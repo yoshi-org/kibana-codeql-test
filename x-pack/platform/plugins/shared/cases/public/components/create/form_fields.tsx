@@ -1,0 +1,317 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import React, { useCallback, useMemo, useEffect } from 'react';
+import {
+  EuiLoadingSpinner,
+  EuiSteps,
+  EuiTitle,
+  EuiFlexGroup,
+  EuiFlexItem,
+  EuiSpacer,
+} from '@elastic/eui';
+import { css } from '@emotion/react';
+import { useFormContext } from '@kbn/es-ui-shared-plugin/static/forms/hook_form_lib';
+
+import type { CasePostRequest, CaseUI } from '../../../common';
+import type { ActionConnector } from '../../../common/types/domain';
+import { Connector } from '../case_form_fields/connector';
+import * as i18n from './translations';
+import { SyncAlertsToggle } from '../case_form_fields/sync_alerts_toggle';
+import type { CasesConfigurationUI, CasesConfigurationUITemplate } from '../../containers/types';
+import { removeEmptyFields } from '../utils';
+import { useCasesFeatures } from '../../common/use_cases_features';
+import { TemplateSelector } from './templates';
+import { TemplateSelector as TemplateSelectorV2 } from './templates_v2';
+import { getInitialCaseValue } from '../../../common/utils/get_initial_case_value';
+import { KibanaServices } from '../../common/lib/kibana';
+import { CaseFormFields } from '../case_form_fields';
+import { builderMap as customFieldsBuilderMap } from '../custom_fields/builder';
+import { ObservablesToggle } from '../case_form_fields/observables_toggle';
+import { getInitialCreateCaseSettings } from './utils';
+import { isObservablesExtractionBlocked } from '../../../common/utils/case_settings';
+
+export interface CreateCaseFormFieldsProps {
+  configuration: CasesConfigurationUI;
+  /** Selected solution. Prefer this over `configuration.owner`, which is '' when lookup falls back. */
+  selectedOwner?: string;
+  connectors: ActionConnector[];
+  isLoading: boolean;
+  withSteps: boolean;
+  draftStorageKey: string;
+}
+
+const transformTemplateCaseFieldsToCaseFormFields = (
+  owner: string,
+  caseTemplateFields: CasesConfigurationUITemplate['caseFields'],
+  configuration: CasesConfigurationUI
+): CasePostRequest => {
+  const caseFields = removeEmptyFields(caseTemplateFields ?? {});
+  const transFormedCustomFields = caseFields?.customFields?.map((customField) => {
+    const customFieldFactory = customFieldsBuilderMap[customField.type];
+    const { convertNullToEmpty } = customFieldFactory();
+    const value = convertNullToEmpty ? convertNullToEmpty(customField.value) : customField.value;
+
+    return {
+      ...customField,
+      value,
+    };
+  });
+
+  const ownerSettings = getInitialCreateCaseSettings(owner, configuration);
+  const templateSettings = caseFields?.settings;
+
+  return getInitialCaseValue({
+    owner,
+    ...caseFields,
+    settings: {
+      syncAlerts: templateSettings?.syncAlerts ?? ownerSettings.syncAlerts,
+      extractObservables: isObservablesExtractionBlocked(owner)
+        ? false
+        : templateSettings?.extractObservables ?? ownerSettings.extractObservables,
+    },
+    customFields: transFormedCustomFields as CaseUI['customFields'],
+  });
+};
+
+const DEFAULT_EMPTY_TEMPLATE_KEY = 'defaultEmptyTemplateKey';
+
+export const CreateCaseFormFields: React.FC<CreateCaseFormFieldsProps> = React.memo(
+  ({ configuration, selectedOwner, connectors, isLoading, withSteps, draftStorageKey }) => {
+    const { reset, updateFieldValues, isSubmitting, setFieldValue, getFields } = useFormContext();
+
+    const caseOwner = selectedOwner || configuration.owner;
+    const {
+      isSyncAlertsEnabled,
+      isExtractObservablesEnabled,
+      observablesAuthorized,
+      connectorsAuthorized,
+    } = useCasesFeatures(caseOwner);
+    const config = KibanaServices.getConfig();
+    const isTemplatesV2Enabled = config?.templates?.enabled ?? false;
+    const canExtractObservables = observablesAuthorized && isExtractObservablesEnabled;
+
+    /**
+     * Changes the selected connector
+     * when the user selects a solution.
+     * Each solution has its own configuration
+     * so the connector has to change.
+     */
+    useEffect(() => {
+      setFieldValue('connectorId', configuration.connector.id);
+    }, [configuration.connector.id, setFieldValue]);
+
+    /**
+     * Form defaultValue is fixed at mount. Re-apply the space default when configuration
+     * changes (load completes, or owner switches to an unconfigured owner whose lookup
+     * returns initialConfiguration with id: '' and extractObservables: false). Skip only
+     * while the field is dirty so a user or template choice is not overwritten.
+     * Also skip while configurations are still loading to avoid committing the provisional
+     * false fallback before the real space value arrives.
+     */
+    useEffect(() => {
+      if (isLoading) {
+        return;
+      }
+      const field = getFields().extractObservables;
+      if (field && !field.isPristine) {
+        return;
+      }
+      setFieldValue(
+        'extractObservables',
+        isObservablesExtractionBlocked(caseOwner)
+          ? false
+          : configuration.extractObservables ?? false
+      );
+    }, [
+      caseOwner,
+      configuration.extractObservables,
+      configuration.id,
+      getFields,
+      isLoading,
+      setFieldValue,
+    ]);
+
+    const defaultTemplate = useMemo(
+      () => ({
+        key: DEFAULT_EMPTY_TEMPLATE_KEY,
+        name: i18n.DEFAULT_EMPTY_TEMPLATE_NAME,
+        caseFields: getInitialCaseValue({
+          owner: caseOwner,
+          connector: configuration.connector,
+          settings: getInitialCreateCaseSettings(caseOwner, configuration),
+        }),
+      }),
+      [caseOwner, configuration]
+    );
+
+    const onTemplateChange = useCallback(
+      ({ caseFields }: Pick<CasesConfigurationUITemplate, 'caseFields' | 'key'>) => {
+        const caseFormFields = transformTemplateCaseFieldsToCaseFormFields(
+          caseOwner,
+          caseFields,
+          configuration
+        );
+
+        reset({
+          resetValues: true,
+          defaultValue: getInitialCaseValue({
+            owner: caseOwner,
+            settings: getInitialCreateCaseSettings(caseOwner, configuration),
+          }),
+        });
+        updateFieldValues(caseFormFields);
+      },
+      [caseOwner, configuration, reset, updateFieldValues]
+    );
+
+    const firstStep = useMemo(
+      () => ({
+        title: i18n.STEP_ONE_TITLE,
+        children: isTemplatesV2Enabled ? (
+          <TemplateSelectorV2 isLoading={isSubmitting || isLoading} />
+        ) : (
+          <TemplateSelector
+            isLoading={isSubmitting || isLoading}
+            templates={[defaultTemplate, ...configuration.templates]}
+            onTemplateChange={onTemplateChange}
+          />
+        ),
+      }),
+      [
+        configuration.templates,
+        defaultTemplate,
+        isLoading,
+        isSubmitting,
+        isTemplatesV2Enabled,
+        onTemplateChange,
+      ]
+    );
+
+    const secondStep = useMemo(
+      () => ({
+        title: i18n.STEP_TWO_TITLE,
+        children: (
+          <CaseFormFields
+            configurationCustomFields={configuration.customFields}
+            isLoading={isSubmitting}
+            setCustomFieldsOptional={false}
+            isEditMode={false}
+            draftStorageKey={draftStorageKey}
+          />
+        ),
+      }),
+      [configuration.customFields, draftStorageKey, isSubmitting]
+    );
+    const showThirdStep = isSyncAlertsEnabled || canExtractObservables;
+    const thirdStep = useMemo(
+      () => ({
+        title: i18n.STEP_THREE_TITLE,
+        children: (
+          <>
+            {isSyncAlertsEnabled && <SyncAlertsToggle isLoading={isSubmitting} />}
+            {canExtractObservables && <ObservablesToggle isLoading={isSubmitting} />}
+          </>
+        ),
+      }),
+      [isSubmitting, isSyncAlertsEnabled, canExtractObservables]
+    );
+
+    const fourthStep = useMemo(
+      () => ({
+        title: i18n.STEP_FOUR_TITLE,
+        children: (
+          <Connector
+            connectors={connectors}
+            isLoadingConnectors={isLoading}
+            isLoading={isSubmitting}
+            key={configuration.id}
+          />
+        ),
+      }),
+      [configuration.id, connectors, isLoading, isSubmitting]
+    );
+
+    const allSteps = useMemo(
+      () => [
+        firstStep,
+        secondStep,
+        ...(showThirdStep ? [thirdStep] : []),
+        ...(connectorsAuthorized ? [fourthStep] : []),
+      ],
+      [firstStep, secondStep, showThirdStep, thirdStep, connectorsAuthorized, fourthStep]
+    );
+
+    return (
+      <>
+        {isSubmitting && (
+          <EuiLoadingSpinner
+            css={css`
+              position: absolute;
+              top: 50%;
+              left: 50%;
+              z-index: 99;
+            `}
+            data-test-subj="create-case-loading-spinner"
+            size="xl"
+          />
+        )}
+        {withSteps ? (
+          <EuiSteps
+            headingElement="h2"
+            steps={allSteps}
+            data-test-subj={'case-creation-form-steps'}
+          />
+        ) : (
+          <>
+            <EuiSpacer size="l" />
+            <EuiFlexGroup direction="column">
+              <EuiFlexGroup direction="column">
+                <EuiFlexItem>
+                  <EuiTitle size="s">
+                    <h2>{i18n.STEP_ONE_TITLE}</h2>
+                  </EuiTitle>
+                </EuiFlexItem>
+                <EuiFlexItem>{firstStep.children}</EuiFlexItem>
+              </EuiFlexGroup>
+              <EuiFlexGroup direction="column">
+                <EuiFlexItem>
+                  <EuiTitle size="s">
+                    <h2>{i18n.STEP_TWO_TITLE}</h2>
+                  </EuiTitle>
+                </EuiFlexItem>
+                <EuiFlexItem>{secondStep.children}</EuiFlexItem>
+              </EuiFlexGroup>
+              {showThirdStep && (
+                <EuiFlexGroup direction="column">
+                  <EuiFlexItem>
+                    <EuiTitle size="s">
+                      <h2>{i18n.STEP_THREE_TITLE}</h2>
+                    </EuiTitle>
+                  </EuiFlexItem>
+                  <EuiFlexItem>{thirdStep.children}</EuiFlexItem>
+                </EuiFlexGroup>
+              )}
+              {connectorsAuthorized && (
+                <EuiFlexGroup direction="column">
+                  <EuiFlexItem>
+                    <EuiTitle size="s">
+                      <h2>{i18n.STEP_FOUR_TITLE}</h2>
+                    </EuiTitle>
+                  </EuiFlexItem>
+                  <EuiFlexItem>{fourthStep.children}</EuiFlexItem>
+                </EuiFlexGroup>
+              )}
+            </EuiFlexGroup>
+          </>
+        )}
+      </>
+    );
+  }
+);
+
+CreateCaseFormFields.displayName = 'CreateCaseFormFields';

@@ -1,0 +1,80 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import {
+  sendGetPackagePolicy,
+  sendGetEndpointSecurityPackage,
+  sendPutPackagePolicy,
+} from './ingest';
+import { FleetPackagePolicyGenerator } from '../../../../common/endpoint/data_generators/fleet_package_policy_generator';
+import { getPolicyDataForUpdate } from '../../../../common/endpoint/service/policy/get_policy_data_for_update';
+import { httpServiceMock } from '@kbn/core/public/mocks';
+import { PACKAGE_POLICY_API_ROOT, epmRouteService, API_VERSIONS } from '@kbn/fleet-plugin/common';
+import { policyListApiPathHandlers } from '../../pages/policy/store/test_mock_utils';
+
+describe('ingest service', () => {
+  let http: ReturnType<typeof httpServiceMock.createStartContract>;
+
+  beforeEach(() => {
+    http = httpServiceMock.createStartContract();
+  });
+
+  describe('sendGetPackagePolicy()', () => {
+    it('builds correct API path', async () => {
+      await sendGetPackagePolicy(http, '123');
+      expect(http.get).toHaveBeenCalledWith(`${PACKAGE_POLICY_API_ROOT}/123`, {
+        version: API_VERSIONS.public.v1,
+      });
+    });
+    it('supports http options', async () => {
+      await sendGetPackagePolicy(http, '123', { query: { page: 1 } });
+      expect(http.get).toHaveBeenCalledWith(`${PACKAGE_POLICY_API_ROOT}/123`, {
+        query: {
+          page: 1,
+        },
+        version: API_VERSIONS.public.v1,
+      });
+    });
+    it('encodes special characters in the package policy id', async () => {
+      await sendGetPackagePolicy(http, 'policy/with spaces');
+      expect(http.get).toHaveBeenCalledWith(`${PACKAGE_POLICY_API_ROOT}/policy%2Fwith%20spaces`, {
+        version: API_VERSIONS.public.v1,
+      });
+    });
+  });
+
+  describe('sendPutPackagePolicy()', () => {
+    it('encodes special characters in the package policy id', async () => {
+      const packagePolicy = getPolicyDataForUpdate(
+        new FleetPackagePolicyGenerator('seed').generateEndpointPackagePolicy()
+      );
+      await sendPutPackagePolicy(http, 'policy/with spaces', packagePolicy);
+      expect(http.put).toHaveBeenCalledWith(`${PACKAGE_POLICY_API_ROOT}/policy%2Fwith%20spaces`, {
+        version: API_VERSIONS.public.v1,
+        body: JSON.stringify(packagePolicy),
+      });
+    });
+  });
+
+  describe('sendGetEndpointSecurityPackage()', () => {
+    it('should query for endpoint package', async () => {
+      const path = epmRouteService.getInfoPath('endpoint');
+      http.get.mockReturnValue(Promise.resolve(policyListApiPathHandlers()[path]()));
+      await sendGetEndpointSecurityPackage(http);
+      expect(http.get).toHaveBeenCalledWith(path, {
+        version: API_VERSIONS.public.v1,
+      });
+    });
+
+    it('should throw if package is not found', async () => {
+      http.get.mockResolvedValue({ response: [], success: true });
+      await expect(async () => {
+        await sendGetEndpointSecurityPackage(http);
+      }).rejects.toThrow();
+    });
+  });
+});

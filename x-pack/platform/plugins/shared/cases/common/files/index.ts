@@ -1,0 +1,46 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import { z } from '@kbn/zod/v4';
+import { isEmpty } from 'lodash';
+import { OWNERS } from '../constants';
+import type { HttpApiPrivilegeOperation, Owner } from '../constants/types';
+
+/**
+ * This type is only used to validate for deletion, it does not check all the fields that should exist in the file
+ * metadata.
+ */
+export const CaseFileMetadataForDeletionSchema = z.object({
+  caseIds: z.array(z.string().max(512)),
+});
+
+export type CaseFileMetadataForDeletion = z.infer<typeof CaseFileMetadataForDeletionSchema>;
+
+const FILE_KIND_DELIMITER = 'FilesCases';
+
+export const constructFilesHttpOperationPrivilege = (
+  owner: Owner,
+  operation: HttpApiPrivilegeOperation
+) => {
+  return `${owner}${FILE_KIND_DELIMITER}${operation}`;
+};
+
+export const constructFileKindIdByOwner = (owner: Owner) => `${owner}${FILE_KIND_DELIMITER}`;
+
+export const constructOwnerFromFileKind = (fileKind: string): Owner | undefined => {
+  const splitString = fileKind.split(FILE_KIND_DELIMITER);
+
+  if (splitString.length === 2 && isEmpty(splitString[1]) && isValidOwner(splitString[0])) {
+    return splitString[0];
+  }
+};
+
+const isValidOwner = (ownerToValidate: string): ownerToValidate is Owner => {
+  const foundOwner = OWNERS.find((validOwner) => validOwner === ownerToValidate);
+
+  return foundOwner !== undefined;
+};

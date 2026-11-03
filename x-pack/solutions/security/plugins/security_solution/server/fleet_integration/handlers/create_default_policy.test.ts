@@ -1,0 +1,1458 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+import { Subject } from 'rxjs';
+import type { ILicense } from '@kbn/licensing-types';
+import { licenseMock } from '@kbn/licensing-plugin/common/licensing.mock';
+import { cloudMock } from '@kbn/cloud-plugin/server/mocks';
+import {
+  ALL_PRODUCT_FEATURE_KEYS,
+  ProductFeatureSecurityKey,
+} from '@kbn/security-solution-features/keys';
+import { LicenseService } from '../../../common/license';
+import { isEndpointPolicyValidForLicense } from '../../../common/license/policy_config';
+import { createDefaultPolicy } from './create_default_policy';
+import { ProtectionModes } from '../../../common/endpoint/types';
+import type { PolicyConfig } from '../../../common/endpoint/types';
+import {
+  policyFactory,
+  policyFactoryWithoutPaidEnterpriseFeatures,
+} from '../../../common/endpoint/models/policy_config';
+import * as PolicyConfigHelpers from '../../../common/endpoint/models/policy_config_helpers';
+import { elasticsearchServiceMock } from '@kbn/core/server/mocks';
+import type {
+  AnyPolicyCreateConfig,
+  PolicyCreateCloudConfig,
+  PolicyCreateEndpointConfig,
+} from '../types';
+import type { ProductFeaturesService } from '../../lib/product_features_service/product_features_service';
+import { createProductFeaturesServiceMock } from '../../lib/product_features_service/mocks';
+import { createTelemetryConfigProviderMock } from '../../../common/telemetry_config/mocks';
+import type { ExperimentalFeatures } from '../../../common';
+
+describe('Create Default Policy tests ', () => {
+  const cloud = cloudMock.createSetup();
+  const Platinum = licenseMock.createLicense({
+    license: { type: 'platinum', mode: 'platinum', uid: '' },
+  });
+  const Enterprise = licenseMock.createLicense({
+    license: { type: 'enterprise', mode: 'enterprise', uid: '' },
+  });
+  const Gold = licenseMock.createLicense({ license: { type: 'gold', mode: 'gold', uid: '' } });
+  const Basic = licenseMock.createLicense({ license: { type: 'basic', mode: 'basic', uid: '' } });
+  let licenseEmitter: Subject<ILicense>;
+  let licenseService: LicenseService;
+  let productFeaturesService: ProductFeaturesService;
+  const telemetryConfigProviderMock = createTelemetryConfigProviderMock();
+  const experimentalFeatures = {
+    trustedDevices: true,
+    customYaraSignaturesEnabled: true,
+    linuxRansomwareProtection: true,
+    endpointAiDataCollection: true,
+    perOsPolicySettings: true,
+  } as ExperimentalFeatures;
+
+  const createDefaultPolicyCallback = async (
+    config?: AnyPolicyCreateConfig,
+    experimentalFeaturesOverride: ExperimentalFeatures = experimentalFeatures
+  ): Promise<PolicyConfig> => {
+    const esClientInfo = await elasticsearchServiceMock.createClusterClient().asInternalUser.info();
+    esClientInfo.cluster_name = '';
+    esClientInfo.cluster_uuid = '';
+    return createDefaultPolicy(
+      licenseService,
+      config,
+      cloud,
+      esClientInfo,
+      productFeaturesService,
+      telemetryConfigProviderMock,
+      experimentalFeaturesOverride
+    );
+  };
+
+  beforeEach(() => {
+    licenseEmitter = new Subject();
+    licenseService = new LicenseService();
+    licenseService.start(licenseEmitter);
+    licenseEmitter.next(Platinum); // set license level to platinum
+    productFeaturesService = createProductFeaturesServiceMock();
+  });
+
+  describe('When no config is set', () => {
+    beforeEach(() => {
+      // @ts-expect-error write to readonly property for testing
+      experimentalFeatures.linuxDnsEvents = true;
+    });
+
+    it('Should return PolicyConfig when license is at least platinum', async () => {
+      const defaultPolicy = policyFactory();
+
+      const policy = await createDefaultPolicyCallback(undefined);
+
+      // events are the same
+      expect(policy.windows.events).toEqual(defaultPolicy.windows.events);
+      expect(policy.linux.events).toEqual(defaultPolicy.linux.events);
+      expect(policy.mac.events).toEqual(defaultPolicy.mac.events);
+
+      // check some of the protections to be disabled
+      const disabledButSupported = {
+        mode: ProtectionModes.off,
+        supported: true,
+        custom_yara_signatures: false,
+      };
+      const disabledButSupportedBehaviorProtection = {
+        mode: ProtectionModes.off,
+        supported: true,
+        reputation_service: true,
+      };
+      expect(policy.windows.behavior_protection).toEqual(disabledButSupportedBehaviorProtection);
+      expect(policy.mac.memory_protection).toEqual(disabledButSupported);
+      expect(policy.linux.behavior_protection).toEqual(disabledButSupportedBehaviorProtection);
+
+      // malware popups should be disabled
+      expect(policy.windows.popup.malware.enabled).toBeFalsy();
+      expect(policy.mac.popup.malware.enabled).toBeFalsy();
+      expect(policy.linux.popup.malware.enabled).toBeFalsy();
+    });
+
+    it('Should return PolicyConfig for events only without paid features when license is below platinum', async () => {
+      const defaultPolicy = policyFactory();
+      licenseEmitter.next(Gold);
+
+      const policy = await createDefaultPolicyCallback(undefined);
+
+      // events are the same
+      expect(policy.windows.events).toEqual(defaultPolicy.windows.events);
+      expect(policy.linux.events).toEqual(defaultPolicy.linux.events);
+      expect(policy.mac.events).toEqual(defaultPolicy.mac.events);
+
+      // check some of the protections to be disabled and unsupported
+      const disabledAndUnsupported = {
+        mode: ProtectionModes.off,
+        supported: false,
+        custom_yara_signatures: false,
+      };
+      const disabledAndUnsupportedBehaviorProtection = {
+        mode: ProtectionModes.off,
+        supported: false,
+        reputation_service: false,
+      };
+      expect(policy.windows.behavior_protection).toEqual(disabledAndUnsupportedBehaviorProtection);
+      expect(policy.mac.memory_protection).toEqual(disabledAndUnsupported);
+      expect(policy.linux.behavior_protection).toEqual(disabledAndUnsupportedBehaviorProtection);
+
+      // malware popups are enabled on unpaid license
+      expect(policy.windows.popup.malware.enabled).toBeTruthy();
+      expect(policy.mac.popup.malware.enabled).toBeTruthy();
+      expect(policy.linux.popup.malware.enabled).toBeTruthy();
+    });
+  });
+
+  describe('When endpoint config is set', () => {
+    const createEndpointConfig = (
+      endpointConfig: PolicyCreateEndpointConfig['endpointConfig']
+    ): PolicyCreateEndpointConfig => {
+      return {
+        type: 'endpoint',
+        endpointConfig,
+      };
+    };
+
+    const defaultEventsDisabled = (): {
+      linux: PolicyConfig['linux']['events'];
+      mac: PolicyConfig['mac']['events'];
+      windows: PolicyConfig['windows']['events'];
+    } => ({
+      linux: {
+        dns: false,
+        file: false,
+        process: false,
+        network: false,
+        session_data: false,
+        tty_io: false,
+      },
+      mac: {
+        dns: false,
+        process: false,
+        file: false,
+        network: false,
+        security: false,
+      },
+      windows: {
+        credential_access: false,
+        process: false,
+        file: false,
+        network: false,
+        dll_and_driver_load: false,
+        dns: false,
+        registry: false,
+        security: false,
+      },
+    });
+    const OSTypes = ['linux', 'mac', 'windows'] as const;
+
+    beforeEach(() => {
+      // @ts-expect-error write to readonly property for testing
+      experimentalFeatures.linuxDnsEvents = true;
+    });
+
+    it('Should return PolicyConfig for events only when preset is DataCollection', async () => {
+      const defaultPolicy = policyFactory();
+      const config = createEndpointConfig({ preset: 'DataCollection' });
+      const policy = await createDefaultPolicyCallback(config);
+
+      // events are the same
+      expect(policy.windows.events).toEqual(defaultPolicy.windows.events);
+      expect(policy.linux.events).toEqual(defaultPolicy.linux.events);
+      expect(policy.mac.events).toEqual(defaultPolicy.mac.events);
+
+      // check some of the protections to be disabled
+      const disabledButSupported = {
+        mode: ProtectionModes.off,
+        supported: true,
+        custom_yara_signatures: false,
+      };
+      const disabledButSupportedBehaviorProtection = {
+        mode: ProtectionModes.off,
+        supported: true,
+        reputation_service: true,
+      };
+      expect(policy.windows.behavior_protection).toEqual(disabledButSupportedBehaviorProtection);
+      expect(policy.mac.memory_protection).toEqual(disabledButSupported);
+      expect(policy.linux.behavior_protection).toEqual(disabledButSupportedBehaviorProtection);
+
+      // malware popups should be disabled
+      expect(policy.windows.popup.malware.enabled).toBeFalsy();
+      expect(policy.mac.popup.malware.enabled).toBeFalsy();
+      expect(policy.linux.popup.malware.enabled).toBeFalsy();
+    });
+
+    it('Should return only process event enabled on policy when preset is NGAV', async () => {
+      const config = createEndpointConfig({ preset: 'NGAV' });
+      const policy = await createDefaultPolicyCallback(config);
+      const events = defaultEventsDisabled();
+      OSTypes.forEach((os) => {
+        expect(policy[os].events).toMatchObject({
+          ...events[os],
+          process: true,
+        });
+      });
+    });
+
+    it('Should return process, file and network events enabled when preset is EDR Essential', async () => {
+      const config = createEndpointConfig({ preset: 'EDREssential' });
+      const policy = await createDefaultPolicyCallback(config);
+      const events = defaultEventsDisabled();
+      const enabledEvents = {
+        process: true,
+        file: true,
+        network: true,
+      };
+      OSTypes.forEach((os) => {
+        expect(policy[os].events).toMatchObject({
+          ...events[os],
+          ...enabledEvents,
+        });
+      });
+    });
+
+    it('Should return the default config without enterprise features when preset is EDR Complete on platinum', async () => {
+      const config = createEndpointConfig({ preset: 'EDRComplete' });
+      const policy = await createDefaultPolicyCallback(config, {
+        ...experimentalFeatures,
+        perOsPolicySettings: true,
+        registryCredentialHardening: true,
+      });
+      const license = 'platinum';
+      const isCloud = true;
+      const defaultPolicy = policyFactoryWithoutPaidEnterpriseFeatures(
+        policyFactory({
+          license,
+          cloud: isCloud,
+          isGlobalTelemetryEnabled: true,
+        })
+      );
+      // update defaultPolicy w/ platinum license & cloud info
+      defaultPolicy.meta.license = license;
+      defaultPolicy.meta.cloud = isCloud;
+      expect(policy).toMatchObject(defaultPolicy);
+    });
+
+    it('Should return the default config when preset is EDR Complete on enterprise', async () => {
+      licenseEmitter.next(Enterprise);
+
+      const config = createEndpointConfig({ preset: 'EDRComplete' });
+      const policy = await createDefaultPolicyCallback(config, {
+        ...experimentalFeatures,
+        perOsPolicySettings: true,
+        registryCredentialHardening: true,
+      });
+      const license = 'enterprise';
+      const isCloud = true;
+      const defaultPolicy = policyFactory({
+        license,
+        cloud: isCloud,
+        isGlobalTelemetryEnabled: true,
+      });
+      // update defaultPolicy w/ enterprise license & cloud info
+      defaultPolicy.meta.license = license;
+      defaultPolicy.meta.cloud = isCloud;
+      expect(policy).toMatchObject(defaultPolicy);
+    });
+
+    it('should set policy to event collection only if endpointPolicyProtections productFeature is disabled', async () => {
+      productFeaturesService = createProductFeaturesServiceMock(
+        ALL_PRODUCT_FEATURE_KEYS.filter((key) => key !== 'endpoint_policy_protections')
+      );
+
+      await expect(
+        createDefaultPolicyCallback(createEndpointConfig({ preset: 'EDRComplete' }))
+      ).resolves.toMatchObject({
+        linux: {
+          behavior_protection: { mode: 'off' },
+          malware: { mode: 'off' },
+          memory_protection: { mode: 'off' },
+        },
+        mac: {
+          behavior_protection: { mode: 'off' },
+          malware: { mode: 'off' },
+          memory_protection: { mode: 'off' },
+        },
+        windows: {
+          antivirus_registration: { enabled: false },
+          attack_surface_reduction: { credential_hardening: { enabled: false } },
+          behavior_protection: { mode: 'off' },
+          malware: { blocklist: false },
+          memory_protection: { mode: 'off' },
+          ransomware: { mode: 'off' },
+        },
+      });
+    });
+
+    it('should set meta.billable', async () => {
+      const isBillablePolicySpy = jest.spyOn(PolicyConfigHelpers, 'isBillablePolicy');
+      const config = createEndpointConfig({ preset: 'DataCollection' });
+
+      isBillablePolicySpy.mockReturnValue(false);
+      let policy = await createDefaultPolicyCallback(config);
+      expect(policy.meta.billable).toBe(false);
+
+      isBillablePolicySpy.mockReturnValue(true);
+      policy = await createDefaultPolicyCallback(config);
+      expect(policy.meta.billable).toBe(true);
+
+      isBillablePolicySpy.mockRestore();
+    });
+  });
+
+  describe('When cloud config is set', () => {
+    const createCloudConfig = (): PolicyCreateCloudConfig => ({
+      type: 'cloud',
+    });
+
+    it('Session data should be enabled for Linux', async () => {
+      const config = createCloudConfig();
+      const policy = await createDefaultPolicyCallback(config);
+      expect(policy.linux.events.session_data).toBe(true);
+    });
+    it('Protections should be disabled for all OSs', async () => {
+      const config = createCloudConfig();
+      const policy = await createDefaultPolicyCallback(config);
+      const OSTypes = ['linux', 'mac', 'windows'] as const;
+      OSTypes.forEach((os) => {
+        expect(policy[os].malware.mode).toBe('off');
+        expect(policy[os].memory_protection.mode).toBe('off');
+        expect(policy[os].behavior_protection.mode).toBe('off');
+      });
+      // Linux ransomware is optional (behind `linuxRansomwareProtection`), so only the
+      // always-present branches are checked here.
+      expect(policy.windows.ransomware.mode).toBe('off');
+      expect(policy.mac.ransomware.mode).toBe('off');
+    });
+  });
+
+  describe('Global Telemetry Config', () => {
+    it('should save telemetry config state in policy based on telemetry config provider', async () => {
+      telemetryConfigProviderMock.getIsOptedIn.mockReturnValue(false);
+      let policyConfig = await createDefaultPolicyCallback();
+      expect(policyConfig.global_telemetry_enabled).toBe(false);
+
+      telemetryConfigProviderMock.getIsOptedIn.mockReturnValue(true);
+      policyConfig = await createDefaultPolicyCallback();
+      expect(policyConfig.global_telemetry_enabled).toBe(true);
+    });
+
+    it('should fallback to `false` when global telemetry config is unavailable', async () => {
+      telemetryConfigProviderMock.getIsOptedIn.mockReturnValue(undefined);
+      const policyConfig = await createDefaultPolicyCallback();
+      expect(policyConfig.global_telemetry_enabled).toBe(false);
+    });
+  });
+
+  describe('Device Control license gating', () => {
+    const edrCompleteConfig: PolicyCreateEndpointConfig = {
+      type: 'endpoint',
+      endpointConfig: { preset: 'EDRComplete' },
+    };
+
+    it('should disable device control when license is platinum', async () => {
+      const policy = await createDefaultPolicyCallback(edrCompleteConfig);
+
+      expect(policy.windows.device_control?.enabled).toBe(false);
+      expect(policy.windows.popup.device_control?.enabled).toBe(false);
+      expect(policy.mac.device_control?.enabled).toBe(false);
+      expect(policy.mac.popup.device_control?.enabled).toBe(false);
+    });
+
+    it('should disable device control when license is below platinum', async () => {
+      licenseEmitter.next(Gold);
+
+      const policy = await createDefaultPolicyCallback(edrCompleteConfig);
+
+      expect(policy.windows.device_control?.enabled).toBe(false);
+      expect(policy.windows.popup.device_control?.enabled).toBe(false);
+      expect(policy.mac.device_control?.enabled).toBe(false);
+      expect(policy.mac.popup.device_control?.enabled).toBe(false);
+    });
+
+    it('should keep device control enabled when license is enterprise', async () => {
+      licenseEmitter.next(Enterprise);
+
+      const policy = await createDefaultPolicyCallback(edrCompleteConfig);
+
+      expect(policy.windows.device_control?.enabled).toBe(true);
+      expect(policy.mac.device_control?.enabled).toBe(true);
+    });
+  });
+
+  describe('License compliance invariant', () => {
+    type Preset = PolicyCreateEndpointConfig['endpointConfig']['preset'];
+
+    const tiers: Array<[tier: string, license: ILicense]> = [
+      ['basic', Basic],
+      ['gold', Gold],
+      ['platinum', Platinum],
+      ['enterprise', Enterprise],
+    ];
+    const presets: Preset[] = ['DataCollection', 'NGAV', 'EDREssential', 'EDRComplete'];
+    const perOsFlagStates = [false, true];
+
+    // Cross product, so a failure names the exact (tier, preset, flag) triple.
+    const cases: Array<[tier: string, preset: Preset, perOs: boolean, license: ILicense]> =
+      tiers.flatMap(([tier, license]) =>
+        presets.flatMap((preset) =>
+          perOsFlagStates.map((perOs): [string, Preset, boolean, ILicense] => [
+            tier,
+            preset,
+            perOs,
+            license,
+          ])
+        )
+      );
+
+    it.each(cases)(
+      'should create a policy that satisfies isEndpointPolicyValidForLicense on %s with the %s preset (perOsPolicySettings: %s)',
+      async (_tier, preset, perOs, license) => {
+        licenseEmitter.next(license);
+
+        const policy = await createDefaultPolicyCallback(
+          { type: 'endpoint', endpointConfig: { preset } },
+          { ...experimentalFeatures, perOsPolicySettings: perOs }
+        );
+
+        expect(isEndpointPolicyValidForLicense(policy, license)).toBe(true);
+      }
+    );
+
+    // Guards the invariant above against passing vacuously: the raw factory output
+    // (Device Control on) is what Platinum used to be created with, and it must fail.
+    it('should not consider a raw policyFactory() output valid for a platinum license', () => {
+      expect(isEndpointPolicyValidForLicense(policyFactory(), Platinum)).toBe(false);
+    });
+  });
+
+  describe('macOS ransomware default', () => {
+    type Preset = PolicyCreateEndpointConfig['endpointConfig']['preset'];
+
+    const perOsExperimentalFeatures: ExperimentalFeatures = {
+      ...experimentalFeatures,
+      perOsPolicySettings: true,
+    };
+    const createEndpointConfig = (preset: Preset): PolicyCreateEndpointConfig => ({
+      type: 'endpoint',
+      endpointConfig: { preset },
+    });
+
+    it.each<Preset>(['EDRComplete', 'EDREssential', 'NGAV'])(
+      'should enable macOS ransomware prevention for the %s preset when perOsPolicySettings is on',
+      async (preset) => {
+        const policy = await createDefaultPolicyCallback(
+          createEndpointConfig(preset),
+          perOsExperimentalFeatures
+        );
+
+        expect(policy.mac.ransomware).toEqual({ mode: ProtectionModes.prevent, supported: true });
+        expect(policy.mac.popup.ransomware.enabled).toBe(true);
+        expect(policy.windows.ransomware.mode).toBe(ProtectionModes.prevent);
+      }
+    );
+
+    it('should enable macOS ransomware prevention on an Enterprise license', async () => {
+      licenseEmitter.next(Enterprise);
+
+      const policy = await createDefaultPolicyCallback(
+        createEndpointConfig('EDRComplete'),
+        perOsExperimentalFeatures
+      );
+
+      expect(policy.mac.ransomware.mode).toBe(ProtectionModes.prevent);
+    });
+
+    it.each<[name: string, config: AnyPolicyCreateConfig | undefined]>([
+      ['the DataCollection preset', createEndpointConfig('DataCollection')],
+      ['no integration config', undefined],
+      ['a cloud config', { type: 'cloud' }],
+    ])('should keep macOS ransomware off for %s', async (_name, config) => {
+      const policy = await createDefaultPolicyCallback(config, perOsExperimentalFeatures);
+
+      expect(policy.mac.ransomware.mode).toBe(ProtectionModes.off);
+      expect(policy.mac.popup.ransomware.enabled).toBe(false);
+    });
+
+    it.each<[tier: string, license: ILicense]>([
+      ['gold', Gold],
+      ['basic', Basic],
+    ])(
+      'should keep macOS ransomware off and unsupported on a %s license',
+      async (_tier, license) => {
+        licenseEmitter.next(license);
+
+        const policy = await createDefaultPolicyCallback(
+          createEndpointConfig('EDRComplete'),
+          perOsExperimentalFeatures
+        );
+
+        expect(policy.mac.ransomware).toEqual({ mode: ProtectionModes.off, supported: false });
+      }
+    );
+
+    it('should keep macOS ransomware off when the endpointPolicyProtections product feature is disabled', async () => {
+      productFeaturesService = createProductFeaturesServiceMock(
+        ALL_PRODUCT_FEATURE_KEYS.filter(
+          (key) => key !== ProductFeatureSecurityKey.endpointPolicyProtections
+        )
+      );
+
+      const policy = await createDefaultPolicyCallback(
+        createEndpointConfig('EDRComplete'),
+        perOsExperimentalFeatures
+      );
+
+      expect(policy.mac.ransomware.mode).toBe(ProtectionModes.off);
+    });
+
+    // Without the per-OS form, macOS ransomware has no card, so it must stay opt-in.
+    it('should keep macOS ransomware off when perOsPolicySettings is off', async () => {
+      const policy = await createDefaultPolicyCallback(createEndpointConfig('EDRComplete'), {
+        ...experimentalFeatures,
+        perOsPolicySettings: false,
+      });
+
+      expect(policy.mac.ransomware).toEqual({ mode: ProtectionModes.off, supported: true });
+      expect(policy.windows.ransomware.mode).toBe(ProtectionModes.prevent);
+    });
+  });
+
+  describe('Device Control Removal', () => {
+    it('should remove device control when endpointTrustedDevices product feature is disabled', async () => {
+      const removeDeviceControlSpy = jest.spyOn(PolicyConfigHelpers, 'removeDeviceControl');
+      productFeaturesService = createProductFeaturesServiceMock(
+        ALL_PRODUCT_FEATURE_KEYS.filter((key) => key !== 'endpoint_trusted_devices')
+      );
+
+      await createDefaultPolicyCallback();
+
+      expect(removeDeviceControlSpy).toHaveBeenCalledTimes(1);
+      removeDeviceControlSpy.mockRestore();
+    });
+
+    it('should remove device control when trustedDevices experimental feature is disabled', async () => {
+      const removeDeviceControlSpy = jest.spyOn(PolicyConfigHelpers, 'removeDeviceControl');
+      const experimentalFeaturesWithTrustedDevicesDisabled = {
+        trustedDevices: false,
+      } as ExperimentalFeatures;
+
+      const createDefaultPolicyCallbackWithDisabledFeature = async (
+        config?: AnyPolicyCreateConfig
+      ): Promise<PolicyConfig> => {
+        const esClientInfo = await elasticsearchServiceMock
+          .createClusterClient()
+          .asInternalUser.info();
+        esClientInfo.cluster_name = '';
+        esClientInfo.cluster_uuid = '';
+        return createDefaultPolicy(
+          licenseService,
+          config,
+          cloud,
+          esClientInfo,
+          productFeaturesService,
+          telemetryConfigProviderMock,
+          experimentalFeaturesWithTrustedDevicesDisabled
+        );
+      };
+
+      await createDefaultPolicyCallbackWithDisabledFeature();
+
+      expect(removeDeviceControlSpy).toHaveBeenCalledTimes(1);
+      removeDeviceControlSpy.mockRestore();
+    });
+
+    it('should remove device control when both endpointTrustedDevices product feature and experimental feature are disabled', async () => {
+      const removeDeviceControlSpy = jest.spyOn(PolicyConfigHelpers, 'removeDeviceControl');
+      productFeaturesService = createProductFeaturesServiceMock(
+        ALL_PRODUCT_FEATURE_KEYS.filter((key) => key !== 'endpoint_trusted_devices')
+      );
+      const experimentalFeaturesWithTrustedDevicesDisabled = {
+        trustedDevices: false,
+      } as ExperimentalFeatures;
+
+      const createDefaultPolicyCallbackWithBothDisabled = async (
+        config?: AnyPolicyCreateConfig
+      ): Promise<PolicyConfig> => {
+        const esClientInfo = await elasticsearchServiceMock
+          .createClusterClient()
+          .asInternalUser.info();
+        esClientInfo.cluster_name = '';
+        esClientInfo.cluster_uuid = '';
+        return createDefaultPolicy(
+          licenseService,
+          config,
+          cloud,
+          esClientInfo,
+          productFeaturesService,
+          telemetryConfigProviderMock,
+          experimentalFeaturesWithTrustedDevicesDisabled
+        );
+      };
+
+      await createDefaultPolicyCallbackWithBothDisabled();
+
+      expect(removeDeviceControlSpy).toHaveBeenCalledTimes(1);
+      removeDeviceControlSpy.mockRestore();
+    });
+
+    it('should NOT remove device control when both endpointTrustedDevices product feature and trustedDevices experimental feature are enabled', async () => {
+      const removeDeviceControlSpy = jest.spyOn(PolicyConfigHelpers, 'removeDeviceControl');
+      // Both features are enabled by default in the test setup
+
+      await createDefaultPolicyCallback();
+
+      expect(removeDeviceControlSpy).not.toHaveBeenCalled();
+      removeDeviceControlSpy.mockRestore();
+    });
+  });
+
+  describe('Custom YARA signatures gating', () => {
+    const edrCompleteConfig: PolicyCreateEndpointConfig = {
+      type: 'endpoint',
+      endpointConfig: { preset: 'EDRComplete' },
+    };
+    const dataCollectionConfig: PolicyCreateEndpointConfig = {
+      type: 'endpoint',
+      endpointConfig: { preset: 'DataCollection' },
+    };
+    const osList = ['windows', 'mac', 'linux'] as const;
+
+    const expectCustomYaraSignatures = (policy: PolicyConfig, enabled: boolean) => {
+      for (const os of osList) {
+        expect(policy[os].memory_protection.custom_yara_signatures).toBe(enabled);
+      }
+    };
+
+    const expectCustomYaraSignaturesAbsent = (policy: PolicyConfig) => {
+      for (const os of osList) {
+        expect(policy[os].memory_protection).not.toHaveProperty('custom_yara_signatures');
+      }
+    };
+
+    it('should enable custom YARA signatures on all OSes when flag, product feature, and Enterprise license are on', async () => {
+      licenseEmitter.next(Enterprise);
+
+      const policy = await createDefaultPolicyCallback(edrCompleteConfig);
+
+      expectCustomYaraSignatures(policy, true);
+    });
+
+    it('should omit custom YARA signatures when the experimental flag is off', async () => {
+      licenseEmitter.next(Enterprise);
+      const experimentalFeaturesWithCysDisabled = {
+        trustedDevices: true,
+        linuxDnsEvents: true,
+        linuxRansomwareProtection: true,
+        perOsPolicySettings: true,
+        customYaraSignaturesEnabled: false,
+      } as ExperimentalFeatures;
+
+      const esClientInfo = await elasticsearchServiceMock
+        .createClusterClient()
+        .asInternalUser.info();
+      esClientInfo.cluster_name = '';
+      esClientInfo.cluster_uuid = '';
+      const policy = createDefaultPolicy(
+        licenseService,
+        edrCompleteConfig,
+        cloud,
+        esClientInfo,
+        productFeaturesService,
+        telemetryConfigProviderMock,
+        experimentalFeaturesWithCysDisabled
+      );
+
+      expectCustomYaraSignaturesAbsent(policy);
+    });
+
+    it('should omit custom YARA signatures on Platinum license when the experimental flag is off', async () => {
+      const experimentalFeaturesWithCysDisabled = {
+        trustedDevices: true,
+        linuxDnsEvents: true,
+        linuxRansomwareProtection: true,
+        perOsPolicySettings: true,
+        customYaraSignaturesEnabled: false,
+      } as ExperimentalFeatures;
+
+      const esClientInfo = await elasticsearchServiceMock
+        .createClusterClient()
+        .asInternalUser.info();
+      esClientInfo.cluster_name = '';
+      esClientInfo.cluster_uuid = '';
+      const policy = createDefaultPolicy(
+        licenseService,
+        edrCompleteConfig,
+        cloud,
+        esClientInfo,
+        productFeaturesService,
+        telemetryConfigProviderMock,
+        experimentalFeaturesWithCysDisabled
+      );
+
+      // Memory protection itself stays on for Platinum; only the CYS-specific field must be
+      // omitted, rather than materialized as an explicit `false` while the flag is off.
+      expectCustomYaraSignaturesAbsent(policy);
+      expect(policy.windows.memory_protection.mode).not.toBe(ProtectionModes.off);
+    });
+
+    it('should omit custom YARA signatures when the endpointCustomYaraSignatures product feature is off', async () => {
+      licenseEmitter.next(Enterprise);
+      productFeaturesService = createProductFeaturesServiceMock(
+        ALL_PRODUCT_FEATURE_KEYS.filter(
+          (key) => key !== ProductFeatureSecurityKey.endpointCustomYaraSignatures
+        )
+      );
+
+      const policy = await createDefaultPolicyCallback(edrCompleteConfig);
+
+      expectCustomYaraSignaturesAbsent(policy);
+    });
+
+    it('should disable custom YARA signatures for the Data Collection preset', async () => {
+      licenseEmitter.next(Enterprise);
+
+      const policy = await createDefaultPolicyCallback(dataCollectionConfig);
+
+      expectCustomYaraSignatures(policy, false);
+    });
+
+    it('should persist custom YARA signatures as false on Platinum license', async () => {
+      const policy = await createDefaultPolicyCallback(edrCompleteConfig);
+
+      expectCustomYaraSignatures(policy, false);
+    });
+
+    // Regression coverage: gating must run before presets manufacture an explicit `false`.
+    describe('when unavailable, across preset/policy shapes', () => {
+      const createDefaultPolicyWithCysFlagDisabled = async (
+        config?: AnyPolicyCreateConfig
+      ): Promise<PolicyConfig> => {
+        const experimentalFeaturesWithCysDisabled = {
+          trustedDevices: true,
+          linuxDnsEvents: true,
+          linuxRansomwareProtection: true,
+          perOsPolicySettings: true,
+          customYaraSignaturesEnabled: false,
+        } as ExperimentalFeatures;
+
+        const esClientInfo = await elasticsearchServiceMock
+          .createClusterClient()
+          .asInternalUser.info();
+        esClientInfo.cluster_name = '';
+        esClientInfo.cluster_uuid = '';
+        return createDefaultPolicy(
+          licenseService,
+          config,
+          cloud,
+          esClientInfo,
+          productFeaturesService,
+          telemetryConfigProviderMock,
+          experimentalFeaturesWithCysDisabled
+        );
+      };
+
+      const disableCustomYaraSignaturesProductFeature = () => {
+        productFeaturesService = createProductFeaturesServiceMock(
+          ALL_PRODUCT_FEATURE_KEYS.filter(
+            (key) => key !== ProductFeatureSecurityKey.endpointCustomYaraSignatures
+          )
+        );
+      };
+
+      it('should omit custom YARA signatures for the Data Collection preset when the product feature is off', async () => {
+        licenseEmitter.next(Enterprise);
+        disableCustomYaraSignaturesProductFeature();
+
+        const policy = await createDefaultPolicyCallback(dataCollectionConfig);
+
+        expectCustomYaraSignaturesAbsent(policy);
+      });
+
+      it('should omit custom YARA signatures for a cloud policy when the experimental flag is off', async () => {
+        const policy = await createDefaultPolicyWithCysFlagDisabled({
+          type: 'cloud',
+        } as PolicyCreateCloudConfig);
+
+        expectCustomYaraSignaturesAbsent(policy);
+      });
+
+      it('should omit custom YARA signatures for a cloud policy when the product feature is off', async () => {
+        disableCustomYaraSignaturesProductFeature();
+
+        const policy = await createDefaultPolicyCallback({
+          type: 'cloud',
+        } as PolicyCreateCloudConfig);
+
+        expectCustomYaraSignaturesAbsent(policy);
+      });
+
+      it('should omit custom YARA signatures for the default (no config) policy when the experimental flag is off', async () => {
+        const policy = await createDefaultPolicyWithCysFlagDisabled(undefined);
+
+        expectCustomYaraSignaturesAbsent(policy);
+      });
+
+      it('should omit custom YARA signatures for the default (no config) policy when the product feature is off', async () => {
+        disableCustomYaraSignaturesProductFeature();
+
+        const policy = await createDefaultPolicyCallback(undefined);
+
+        expectCustomYaraSignaturesAbsent(policy);
+      });
+
+      // Covers each downstream license-tier clamp branch: none (Enterprise), paid-enterprise
+      // (Platinum), paid (Basic).
+      it.each([
+        ['basic', Basic],
+        ['platinum', Platinum],
+        ['enterprise', Enterprise],
+      ] as Array<[tier: string, license: ILicense]>)(
+        'should omit custom YARA signatures for the Data Collection preset on %s license when the experimental flag is off',
+        async (_tier, license) => {
+          licenseEmitter.next(license);
+
+          const policy = await createDefaultPolicyWithCysFlagDisabled(dataCollectionConfig);
+
+          expectCustomYaraSignaturesAbsent(policy);
+        }
+      );
+    });
+  });
+
+  describe('Registry credential hardening gating', () => {
+    const edrCompleteConfig: PolicyCreateEndpointConfig = {
+      type: 'endpoint',
+      endpointConfig: { preset: 'EDRComplete' },
+    };
+    const edrEssentialConfig: PolicyCreateEndpointConfig = {
+      type: 'endpoint',
+      endpointConfig: { preset: 'EDREssential' },
+    };
+    const ngavConfig: PolicyCreateEndpointConfig = {
+      type: 'endpoint',
+      endpointConfig: { preset: 'NGAV' },
+    };
+    const dataCollectionConfig: PolicyCreateEndpointConfig = {
+      type: 'endpoint',
+      endpointConfig: { preset: 'DataCollection' },
+    };
+    const cloudConfig: PolicyCreateCloudConfig = { type: 'cloud' };
+
+    const enabledExperimentalFeatures: ExperimentalFeatures = {
+      ...experimentalFeatures,
+      registryCredentialHardening: true,
+    };
+
+    const getRegistryCredentialHardening = (policy: PolicyConfig) =>
+      policy.windows.attack_surface_reduction.registry_credential_hardening;
+
+    it.each<[name: string, config: AnyPolicyCreateConfig]>([
+      ['EDRComplete', edrCompleteConfig],
+      ['EDREssential', edrEssentialConfig],
+      ['NGAV', ngavConfig],
+    ])(
+      'should enable registry credential hardening for the %s preset on Enterprise when the flag and product feature are on',
+      async (_name, config) => {
+        licenseEmitter.next(Enterprise);
+
+        const policy = await createDefaultPolicyCallback(config, enabledExperimentalFeatures);
+
+        expect(getRegistryCredentialHardening(policy)).toEqual({ enabled: true });
+      }
+    );
+
+    it.each<[name: string, config: AnyPolicyCreateConfig]>([
+      ['DataCollection', dataCollectionConfig],
+      ['cloud', cloudConfig],
+    ])(
+      'should disable registry credential hardening for the %s preset on Enterprise when the flag and product feature are on',
+      async (_name, config) => {
+        licenseEmitter.next(Enterprise);
+
+        const policy = await createDefaultPolicyCallback(config, enabledExperimentalFeatures);
+
+        expect(getRegistryCredentialHardening(policy)).toEqual({ enabled: false });
+      }
+    );
+
+    it('should disable registry credential hardening for the EDRComplete preset on a Platinum license', async () => {
+      const policy = await createDefaultPolicyCallback(
+        edrCompleteConfig,
+        enabledExperimentalFeatures
+      );
+
+      expect(getRegistryCredentialHardening(policy)).toEqual({ enabled: false });
+    });
+
+    it('should omit registry credential hardening when the experimental flag is off', async () => {
+      licenseEmitter.next(Enterprise);
+
+      const policy = await createDefaultPolicyCallback(edrCompleteConfig, {
+        ...experimentalFeatures,
+        registryCredentialHardening: false,
+      });
+
+      expect(getRegistryCredentialHardening(policy)).toBeUndefined();
+    });
+
+    it('should omit registry credential hardening when the endpointRegistryCredentialHardening product feature is off', async () => {
+      licenseEmitter.next(Enterprise);
+      productFeaturesService = createProductFeaturesServiceMock(
+        ALL_PRODUCT_FEATURE_KEYS.filter(
+          (key) => key !== ProductFeatureSecurityKey.endpointRegistryCredentialHardening
+        )
+      );
+
+      const policy = await createDefaultPolicyCallback(
+        edrCompleteConfig,
+        enabledExperimentalFeatures
+      );
+
+      expect(getRegistryCredentialHardening(policy)).toBeUndefined();
+    });
+
+    it('should not enable registry credential hardening when the endpointPolicyProtections product feature is off (serverless)', async () => {
+      licenseEmitter.next(Enterprise);
+      productFeaturesService = createProductFeaturesServiceMock(
+        ALL_PRODUCT_FEATURE_KEYS.filter(
+          (key) => key !== ProductFeatureSecurityKey.endpointPolicyProtections
+        )
+      );
+
+      const policy = await createDefaultPolicyCallback(
+        edrCompleteConfig,
+        enabledExperimentalFeatures
+      );
+
+      expect(getRegistryCredentialHardening(policy)?.enabled).not.toBe(true);
+    });
+  });
+
+  describe('Linux DNS Events Feature Flag', () => {
+    describe('with linuxDnsEvents feature flag disabled', () => {
+      const createDefaultPolicyWithFeature = async (
+        config?: AnyPolicyCreateConfig
+      ): Promise<PolicyConfig> => {
+        const experimentalFeaturesWithDnsDisabled = {
+          trustedDevices: true,
+          linuxDnsEvents: false,
+          linuxRansomwareProtection: true,
+          perOsPolicySettings: true,
+        } as ExperimentalFeatures;
+
+        const esClientInfo = await elasticsearchServiceMock
+          .createClusterClient()
+          .asInternalUser.info();
+        esClientInfo.cluster_name = '';
+        esClientInfo.cluster_uuid = '';
+        return createDefaultPolicy(
+          licenseService,
+          config,
+          cloud,
+          esClientInfo,
+          productFeaturesService,
+          telemetryConfigProviderMock,
+          experimentalFeaturesWithDnsDisabled
+        );
+      };
+
+      it('should remove Linux DNS events from default policy', async () => {
+        const removeLinuxDnsEventsSpy = jest.spyOn(PolicyConfigHelpers, 'removeLinuxDnsEvents');
+        const defaultPolicy = policyFactory();
+
+        const policy = await createDefaultPolicyWithFeature();
+
+        expect(removeLinuxDnsEventsSpy).toHaveBeenCalledTimes(1);
+        expect(policy.linux.events).not.toHaveProperty('dns');
+        expect(policy.windows.events).toEqual(defaultPolicy.windows.events);
+        expect(policy.mac.events).toEqual(defaultPolicy.mac.events);
+
+        removeLinuxDnsEventsSpy.mockRestore();
+      });
+
+      it('should remove Linux DNS events when license is below platinum', async () => {
+        licenseEmitter.next(Gold);
+
+        const policy = await createDefaultPolicyWithFeature();
+
+        expect(policy.linux.events.dns).toBeUndefined();
+      });
+
+      it('should remove Linux DNS events with DataCollection preset', async () => {
+        const config = {
+          type: 'endpoint',
+          endpointConfig: { preset: 'DataCollection' },
+        } as PolicyCreateEndpointConfig;
+
+        const policy = await createDefaultPolicyWithFeature(config);
+
+        expect(policy.linux.events.dns).toBeUndefined();
+      });
+
+      it('should remove Linux DNS events with NGAV preset', async () => {
+        const config = {
+          type: 'endpoint',
+          endpointConfig: { preset: 'NGAV' },
+        } as PolicyCreateEndpointConfig;
+
+        const policy = await createDefaultPolicyWithFeature(config);
+
+        expect(policy.linux.events.dns).toBeUndefined();
+      });
+
+      it('should remove Linux DNS events with EDREssential preset', async () => {
+        const config = {
+          type: 'endpoint',
+          endpointConfig: { preset: 'EDREssential' },
+        } as PolicyCreateEndpointConfig;
+
+        const policy = await createDefaultPolicyWithFeature(config);
+
+        expect(policy.linux.events.dns).toBeUndefined();
+      });
+
+      it('should remove Linux DNS events with EDRComplete preset', async () => {
+        const config = {
+          type: 'endpoint',
+          endpointConfig: { preset: 'EDRComplete' },
+        } as PolicyCreateEndpointConfig;
+
+        const policy = await createDefaultPolicyWithFeature(config);
+
+        expect(policy.linux.events.dns).toBeUndefined();
+      });
+
+      it('should remove Linux DNS events with cloud config', async () => {
+        const config = {
+          type: 'cloud',
+        } as PolicyCreateCloudConfig;
+
+        const policy = await createDefaultPolicyWithFeature(config);
+
+        expect(policy.linux.events.dns).toBeUndefined();
+      });
+    });
+
+    describe('with linuxDnsEvents feature flag enabled', () => {
+      const createDefaultPolicyWithFeature = async (
+        config?: AnyPolicyCreateConfig
+      ): Promise<PolicyConfig> => {
+        const experimentalFeaturesWithDnsEnabled = {
+          trustedDevices: true,
+          linuxDnsEvents: true,
+          linuxRansomwareProtection: true,
+          perOsPolicySettings: true,
+        } as ExperimentalFeatures;
+
+        const esClientInfo = await elasticsearchServiceMock
+          .createClusterClient()
+          .asInternalUser.info();
+        esClientInfo.cluster_name = '';
+        esClientInfo.cluster_uuid = '';
+        return createDefaultPolicy(
+          licenseService,
+          config,
+          cloud,
+          esClientInfo,
+          productFeaturesService,
+          telemetryConfigProviderMock,
+          experimentalFeaturesWithDnsEnabled
+        );
+      };
+
+      it('should NOT remove Linux DNS events from default policy', async () => {
+        const removeLinuxDnsEventsSpy = jest.spyOn(PolicyConfigHelpers, 'removeLinuxDnsEvents');
+        const defaultPolicy = policyFactory();
+
+        const policy = await createDefaultPolicyWithFeature();
+
+        expect(removeLinuxDnsEventsSpy).not.toHaveBeenCalled();
+        expect(policy.linux.events.dns).toBe(true);
+        expect(policy.linux.events).toEqual(defaultPolicy.linux.events);
+        expect(policy.windows.events).toEqual(defaultPolicy.windows.events);
+        expect(policy.mac.events).toEqual(defaultPolicy.mac.events);
+
+        removeLinuxDnsEventsSpy.mockRestore();
+      });
+
+      it('should include Linux DNS events when license is below platinum', async () => {
+        licenseEmitter.next(Gold);
+
+        const policy = await createDefaultPolicyWithFeature();
+
+        expect(policy.linux.events.dns).toBe(true);
+      });
+
+      it('should include Linux DNS events with DataCollection preset', async () => {
+        const config = {
+          type: 'endpoint',
+          endpointConfig: { preset: 'DataCollection' },
+        } as PolicyCreateEndpointConfig;
+
+        const policy = await createDefaultPolicyWithFeature(config);
+
+        expect(policy.linux.events.dns).toBe(true);
+      });
+
+      it('should include Linux DNS events with NGAV preset (but set to false)', async () => {
+        const config = {
+          type: 'endpoint',
+          endpointConfig: { preset: 'NGAV' },
+        } as PolicyCreateEndpointConfig;
+
+        const policy = await createDefaultPolicyWithFeature(config);
+
+        expect(policy.linux.events.dns).toBe(false);
+      });
+
+      it('should include Linux DNS events with EDREssential preset (but set to false)', async () => {
+        const config = {
+          type: 'endpoint',
+          endpointConfig: { preset: 'EDREssential' },
+        } as PolicyCreateEndpointConfig;
+
+        const policy = await createDefaultPolicyWithFeature(config);
+
+        expect(policy.linux.events.dns).toBe(false);
+      });
+
+      it('should include Linux DNS events with EDRComplete preset', async () => {
+        const config = {
+          type: 'endpoint',
+          endpointConfig: { preset: 'EDRComplete' },
+        } as PolicyCreateEndpointConfig;
+
+        const policy = await createDefaultPolicyWithFeature(config);
+
+        expect(policy.linux.events.dns).toBe(true);
+      });
+
+      it('should include Linux DNS events with cloud config', async () => {
+        const config = {
+          type: 'cloud',
+        } as PolicyCreateCloudConfig;
+
+        const policy = await createDefaultPolicyWithFeature(config);
+
+        expect(policy.linux.events.dns).toBe(true);
+      });
+    });
+  });
+
+  describe('Linux Ransomware Feature Flag', () => {
+    type LinuxRansomwareFlags = Pick<
+      ExperimentalFeatures,
+      'linuxRansomwareProtection' | 'perOsPolicySettings'
+    >;
+    const bothFlagsOn: LinuxRansomwareFlags = {
+      linuxRansomwareProtection: true,
+      perOsPolicySettings: true,
+    };
+
+    const createDefaultPolicyWithFeature = async (
+      flags: LinuxRansomwareFlags,
+      config?: AnyPolicyCreateConfig
+    ): Promise<PolicyConfig> => {
+      const experimentalFeaturesWithRansomwareFlag = {
+        trustedDevices: true,
+        linuxDnsEvents: true,
+        ...flags,
+      } as ExperimentalFeatures;
+
+      const esClientInfo = await elasticsearchServiceMock
+        .createClusterClient()
+        .asInternalUser.info();
+      esClientInfo.cluster_name = '';
+      esClientInfo.cluster_uuid = '';
+      return createDefaultPolicy(
+        licenseService,
+        config,
+        cloud,
+        esClientInfo,
+        productFeaturesService,
+        telemetryConfigProviderMock,
+        experimentalFeaturesWithRansomwareFlag
+      );
+    };
+
+    describe('with linuxRansomwareProtection and perOsPolicySettings feature flags enabled', () => {
+      it.each(['EDRComplete', 'EDREssential', 'NGAV'] as const)(
+        'should enable and support Linux ransomware on platinum with the %s preset',
+        async (preset) => {
+          const policy = await createDefaultPolicyWithFeature(bothFlagsOn, {
+            type: 'endpoint',
+            endpointConfig: { preset },
+          });
+
+          expect(policy.linux.ransomware).toEqual({ mode: 'prevent', supported: true });
+          expect(policy.linux.popup.ransomware).toEqual({ message: '', enabled: true });
+        }
+      );
+
+      it.each(['EDRComplete', 'EDREssential', 'NGAV'] as const)(
+        'should turn Linux ransomware off and unsupported below platinum with the %s preset',
+        async (preset) => {
+          licenseEmitter.next(Gold);
+
+          const policy = await createDefaultPolicyWithFeature(bothFlagsOn, {
+            type: 'endpoint',
+            endpointConfig: { preset },
+          });
+
+          expect(policy.linux.ransomware).toEqual({ mode: 'off', supported: false });
+          expect(policy.linux.popup.ransomware).toEqual({ message: '', enabled: false });
+        }
+      );
+
+      it('should turn Linux ransomware mode off for the Data Collection preset', async () => {
+        const policy = await createDefaultPolicyWithFeature(bothFlagsOn, {
+          type: 'endpoint',
+          endpointConfig: { preset: 'DataCollection' },
+        });
+
+        expect(policy.linux.ransomware?.mode).toBe('off');
+        expect(policy.linux.popup.ransomware).toEqual({ message: '', enabled: false });
+        expect(policy.linux.popup.ransomware).toEqual(policy.mac.popup.ransomware);
+      });
+
+      it('should turn Linux ransomware mode off for a cloud config', async () => {
+        const policy = await createDefaultPolicyWithFeature(bothFlagsOn, { type: 'cloud' });
+
+        expect(policy.linux.ransomware?.mode).toBe('off');
+        expect(policy.linux.popup.ransomware).toEqual({ message: '', enabled: false });
+        expect(policy.linux.popup.ransomware).toEqual(policy.mac.popup.ransomware);
+      });
+
+      it('should turn Linux ransomware mode off when the endpointPolicyProtections product feature is disabled', async () => {
+        productFeaturesService = createProductFeaturesServiceMock(
+          ALL_PRODUCT_FEATURE_KEYS.filter((key) => key !== 'endpoint_policy_protections')
+        );
+
+        const policy = await createDefaultPolicyWithFeature(bothFlagsOn, {
+          type: 'endpoint',
+          endpointConfig: { preset: 'EDRComplete' },
+        });
+
+        expect(policy.linux.ransomware?.mode).toBe('off');
+        expect(policy.linux.popup.ransomware).toEqual({ message: '', enabled: false });
+        expect(policy.linux.popup.ransomware).toEqual(policy.mac.popup.ransomware);
+      });
+    });
+
+    describe.each<[string, LinuxRansomwareFlags]>([
+      [
+        'linuxRansomwareProtection',
+        { linuxRansomwareProtection: false, perOsPolicySettings: true },
+      ],
+      ['perOsPolicySettings', { linuxRansomwareProtection: true, perOsPolicySettings: false }],
+    ])('with the %s feature flag disabled', (_flag, flags) => {
+      const tiers: Array<[tier: string, license: ILicense]> = [
+        ['basic', Basic],
+        ['gold', Gold],
+        ['platinum', Platinum],
+        ['enterprise', Enterprise],
+      ];
+      it.each(tiers)('should omit linux.ransomware on %s', async (_tier, license) => {
+        licenseEmitter.next(license);
+
+        const policy = await createDefaultPolicyWithFeature(flags, {
+          type: 'endpoint',
+          endpointConfig: { preset: 'EDRComplete' },
+        });
+
+        expect(policy.linux).not.toHaveProperty('ransomware');
+        expect(policy.linux.popup).not.toHaveProperty('ransomware');
+      });
+
+      it('should omit linux.ransomware for a cloud config', async () => {
+        const policy = await createDefaultPolicyWithFeature(flags, { type: 'cloud' });
+
+        expect(policy.linux).not.toHaveProperty('ransomware');
+        expect(policy.linux.popup).not.toHaveProperty('ransomware');
+      });
+    });
+  });
+
+  describe('AI Data Collection Feature Flag', () => {
+    const osList = ['windows', 'mac', 'linux'] as const;
+
+    const expectAiDataCollectionEnabled = (policy: PolicyConfig) => {
+      for (const os of osList) {
+        expect(policy[os].ai_data_collection).toEqual({ enabled: true });
+      }
+    };
+
+    const expectAiDataCollectionAbsent = (policy: PolicyConfig) => {
+      for (const os of osList) {
+        expect(policy[os]).not.toHaveProperty('ai_data_collection');
+      }
+    };
+
+    const createPolicyWithFlags = async (
+      flags: { endpointAiDataCollection: boolean; perOsPolicySettings: boolean },
+      config: AnyPolicyCreateConfig | undefined,
+      license: ILicense,
+      productFeatures: ProductFeaturesService
+    ): Promise<PolicyConfig> => {
+      licenseEmitter.next(license);
+
+      const experimentalFeaturesWithFlags = {
+        trustedDevices: true,
+        ...flags,
+      } as ExperimentalFeatures;
+
+      const esClientInfo = await elasticsearchServiceMock
+        .createClusterClient()
+        .asInternalUser.info();
+      esClientInfo.cluster_name = '';
+      esClientInfo.cluster_uuid = '';
+
+      return createDefaultPolicy(
+        licenseService,
+        config,
+        cloud,
+        esClientInfo,
+        productFeatures,
+        telemetryConfigProviderMock,
+        experimentalFeaturesWithFlags
+      );
+    };
+
+    describe('with endpointAiDataCollection and perOsPolicySettings both enabled', () => {
+      const bothEnabled = { endpointAiDataCollection: true, perOsPolicySettings: true };
+      const edrCompleteConfig: PolicyCreateEndpointConfig = {
+        type: 'endpoint',
+        endpointConfig: { preset: 'EDRComplete' },
+      };
+      // `endpoint_policy_protections` disabled emulates the serverless essentials tier.
+      const serverlessEssentialsProductFeatures = createProductFeaturesServiceMock(
+        ALL_PRODUCT_FEATURE_KEYS.filter(
+          (key) => key !== ProductFeatureSecurityKey.endpointPolicyProtections
+        )
+      );
+
+      it.each<
+        [
+          name: string,
+          config: AnyPolicyCreateConfig | undefined,
+          license: ILicense,
+          productFeatures: 'default' | 'serverlessEssentials'
+        ]
+      >([
+        [
+          'the NGAV preset',
+          { type: 'endpoint', endpointConfig: { preset: 'NGAV' } },
+          Platinum,
+          'default',
+        ],
+        [
+          'the EDREssential preset',
+          { type: 'endpoint', endpointConfig: { preset: 'EDREssential' } },
+          Platinum,
+          'default',
+        ],
+        ['the EDRComplete preset', edrCompleteConfig, Platinum, 'default'],
+        [
+          'the DataCollection preset',
+          { type: 'endpoint', endpointConfig: { preset: 'DataCollection' } },
+          Platinum,
+          'default',
+        ],
+        ['a cloud config', { type: 'cloud' } as PolicyCreateCloudConfig, Platinum, 'default'],
+        ['a below-platinum license', edrCompleteConfig, Gold, 'default'],
+        [
+          'the endpoint_policy_protections product feature disabled',
+          edrCompleteConfig,
+          Platinum,
+          'serverlessEssentials',
+        ],
+      ])(
+        'enables ai_data_collection on every OS for %s',
+        async (_name, config, license, productFeaturesVariant) => {
+          const productFeatures =
+            productFeaturesVariant === 'serverlessEssentials'
+              ? serverlessEssentialsProductFeatures
+              : productFeaturesService;
+
+          const policy = await createPolicyWithFlags(bothEnabled, config, license, productFeatures);
+
+          expectAiDataCollectionEnabled(policy);
+        }
+      );
+    });
+
+    describe('with either flag disabled', () => {
+      it.each<
+        [name: string, flags: { endpointAiDataCollection: boolean; perOsPolicySettings: boolean }]
+      >([
+        ['both flags off', { endpointAiDataCollection: false, perOsPolicySettings: false }],
+        [
+          'only perOsPolicySettings on',
+          { endpointAiDataCollection: false, perOsPolicySettings: true },
+        ],
+        [
+          'only endpointAiDataCollection on',
+          { endpointAiDataCollection: true, perOsPolicySettings: false },
+        ],
+      ])('omits ai_data_collection on every OS when %s', async (_name, flags) => {
+        const config: PolicyCreateEndpointConfig = {
+          type: 'endpoint',
+          endpointConfig: { preset: 'EDRComplete' },
+        };
+
+        const policy = await createPolicyWithFlags(flags, config, Platinum, productFeaturesService);
+
+        expectAiDataCollectionAbsent(policy);
+      });
+    });
+  });
+});

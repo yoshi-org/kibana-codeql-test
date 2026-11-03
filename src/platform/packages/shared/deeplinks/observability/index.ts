@@ -1,0 +1,41 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+export {
+  LOGS_APP_ID,
+  OBSERVABILITY_LOGS_EXPLORER_APP_ID,
+  LAST_USED_LOGS_VIEWER_APP_ID,
+  OBSERVABILITY_ONBOARDING_APP_ID,
+  OBSERVABILITY_OVERVIEW_APP_ID,
+  AI_ASSISTANT_APP_ID,
+  OBLT_UX_APP_ID,
+  OBLT_DIGITAL_EXPERIENCE_APP_ID,
+  OBLT_PROFILING_APP_ID,
+  INGEST_HUB_APP_ID,
+  ONBOARDING_APP_ID,
+  NIGHTSHIFT_APP_ID,
+  OBSERVABILITY_ALERTING_APP_ID,
+  OBSERVABILITY_ALERTING_APP_ROUTE,
+  OBSERVABILITY_ALERTING_BASE_PATH,
+  OBSERVABILITY_ALERTING_ALERTS_PATH,
+  OBSERVABILITY_ALERTING_INBOX_PATH,
+  OBSERVABILITY_ALERTING_RULES_V1_PATH,
+  OBSERVABILITY_ALERTING_RULES_V2_PATH,
+  OBSERVABILITY_ALERTING_RULE_LIBRARY_PATH,
+  OBSERVABILITY_ALERTING_ACTION_POLICIES_PATH,
+  OBSERVABILITY_ALERTING_EXECUTION_HISTORY_PATH,
+} from './constants';
+export type {
+  AppId,
+  DeepLinkId,
+  ObservabilityAlertingLinkId,
+  NightshiftLinkId,
+  StreamsLinkId,
+} from './deep_links';
+export * from './locators';

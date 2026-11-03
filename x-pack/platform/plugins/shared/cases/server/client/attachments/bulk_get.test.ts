@@ -1,0 +1,258 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import Boom from '@hapi/boom';
+import { MAX_BULK_GET_ATTACHMENTS } from '../../../common/constants';
+import { mockCaseComments, mockCaseUnifiedAttachments } from '../../mocks';
+import { createCasesClientMockArgs, createCasesClientMock } from '../mocks';
+import { bulkGet } from './bulk_get';
+
+describe('bulkGet', () => {
+  const attachmentSO = mockCaseUnifiedAttachments[0];
+  const unifiedAttachmentSO = mockCaseUnifiedAttachments[0];
+  const legacyAttachmentSO = mockCaseComments[0];
+
+  describe('errors', () => {
+    const casesClient = createCasesClientMock();
+    const clientArgs = createCasesClientMockArgs();
+
+    clientArgs.authorization.getAndEnsureAuthorizedEntities.mockResolvedValue({
+      authorized: [attachmentSO],
+      unauthorized: [],
+    });
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it(`throws when trying to fetch more than ${MAX_BULK_GET_ATTACHMENTS} attachments`, async () => {
+      await expect(
+        bulkGet(
+          {
+            savedObjectIds: Array(MAX_BULK_GET_ATTACHMENTS + 1).fill('foobar'),
+            caseID: '123',
+          },
+          clientArgs,
+          casesClient
+        )
+      ).rejects.toThrow(
+        `Error: ids: The length of the field ids is too long. Array must be of length <= ${MAX_BULK_GET_ATTACHMENTS}.`
+      );
+    });
+
+    it('throws when trying to fetch zero attachments', async () => {
+      await expect(
+        bulkGet({ savedObjectIds: [], caseID: '123' }, clientArgs, casesClient)
+      ).rejects.toThrow(
+        'Error: ids: The length of the field ids is too short. Array must be of length >= 1.'
+      );
+    });
+
+    it('constructs the case error correctly', async () => {
+      clientArgs.services.attachmentService.getter.bulkGet.mockResolvedValue({
+        saved_objects: [
+          attachmentSO,
+          {
+            id: '1',
+            type: 'cases',
+            error: {
+              error: 'My error',
+              message: 'not found',
+              statusCode: 404,
+            },
+            references: [],
+          },
+        ],
+      });
+
+      const res = await bulkGet(
+        { savedObjectIds: ['my-case-1'], caseID: 'mock-id-1' },
+        clientArgs,
+        casesClient
+      );
+
+      expect(res.attachments.length).toBe(1);
+      expect(res.errors.length).toBe(1);
+
+      expect(res.errors[0]).toEqual({
+        savedObjectId: '1',
+        error: 'My error',
+        message: 'not found',
+        status: 404,
+      });
+    });
+
+    it('constructs the case error correctly in case of an SO decorated error', async () => {
+      clientArgs.services.attachmentService.getter.bulkGet.mockResolvedValue({
+        saved_objects: [
+          attachmentSO,
+          {
+            id: '1',
+            type: 'cases',
+            error: {
+              ...Boom.boomify(new Error('My error'), {
+                statusCode: 404,
+                message: 'SO not found',
+              }),
+            },
+            references: [],
+          },
+        ],
+      });
+
+      const res = await bulkGet(
+        { savedObjectIds: ['my-case-1'], caseID: 'mock-id-1' },
+        clientArgs,
+        casesClient
+      );
+
+      expect(res.attachments.length).toBe(1);
+      expect(res.errors.length).toBe(1);
+
+      expect(res.errors[0]).toEqual({
+        savedObjectId: '1',
+        error: 'Not Found',
+        message: 'SO not found: My error',
+        status: 404,
+      });
+    });
+
+    it('keeps a not found error that has no references', async () => {
+      clientArgs.services.attachmentService.getter.bulkGet.mockResolvedValue({
+        saved_objects: [
+          attachmentSO,
+          {
+            id: 'missing',
+            type: 'cases-attachments',
+            error: { error: 'Not Found', message: 'not found', statusCode: 404 },
+          } as never,
+        ],
+      });
+
+      const res = await bulkGet(
+        { savedObjectIds: ['missing'], caseID: 'mock-id-1' },
+        clientArgs,
+        casesClient
+      );
+
+      expect(res.errors).toEqual([
+        { savedObjectId: 'missing', error: 'Not Found', message: 'not found', status: 404 },
+      ]);
+    });
+
+    it('reports decode errors from another case as association errors', async () => {
+      const decodeError = (id: string, caseId: string) => ({
+        id,
+        type: 'cases-attachments',
+        error: {
+          error: 'Bad Request',
+          message: 'Attachment type "security.secret" is not recognized.',
+          statusCode: 400,
+        },
+        references: [{ id: caseId, name: 'associated-cases', type: 'cases' }],
+      });
+      clientArgs.services.attachmentService.getter.bulkGet.mockResolvedValue({
+        saved_objects: [
+          attachmentSO,
+          decodeError('same-case', 'mock-id-1'),
+          decodeError('other-case', 'other-case-id'),
+        ],
+      });
+
+      const res = await bulkGet(
+        { savedObjectIds: ['same-case', 'other-case'], caseID: 'mock-id-1' },
+        clientArgs,
+        casesClient
+      );
+
+      expect(res.errors).toEqual(
+        expect.arrayContaining([
+          {
+            savedObjectId: 'same-case',
+            error: 'Bad Request',
+            message: 'Attachment type "security.secret" is not recognized.',
+            status: 400,
+          },
+          {
+            savedObjectId: 'other-case',
+            error: 'Bad Request',
+            message: 'Attachment is not attached to case id=mock-id-1',
+            status: 400,
+          },
+        ])
+      );
+      expect(res.errors).toHaveLength(2);
+    });
+  });
+
+  describe('returns unified attachments', () => {
+    const casesClient = createCasesClientMock();
+    const clientArgs = createCasesClientMockArgs();
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      clientArgs.authorization.getAndEnsureAuthorizedEntities.mockResolvedValue({
+        authorized: [unifiedAttachmentSO],
+        unauthorized: [],
+      });
+      clientArgs.services.attachmentService.getter.bulkGet.mockResolvedValue({
+        saved_objects: [unifiedAttachmentSO],
+      });
+    });
+
+    it('returns unified attachments', async () => {
+      const res = await bulkGet(
+        { savedObjectIds: ['my-case-1'], caseID: 'mock-id-1' },
+        clientArgs,
+        casesClient
+      );
+
+      expect(clientArgs.services.attachmentService.getter.bulkGet).toHaveBeenCalledWith([
+        'my-case-1',
+      ]);
+      expect(res.attachments[0]).toEqual(
+        expect.objectContaining({
+          id: unifiedAttachmentSO.id,
+          type: 'comment',
+          data: { content: 'test' },
+        })
+      );
+    });
+  });
+
+  describe('returns a legacy attachment as unified', () => {
+    const casesClient = createCasesClientMock();
+    const clientArgs = createCasesClientMockArgs();
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      clientArgs.authorization.getAndEnsureAuthorizedEntities.mockResolvedValue({
+        authorized: [legacyAttachmentSO],
+        unauthorized: [],
+      });
+      clientArgs.services.attachmentService.getter.bulkGet.mockResolvedValue({
+        saved_objects: [legacyAttachmentSO],
+      });
+    });
+
+    it('returns a legacy attachment as unified', async () => {
+      const res = await bulkGet(
+        { savedObjectIds: [legacyAttachmentSO.id], caseID: 'mock-id-1' },
+        clientArgs,
+        casesClient
+      );
+
+      expect(res.attachments[0]).toEqual(
+        expect.objectContaining({
+          id: legacyAttachmentSO.id,
+          type: 'comment',
+          data: { content: 'Wow, good luck catching that bad meanie!' },
+        })
+      );
+    });
+  });
+});

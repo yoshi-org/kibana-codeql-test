@@ -1,0 +1,9 @@
+{
+  "type": "shared-common",
+  "id": "@kbn/mapbox-gl",
+  "owner": [
+    "@elastic/kibana-dashboards"
+  ],
+  "group": "platform",
+  "visibility": "private"
+}

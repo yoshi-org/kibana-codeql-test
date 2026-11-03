@@ -1,0 +1,178 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+
+import type { EuiBasicTableColumn, EuiTableSelectionType } from '@elastic/eui';
+
+import { EuiInMemoryTable, EuiSkeletonText, EuiSpacer, EuiEmptyPrompt } from '@elastic/eui';
+
+import { OBSERVABLE_TYPES_BUILTIN } from '../../../common/constants';
+import type { Observable, ObservableType } from '../../../common/types/domain';
+import type { CaseUI } from '../../../common/ui';
+import * as i18n from './translations';
+import { AddObservable } from './add_observable';
+import { ObservableActionsPopoverButton } from './observable_actions_popover_button';
+import { useGetCaseConfiguration } from '../../containers/configure/use_get_case_configuration';
+import { ObservablesUtilityBar } from './observables_utility_bar';
+import { useCanRunCaseWorkflow } from '../workflows/use_run_case_workflow';
+import { useCasesContext } from '../cases_context/use_cases_context';
+
+const getColumns = (
+  caseData: CaseUI,
+  observableTypes: ObservableType[],
+  canRunWorkflow: boolean
+): Array<EuiBasicTableColumn<Observable>> => [
+  {
+    name: i18n.OBSERVABLE_VALUE,
+    field: 'value',
+    'data-test-subj': 'cases-observables-table-value',
+  },
+  {
+    name: i18n.OBSERVABLE_TYPE,
+    field: 'typeKey',
+    'data-test-subj': 'cases-observables-table-type',
+    render: (typeKey: string) =>
+      observableTypes.find((observableType) => observableType.key === typeKey)?.label || '-',
+  },
+  {
+    name: i18n.OBSERVABLE_DESCRIPTION,
+    field: 'description',
+    'data-test-subj': 'cases-observables-table-description',
+  },
+  {
+    name: i18n.DATE_ADDED,
+    field: 'createdAt',
+    'data-test-subj': 'cases-observables-table-date-added',
+    dataType: 'date',
+  },
+  {
+    name: i18n.OBSERVABLE_ACTIONS,
+    field: 'actions',
+    'data-test-subj': 'cases-observables-table-actions',
+    width: '120px',
+    actions: [
+      {
+        name: i18n.OBSERVABLE_ACTIONS,
+        render: (observable: Observable) => {
+          return (
+            <ObservableActionsPopoverButton
+              caseData={caseData}
+              observable={observable}
+              canRunWorkflow={canRunWorkflow}
+            />
+          );
+        },
+      },
+    ],
+  },
+];
+
+const EmptyObservablesTable = ({ caseData }: { caseData: CaseUI }) => (
+  <EuiEmptyPrompt
+    title={<h3>{i18n.NO_OBSERVABLES}</h3>}
+    data-test-subj="cases-observables-table-empty"
+    titleSize="xs"
+    actions={<AddObservable caseData={caseData} />}
+  />
+);
+
+EmptyObservablesTable.displayName = 'EmptyObservablesTable';
+
+export interface ObservablesTableProps {
+  caseData: CaseUI;
+  isLoading: boolean;
+  onExtractObservablesChanged: (isOn: boolean) => void;
+}
+
+export const ObservablesTable = ({
+  caseData,
+  isLoading,
+  onExtractObservablesChanged,
+}: ObservablesTableProps) => {
+  const canRunWorkflow = useCanRunCaseWorkflow();
+  const { permissions } = useCasesContext();
+  const canSelectObservables = canRunWorkflow || permissions.update;
+
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(new Set());
+
+  // `caseData.observables` is the search-filtered list. Drop ids that leave it so a hidden
+  // observable does not come back selected, and become a bulk target, when the search is cleared.
+  useEffect(() => {
+    setSelectedIds((previous) => {
+      const displayedIds = new Set(caseData.observables.map(({ id }) => id));
+      const next = new Set([...previous].filter((id) => displayedIds.has(id)));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [caseData.observables]);
+
+  const selected = useMemo(
+    () => caseData.observables.filter(({ id }) => selectedIds.has(id)),
+    [caseData.observables, selectedIds]
+  );
+
+  const onSelectionChange = useCallback(
+    (items: Observable[]) => setSelectedIds(new Set(items.map(({ id }) => id))),
+    []
+  );
+
+  const onBulkActionSuccess = useCallback(() => setSelectedIds(new Set()), []);
+
+  const selection: EuiTableSelectionType<Observable> | undefined = useMemo(
+    () => (canSelectObservables ? { selected, onSelectionChange } : undefined),
+    [canSelectObservables, onSelectionChange, selected]
+  );
+
+  const filesTableRowProps = useCallback(
+    (observable: Observable) => ({
+      'data-test-subj': `cases-observables-table-row-${observable.id}`,
+    }),
+    []
+  );
+
+  const { data: currentConfiguration, isLoading: loadingCaseConfigure } = useGetCaseConfiguration();
+
+  const observableTypes = useMemo(
+    () => [...OBSERVABLE_TYPES_BUILTIN, ...currentConfiguration.observableTypes],
+    [currentConfiguration.observableTypes]
+  );
+  const columns = useMemo(
+    () => getColumns(caseData, observableTypes, canRunWorkflow),
+    [caseData, observableTypes, canRunWorkflow]
+  );
+
+  return isLoading || loadingCaseConfigure ? (
+    <>
+      <EuiSpacer size="l" />
+      <EuiSkeletonText data-test-subj="cases-observables-table-loading" lines={10} />
+    </>
+  ) : (
+    <>
+      <ObservablesUtilityBar
+        caseData={caseData}
+        isLoading={isLoading}
+        onExtractObservablesChanged={onExtractObservablesChanged}
+        selectedObservables={selected}
+        canRunWorkflow={canRunWorkflow}
+        onBulkActionSuccess={onBulkActionSuccess}
+      />
+      <EuiSpacer size="xs" />
+      <EuiInMemoryTable
+        tableCaption={i18n.OBSERVABLES_TABLE}
+        items={caseData.observables}
+        itemId="id"
+        rowHeader="id"
+        columns={columns}
+        data-test-subj="cases-observables-table"
+        noItemsMessage={<EmptyObservablesTable caseData={caseData} />}
+        rowProps={filesTableRowProps}
+        selection={selection}
+      />
+    </>
+  );
+};
+
+ObservablesTable.displayName = 'ObservablesTable';

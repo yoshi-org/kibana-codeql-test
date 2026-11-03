@@ -1,0 +1,571 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import { createHash } from 'crypto';
+import type {
+  Entry,
+  EntryNested,
+  ExceptionListItemSchema,
+  FoundExceptionListItemSchema,
+} from '@kbn/securitysolution-io-ts-list-types';
+import { EntryFieldType } from '@kbn/securitysolution-utils';
+
+import { ENDPOINT_ARTIFACT_LISTS } from '@kbn/securitysolution-list-constants';
+import type { ExceptionListClient } from '@kbn/lists-plugin/server';
+import { validate } from '@kbn/securitysolution-io-ts-utils';
+import type { Logger } from '@kbn/logging';
+import {
+  DISABLED_ARTIFACT_TAG,
+  PROCESS_DESCENDANT_EXTRA_ENTRY,
+  TRUSTED_PROCESS_DESCENDANTS_TAG,
+} from '../../../../common/endpoint/service/artifacts/constants';
+import type { ExperimentalFeatures } from '../../../../common';
+import { isProcessDescendantsEnabled } from '../../../../common/endpoint/service/artifacts/utils';
+import { MetaArchValue, EndpointArtifactScanContext } from '../../../../common/endpoint/types';
+import type { YaraCompiledRule } from '../libyara';
+import { YaraEngineUnavailableError } from '../libyara';
+import { validateCustomYaraRule } from '../custom_yara_signatures';
+import type {
+  InternalArtifactCompleteSchema,
+  TranslatedEntry,
+  TranslatedPerformantEntries,
+  TranslatedEntryMatcher,
+  TranslatedEntryMatchWildcard,
+  TranslatedEntryMatchWildcardMatcher,
+  TranslatedEntryNestedEntry,
+  TranslatedExceptionListItem,
+  TranslatedYaraRule,
+  WrappedTranslatedExceptionList,
+  WrappedTranslatedYaraRulesList,
+  TranslatedEntriesOfProcessDescendants,
+  TranslatedEntryTrustDescendants,
+} from '../../schemas';
+import {
+  translatedPerformantEntries as translatedPerformantEntriesType,
+  translatedEntry as translatedEntryType,
+  translatedEntryMatchAnyMatcher,
+  translatedEntryMatchMatcher,
+  translatedEntryMatchWildcardMatcher,
+  translatedEntryNestedEntry,
+  wrappedTranslatedExceptionList,
+  wrappedTranslatedYaraRulesList,
+} from '../../schemas';
+
+export async function buildArtifact(
+  exceptions: WrappedTranslatedExceptionList | WrappedTranslatedYaraRulesList,
+  schemaVersion: string,
+  os: string,
+  name: string
+): Promise<InternalArtifactCompleteSchema> {
+  const exceptionsBuffer = Buffer.from(JSON.stringify(exceptions));
+  const sha256 = createHash('sha256').update(exceptionsBuffer.toString()).digest('hex');
+
+  // Keep compression info empty in case its a duplicate. Lazily compress before committing if needed.
+  return {
+    identifier: `${name}-${os}-${schemaVersion}`,
+    compressionAlgorithm: 'none',
+    encryptionAlgorithm: 'none',
+    decodedSha256: sha256,
+    encodedSha256: sha256,
+    decodedSize: exceptionsBuffer.byteLength,
+    encodedSize: exceptionsBuffer.byteLength,
+    body: exceptionsBuffer.toString('base64'),
+  };
+}
+
+export type ArtifactListId =
+  | typeof ENDPOINT_ARTIFACT_LISTS.endpointExceptions.id
+  | typeof ENDPOINT_ARTIFACT_LISTS.trustedApps.id
+  | typeof ENDPOINT_ARTIFACT_LISTS.trustedDevices.id
+  | typeof ENDPOINT_ARTIFACT_LISTS.eventFilters.id
+  | typeof ENDPOINT_ARTIFACT_LISTS.hostIsolationExceptions.id
+  | typeof ENDPOINT_ARTIFACT_LISTS.blocklists.id
+  | typeof ENDPOINT_ARTIFACT_LISTS.customYaraSignatures.id;
+
+export function convertExceptionsToEndpointFormat(
+  exceptions: ExceptionListItemSchema[],
+  schemaVersion: string,
+  experimentalFeatures: ExperimentalFeatures
+): WrappedTranslatedExceptionList {
+  const translatedExceptions = {
+    entries: translateToEndpointExceptions(exceptions, schemaVersion, experimentalFeatures),
+  };
+  const [validated, errors] = validate(translatedExceptions, wrappedTranslatedExceptionList);
+  if (errors != null) {
+    throw new Error(errors);
+  }
+
+  return validated as WrappedTranslatedExceptionList;
+}
+
+export async function convertYaraRulesToEndpointFormat(
+  exceptions: ExceptionListItemSchema[],
+  schemaVersion: string,
+  logger?: Logger
+): Promise<WrappedTranslatedYaraRulesList> {
+  const translatedYaraRules = {
+    entries: await translateToYaraRules(exceptions, schemaVersion, logger),
+  };
+  const [validated, errors] = validate(translatedYaraRules, wrappedTranslatedYaraRulesList);
+  if (errors != null) {
+    throw new Error(errors);
+  }
+
+  return validated as WrappedTranslatedYaraRulesList;
+}
+
+export async function getFilteredEndpointExceptionListRaw({
+  elClient,
+  filter,
+  listId,
+}: {
+  elClient: ExceptionListClient;
+  filter: string;
+  listId: ArtifactListId;
+}): Promise<ExceptionListItemSchema[]> {
+  const perPage = 1000;
+  let exceptions: ExceptionListItemSchema[] = [];
+  let page = 1;
+  let paging = true;
+
+  while (paging) {
+    const response = await elClient.findExceptionListItem({
+      listId,
+      namespaceType: 'agnostic',
+      filter,
+      perPage,
+      page,
+      sortField: 'created_at',
+      sortOrder: 'desc',
+    });
+
+    if (response?.data !== undefined) {
+      exceptions = exceptions.concat(response.data);
+
+      paging = (page - 1) * perPage + response.data.length < response.total;
+      page++;
+    } else {
+      break;
+    }
+  }
+
+  return exceptions;
+}
+
+export async function getAllItemsFromEndpointExceptionList({
+  elClient,
+  listId,
+  os,
+}: {
+  elClient: ExceptionListClient;
+  listId: ArtifactListId;
+  os: string;
+}): Promise<FoundExceptionListItemSchema['data']> {
+  const osFilter = `exception-list-agnostic.attributes.os_types:\"${os}\"`;
+
+  return getFilteredEndpointExceptionListRaw({
+    elClient,
+    filter: osFilter,
+    listId,
+  });
+}
+
+const DEFAULT_YARA_ARCH_CONTEXT: TranslatedYaraRule['arch_context'] = [
+  MetaArchValue.X86,
+  MetaArchValue.ARM64,
+];
+
+const DEFAULT_YARA_SCAN_CONTEXT: TranslatedYaraRule['scan_context'] = [
+  EndpointArtifactScanContext.MEMORY,
+];
+
+/** Retries per item for transient libyara engine failures while packing artifacts. */
+const YARA_ITEM_VALIDATE_MAX_ATTEMPTS = 3;
+
+/**
+ * Reads `arch_context` from rules that already passed `validateCustomYaraRule`.
+ * Product validation guarantees a non-empty rule list and that `meta.arch` is either
+ * omitted on every rule or set to the same allowed value(s) on every rule.
+ */
+function getArchContextFromCompiledRules(
+  rules: YaraCompiledRule[]
+): TranslatedYaraRule['arch_context'] {
+  const originalArch = rules[0]?.meta.arch;
+  if (originalArch === undefined) {
+    return [...DEFAULT_YARA_ARCH_CONTEXT];
+  }
+
+  return originalArch.split(/, ?/) as TranslatedYaraRule['arch_context'];
+}
+
+const skipYaraItem = (logger: Logger | undefined, itemId: string, reason: string): void => {
+  logger?.warn(
+    `Skipping Custom YARA Signature [${itemId}] while building the endpoint artifact: ${reason}`
+  );
+};
+
+async function validateCustomYaraRuleWithRetries(
+  ruleText: string,
+  osTypes: ExceptionListItemSchema['os_types'],
+  itemId: string,
+  logger?: Logger
+): Promise<Awaited<ReturnType<typeof validateCustomYaraRule>>> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await validateCustomYaraRule(ruleText, osTypes);
+    } catch (error) {
+      if (!(error instanceof YaraEngineUnavailableError)) {
+        throw error;
+      }
+
+      if (attempt >= YARA_ITEM_VALIDATE_MAX_ATTEMPTS) {
+        logger?.error(
+          `libyara engine failed validating Custom YARA Signature [${itemId}] after ${YARA_ITEM_VALIDATE_MAX_ATTEMPTS} attempts; aborting artifact build. ${error.message}`
+        );
+        throw error;
+      }
+
+      logger?.warn(
+        `libyara engine failed validating Custom YARA Signature [${itemId}] on attempt ${attempt}/${YARA_ITEM_VALIDATE_MAX_ATTEMPTS}; retrying. ${error.message}`
+      );
+    }
+  }
+}
+
+async function translateOneYaraException(
+  exception: ExceptionListItemSchema,
+  logger?: Logger
+): Promise<TranslatedYaraRule | undefined> {
+  if ((exception.tags ?? []).includes(DISABLED_ARTIFACT_TAG)) {
+    return undefined;
+  }
+
+  const [entry] = exception.entries;
+  if (entry?.type !== 'match' || typeof entry.value !== 'string') {
+    return undefined;
+  }
+
+  // Full product validation (compile + meta constraints) so invalid arch/scan_type/etc.
+  // are skipped here instead of aborting later schema validation of the whole artifact.
+  // Engine failures are retried per item; exhausted retries propagate so the packager
+  // cannot publish a partial or empty YARA artifact from a flaky/unavailable engine.
+  const result = await validateCustomYaraRuleWithRetries(
+    entry.value,
+    exception.os_types,
+    exception.item_id,
+    logger
+  );
+
+  if (result.errorCount > 0) {
+    skipYaraItem(logger, exception.item_id, `validation reported ${result.errorCount} error(s)`);
+    return undefined;
+  }
+
+  return {
+    yara_rule_data: entry.value,
+    arch_context: getArchContextFromCompiledRules(result.rules),
+    scan_context: [...DEFAULT_YARA_SCAN_CONTEXT],
+    entry_id: exception.id,
+    entry_name: exception.name,
+  };
+}
+
+/**
+ * Translates Custom YARA Signature exception items into the endpoint YARA artifact format.
+ * Items that fail product validation are omitted so one bad entry cannot fail the packager.
+ * Exhausted per-item `YaraEngineUnavailableError` retries propagate so the packager aborts
+ * the manifest build and keeps the previous committed manifest.
+ */
+async function translateToYaraRules(
+  exceptions: ExceptionListItemSchema[],
+  schemaVersion: string,
+  logger?: Logger
+): Promise<TranslatedYaraRule[]> {
+  if (schemaVersion !== 'v1') {
+    throw new Error('unsupported schemaVersion');
+  }
+
+  const translatedItems: TranslatedYaraRule[] = [];
+
+  for (const exception of exceptions) {
+    // libyara compiles synchronously: release the event loop between items so Kibana keeps serving requests.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // Sequential: libyara WASM is a process singleton and is not safe for concurrent ccall.
+    const translatedItem = await translateOneYaraException(exception, logger);
+    if (translatedItem !== undefined) {
+      translatedItems.push(translatedItem);
+    }
+  }
+
+  return translatedItems;
+}
+
+/**
+ * Translates Exception list items to Exceptions the endpoint can understand
+ * @param exceptions
+ * @param schemaVersion
+ * @param experimentalFeatures
+ */
+export function translateToEndpointExceptions(
+  exceptions: ExceptionListItemSchema[],
+  schemaVersion: string,
+  experimentalFeatures: ExperimentalFeatures
+): TranslatedExceptionListItem[] {
+  const entrySet = new Set();
+  const uniqueItems: TranslatedExceptionListItem[] = [];
+  const storeUniqueItem = (item: TranslatedExceptionListItem) => {
+    const entryHash = createHash('sha256').update(JSON.stringify(item)).digest('hex');
+
+    if (!entrySet.has(entryHash)) {
+      uniqueItems.push(item);
+      entrySet.add(entryHash);
+    }
+  };
+
+  if (schemaVersion === 'v1') {
+    exceptions.forEach((entry) => {
+      // For Blocklist, we create a single entry for each blocklist entry item
+      // if there is an entry with more than one hash type.
+      if (
+        entry.list_id === ENDPOINT_ARTIFACT_LISTS.blocklists.id &&
+        entry.entries.length > 1 &&
+        !!entry.entries[0].field.match(EntryFieldType.HASH)
+      ) {
+        entry.entries.forEach((blocklistSingleEntry) => {
+          const translatedItem = translateItem(schemaVersion, {
+            ...entry,
+            entries: [blocklistSingleEntry],
+          });
+
+          storeUniqueItem(translatedItem);
+        });
+      } else if (
+        entry.list_id === ENDPOINT_ARTIFACT_LISTS.eventFilters.id &&
+        isProcessDescendantsEnabled(entry)
+      ) {
+        const translatedItem = translateProcessDescendantEventFilter(schemaVersion, entry);
+        storeUniqueItem(translatedItem);
+      } else if (
+        experimentalFeatures.filterProcessDescendantsForTrustedAppsEnabled &&
+        entry.list_id === ENDPOINT_ARTIFACT_LISTS.trustedApps.id &&
+        isProcessDescendantsEnabled(entry, TRUSTED_PROCESS_DESCENDANTS_TAG)
+      ) {
+        const translatedItem = translateProcessDescendantTrustedApp(schemaVersion, entry);
+        storeUniqueItem(translatedItem);
+      } else {
+        const translatedItem = translateItem(schemaVersion, entry);
+        storeUniqueItem(translatedItem);
+      }
+    });
+
+    return uniqueItems;
+  } else {
+    throw new Error('unsupported schemaVersion');
+  }
+}
+
+function translateProcessDescendantEventFilter(
+  schemaVersion: string,
+  entry: ExceptionListItemSchema
+): TranslatedExceptionListItem {
+  const translatedEntries: TranslatedEntriesOfProcessDescendants = translateItem(schemaVersion, {
+    ...entry,
+    entries: [...entry.entries, PROCESS_DESCENDANT_EXTRA_ENTRY],
+  }) as TranslatedEntriesOfProcessDescendants;
+
+  return {
+    type: entry.type,
+    entries: [
+      {
+        operator: 'included',
+        type: 'descendent_of',
+        value: {
+          entries: [translatedEntries],
+        },
+      },
+    ],
+  };
+}
+
+function translateProcessDescendantTrustedApp(
+  schemaVersion: string,
+  entry: ExceptionListItemSchema
+): TranslatedEntryTrustDescendants {
+  const translatedEntries: TranslatedEntriesOfProcessDescendants = translateItem(schemaVersion, {
+    ...entry,
+    entries: [...entry.entries, PROCESS_DESCENDANT_EXTRA_ENTRY],
+  }) as TranslatedEntriesOfProcessDescendants;
+
+  return {
+    type: entry.type,
+    trust_descendants: true,
+    entries: translatedEntries.entries,
+  };
+}
+
+function getMatcherFunction({
+  field,
+  matchAny,
+  os,
+}: {
+  field: string;
+  matchAny?: boolean;
+  os: ExceptionListItemSchema['os_types'][number];
+}): TranslatedEntryMatcher {
+  const doesFieldEndWith: boolean =
+    field.endsWith('.caseless') || field.endsWith('.name') || field.endsWith('.text');
+
+  return matchAny
+    ? doesFieldEndWith
+      ? os === 'linux'
+        ? 'exact_cased_any'
+        : 'exact_caseless_any'
+      : 'exact_cased_any'
+    : doesFieldEndWith
+    ? os === 'linux'
+      ? 'exact_cased'
+      : 'exact_caseless'
+    : 'exact_cased';
+}
+
+function getMatcherWildcardFunction({
+  field,
+  os,
+}: {
+  field: string;
+  os: ExceptionListItemSchema['os_types'][number];
+}): TranslatedEntryMatchWildcardMatcher {
+  return field.endsWith('.caseless') || field.endsWith('.text')
+    ? os === 'linux'
+      ? 'wildcard_cased'
+      : 'wildcard_caseless'
+    : 'wildcard_cased';
+}
+
+function normalizeFieldName(field: string): string {
+  return field.endsWith('.caseless') || field.endsWith('.text')
+    ? field.substring(0, field.lastIndexOf('.'))
+    : field;
+}
+
+function translateItem(
+  schemaVersion: string,
+  item: ExceptionListItemSchema
+): TranslatedExceptionListItem {
+  const itemSet = new Set();
+
+  const entries: TranslatedExceptionListItem['entries'] = item.entries.reduce<TranslatedEntry[]>(
+    (translatedEntries, entry) => {
+      const translatedEntry = translateEntry(schemaVersion, item.entries, entry, item.os_types[0]);
+
+      if (translatedEntry !== undefined) {
+        if (translatedEntryType.is(translatedEntry)) {
+          const itemHash = createHash('sha256')
+            .update(JSON.stringify(translatedEntry))
+            .digest('hex');
+          if (!itemSet.has(itemHash)) {
+            translatedEntries.push(translatedEntry);
+            itemSet.add(itemHash);
+          }
+        }
+        if (translatedPerformantEntriesType.is(translatedEntry)) {
+          translatedEntry.forEach((tpe) => {
+            const itemHash = createHash('sha256').update(JSON.stringify(tpe)).digest('hex');
+            if (!itemSet.has(itemHash)) {
+              translatedEntries.push(tpe);
+              itemSet.add(itemHash);
+            }
+          });
+        }
+      }
+
+      return translatedEntries;
+    },
+    []
+  );
+
+  return {
+    type: item.type,
+    entries,
+  };
+}
+
+function translateEntry(
+  schemaVersion: string,
+  exceptionListItemEntries: ExceptionListItemSchema['entries'],
+  entry: Entry | EntryNested,
+  os: ExceptionListItemSchema['os_types'][number]
+): TranslatedEntry | TranslatedPerformantEntries | undefined {
+  switch (entry.type) {
+    case 'nested': {
+      const nestedEntries = entry.entries.reduce<TranslatedEntryNestedEntry[]>(
+        (entries, nestedEntry) => {
+          const translatedEntry = translateEntry(
+            schemaVersion,
+            exceptionListItemEntries,
+            nestedEntry,
+            os
+          );
+          if (nestedEntry !== undefined && translatedEntryNestedEntry.is(translatedEntry)) {
+            entries.push(translatedEntry);
+          }
+          return entries;
+        },
+        []
+      );
+      return {
+        entries: nestedEntries,
+        field: entry.field,
+        type: 'nested',
+      };
+    }
+    case 'match': {
+      const matcher = getMatcherFunction({ field: entry.field, os });
+      return translatedEntryMatchMatcher.is(matcher)
+        ? {
+            field: normalizeFieldName(entry.field),
+            operator: entry.operator,
+            type: matcher,
+            value: entry.value,
+          }
+        : undefined;
+    }
+    case 'match_any': {
+      const matcher = getMatcherFunction({ field: entry.field, matchAny: true, os });
+      return translatedEntryMatchAnyMatcher.is(matcher)
+        ? {
+            field: normalizeFieldName(entry.field),
+            operator: entry.operator,
+            type: matcher,
+            value: entry.value,
+          }
+        : undefined;
+    }
+    case 'wildcard': {
+      const wildcardMatcher = getMatcherWildcardFunction({ field: entry.field, os });
+      const translatedEntryWildcardMatcher =
+        translatedEntryMatchWildcardMatcher.is(wildcardMatcher);
+
+      const buildEntries = () => {
+        if (translatedEntryWildcardMatcher) {
+          // default process.executable entry
+          const wildcardProcessEntry: TranslatedEntryMatchWildcard = {
+            field: normalizeFieldName(entry.field),
+            operator: entry.operator,
+            type: wildcardMatcher,
+            value: entry.value,
+          };
+
+          return wildcardProcessEntry;
+        }
+      };
+
+      return buildEntries();
+    }
+  }
+}

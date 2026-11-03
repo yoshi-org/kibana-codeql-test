@@ -1,0 +1,89 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+import type { Datatable } from '@kbn/expressions-plugin/common';
+import { isMissingValue, NULL_PLACEHOLDER } from '@kbn/field-formats-common';
+import type { FormatFactory } from '@kbn/field-formats-plugin/common';
+import { createEscapeValue } from './escape_value';
+
+export const LINE_FEED_CHARACTER = '\r\n';
+export const CSV_MIME_TYPE = 'text/plain;charset=utf-8';
+
+interface CSVOptions {
+  csvSeparator: string;
+  quoteValues: boolean;
+  escapeFormulaValues: boolean;
+  formatFactory: FormatFactory;
+  raw?: boolean;
+  /**
+   * Mirrors `TablesAdapter.missingValueDisplay`: only `'table'` exports missing values as the
+   * dash the table renders; otherwise they go through the formatter and keep the `(null)` label.
+   */
+  missingValueDisplay?: 'text' | 'table';
+}
+
+export function datatableToCSV(
+  { columns, rows }: Datatable,
+  {
+    csvSeparator,
+    quoteValues,
+    formatFactory,
+    raw,
+    escapeFormulaValues,
+    missingValueDisplay,
+  }: CSVOptions
+) {
+  const escapeValues = createEscapeValue({
+    separator: csvSeparator,
+    quoteValues,
+    escapeFormulaValues,
+  });
+  // Placeholder is our own constant, not document content: still quote it when quoting
+  // is on (so a csvSeparator of "-" does not produce `--...`), but never formula-escape
+  // it into "'-".
+  const escapePlaceholder = createEscapeValue({
+    separator: csvSeparator,
+    quoteValues,
+    escapeFormulaValues: false,
+  });
+
+  const header: string[] = [];
+  const sortedColumnIds: string[] = [];
+  const formatters: Record<string, ReturnType<FormatFactory>> = {};
+
+  columns.forEach((column, i) => {
+    header[i] = escapeValues(column.name);
+    sortedColumnIds[i] = column.id;
+    formatters[column.id] = formatFactory(column.meta?.params);
+  });
+
+  if (header.length === 0) {
+    return '';
+  }
+
+  // Convert the array of row objects to an array of row arrays
+  const csvRows = rows.map((row) => {
+    return sortedColumnIds.map((id) => {
+      const value = row[id];
+
+      // Export what the table shows: missing values as a dash, quoted like any other
+      // non-alphanumeric cell but never formula-escaped. Charts keep the `(null)` label.
+      if (!raw && missingValueDisplay === 'table' && isMissingValue(value)) {
+        return escapePlaceholder(NULL_PLACEHOLDER);
+      }
+
+      return escapeValues(raw ? value : formatters[id].convertToText(value));
+    });
+  });
+
+  return (
+    [header, ...csvRows].map((row) => row.join(csvSeparator)).join(LINE_FEED_CHARACTER) +
+    LINE_FEED_CHARACTER // Add \r\n after last line
+  );
+}

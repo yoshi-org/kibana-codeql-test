@@ -1,0 +1,10 @@
+{
+  "type": "shared-common",
+  "id": "@kbn/dom-drag-drop",
+  "owner": [
+    "@elastic/kibana-dashboards",
+    "@elastic/kibana-discover"
+  ],
+  "group": "platform",
+  "visibility": "shared"
+}

@@ -1,0 +1,9 @@
+{
+  "type": "shared-browser",
+  "id": "@kbn/managed-content-badge",
+  "owner": [
+    "@elastic/kibana-dashboards"
+  ],
+  "group": "platform",
+  "visibility": "private"
+}

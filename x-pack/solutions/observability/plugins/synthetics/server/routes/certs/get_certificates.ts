@@ -1,0 +1,165 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import { z } from '@kbn/zod';
+import {
+  MAX_DATE_RANGE_LENGTH,
+  MAX_ROUTE_STRING_LENGTH,
+  queryBoolean,
+  queryNumber,
+} from '../zod_query';
+import { syntheticsMonitorAttributes } from '../../../common/types/saved_objects';
+import type { SyntheticsRestApiRouteFactory } from '../types';
+import { processMonitors } from '../../saved_objects/synthetics_monitor/process_monitors';
+import { SYNTHETICS_API_URLS } from '../../../common/constants';
+import type { CertResult, GetCertsParams } from '../../../common/runtime_types';
+import { ConfigKey } from '../../../common/constants/monitor_management';
+import { getSyntheticsCerts } from '../../queries/get_certs';
+import { isCCSEnabled } from '../../lib/remote_result_utils';
+import { parseRemoteNames } from '../../lib/parse_remote_names';
+
+export const getSyntheticsCertsRoute: SyntheticsRestApiRouteFactory<
+  { data: CertResult },
+  GetCertsParams
+> = () => ({
+  method: 'GET',
+  path: SYNTHETICS_API_URLS.CERTS,
+  validate: {
+    query: z.strictObject({
+      pageIndex: queryNumber.optional(),
+      size: queryNumber.optional(),
+      sortBy: z.string().max(256).optional(),
+      direction: z.string().max(256).optional(),
+      search: z.string().max(MAX_ROUTE_STRING_LENGTH).optional(),
+      from: z.string().max(MAX_DATE_RANGE_LENGTH).optional(),
+      to: z.string().max(MAX_DATE_RANGE_LENGTH).optional(),
+      // Upper bound on certificate `not_after` (datemath, e.g. `now+30d`), powering
+      // the "Expiring within" quick filter. Already-expired certs are included.
+      notValidAfter: z.string().max(MAX_DATE_RANGE_LENGTH).optional(),
+      // Comma-separated filters (e.g. `http,browser`) sent as strings to avoid
+      // query-array serialization edge cases. `monitorTypes` scopes by monitor
+      // type; `browserResourceTypes` and `certOrigin` are browser-only quick
+      // filters; `tags` scopes by monitor tag.
+      monitorTypes: z.string().max(MAX_ROUTE_STRING_LENGTH).optional(),
+      browserResourceTypes: z.string().max(MAX_ROUTE_STRING_LENGTH).optional(),
+      certOrigin: z.string().max(256).optional(),
+      tags: z.string().max(MAX_ROUTE_STRING_LENGTH).optional(),
+      // Comma-separated issuer (certificate authority) common names; scopes the
+      // list to certs signed by the selected CA(s).
+      issuers: z.string().max(MAX_ROUTE_STRING_LENGTH).optional(),
+      // Comma-separated remote cluster aliases; honoured only when CCS is on.
+      // Empty/absent → every configured cluster.
+      remoteNames: z.string().max(MAX_ROUTE_STRING_LENGTH).optional(),
+      // Same contract as Overview/Management: load enabled monitors from every
+      // space the user can read, and drop the CCS remote-branch space gate.
+      showFromAllSpaces: queryBoolean.optional(),
+    }),
+  },
+  handler: async ({
+    request,
+    response,
+    syntheticsEsClient,
+    monitorConfigRepository,
+    server,
+    spaceId,
+  }) => {
+    const {
+      monitorTypes,
+      browserResourceTypes,
+      certOrigin,
+      tags,
+      issuers,
+      remoteNames,
+      showFromAllSpaces,
+      ...queryParams
+    } = request.query;
+
+    const toList = (value?: string) =>
+      value
+        ? value
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined;
+
+    const ccsEnabled = isCCSEnabled(server);
+
+    const remoteNamesResult = parseRemoteNames(remoteNames);
+    if (!remoteNamesResult.ok) {
+      return response.badRequest({
+        body: {
+          message: `remoteNames must not exceed ${remoteNamesResult.max} entries (received ${remoteNamesResult.received})`,
+        },
+      });
+    }
+    const remoteNameList = remoteNamesResult.value;
+
+    const monitors = await monitorConfigRepository.getAll({
+      filter: `${syntheticsMonitorAttributes}.${ConfigKey.ENABLED}: true`,
+      showFromAllSpaces,
+    });
+
+    // Without CCS, no local monitors = no certs. With CCS, remote-only
+    // monitors may still contribute, so the search has to run.
+    if (!ccsEnabled && monitors.length === 0) {
+      return {
+        data: {
+          certs: [],
+          total: 0,
+        },
+      };
+    }
+
+    const { enabledMonitorQueryIds } = processMonitors(monitors);
+
+    const data = await getSyntheticsCerts({
+      ...queryParams,
+      monitorTypes: toList(monitorTypes),
+      browserResourceTypes: toList(browserResourceTypes),
+      certOrigin: toList(certOrigin),
+      tags: toList(tags),
+      issuers: toList(issuers),
+      syntheticsEsClient,
+      monitorIds: enabledMonitorQueryIds,
+      // The certificates page lists certs from every enabled monitor, including
+      // the certificate captured on a browser monitor's navigation request.
+      includeBrowserCerts: true,
+      ccsEnabled,
+      remoteNames: remoteNameList,
+      spaceId,
+      showFromAllSpaces: Boolean(showFromAllSpaces),
+    });
+    return { data: attachCertMonitorSpaces(data, monitors) };
+  },
+});
+
+export const attachCertMonitorSpaces = (
+  data: CertResult,
+  monitors: Array<{ attributes?: { config_id?: string }; namespaces?: string[] }>
+): CertResult => {
+  const spacesByConfigId = new Map<string, string[]>();
+  for (const monitor of monitors) {
+    const configId = monitor.attributes?.[ConfigKey.CONFIG_ID];
+    if (!configId || !monitor.namespaces?.length) {
+      continue;
+    }
+    spacesByConfigId.set(configId, monitor.namespaces);
+  }
+  if (spacesByConfigId.size === 0) {
+    return data;
+  }
+  return {
+    ...data,
+    certs: data.certs.map((cert) => ({
+      ...cert,
+      monitors: cert.monitors.map((mon) => {
+        const spaces = mon.configId ? spacesByConfigId.get(mon.configId) : undefined;
+        return spaces ? { ...mon, spaces } : mon;
+      }),
+    })),
+  };
+};

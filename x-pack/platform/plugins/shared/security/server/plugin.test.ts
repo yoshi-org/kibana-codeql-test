@@ -1,0 +1,390 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import type { Client } from '@elastic/elasticsearch';
+import { of } from 'rxjs';
+
+import { cloudMock } from '@kbn/cloud-plugin/server/mocks';
+import { ByteSizeValue } from '@kbn/config-schema';
+import type { PackageInfo } from '@kbn/core/server';
+import type { PluginInitializerContextMock } from '@kbn/core/server/mocks';
+import { coreMock, loggingSystemMock } from '@kbn/core/server/mocks';
+import { encryptedSavedObjectsMock } from '@kbn/encrypted-saved-objects-plugin/server/mocks';
+import { featuresPluginMock } from '@kbn/features-plugin/server/mocks';
+import { licensingMock } from '@kbn/licensing-plugin/server/mocks';
+import { taskManagerMock } from '@kbn/task-manager-plugin/server/mocks';
+
+import { AuditService } from './audit';
+import { ConfigSchema } from './config';
+import type { PluginSetupDependencies, PluginStartDependencies } from './plugin';
+import { SecurityPlugin } from './plugin';
+import { ServiceAccountsService } from './service_accounts';
+import { userProfileServiceMock } from './user_profile/user_profile_service.mock';
+
+describe('Security Plugin', () => {
+  let plugin: SecurityPlugin;
+  let mockCoreSetup: ReturnType<typeof coreMock.createSetup>;
+  let mockCoreStart: ReturnType<typeof coreMock.createStart>;
+  let mockSetupDependencies: PluginSetupDependencies;
+  let mockStartDependencies: PluginStartDependencies;
+  let mockInitializerContext: PluginInitializerContextMock<typeof ConfigSchema>;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockInitializerContext = coreMock.createPluginInitializerContext(
+      ConfigSchema.validate(
+        {
+          session: { idleTimeout: 1500 },
+          authc: {
+            providers: ['saml', 'token'],
+            saml: { realm: 'saml1', maxRedirectURLSize: new ByteSizeValue(2048) },
+          },
+          encryptionKey: 'z'.repeat(32),
+        },
+        { dist: true }
+      )
+    );
+    plugin = new SecurityPlugin(mockInitializerContext);
+
+    mockCoreSetup = coreMock.createSetup({
+      pluginStartContract: { userProfiles: userProfileServiceMock.createStart() },
+    });
+
+    const core = coreMock.createRequestHandlerContext();
+
+    core.elasticsearch.client.asInternalUser.xpack.usage.mockResolvedValue({
+      security: { operator_privileges: { enabled: false, available: false } },
+    } as Awaited<ReturnType<Client['xpack']['usage']>>);
+
+    mockSetupDependencies = {
+      licensing: {
+        license$: of({ getUnavailableReason: jest.fn() }),
+        featureUsage: { register: jest.fn() },
+      },
+      features: featuresPluginMock.createSetup(),
+      taskManager: taskManagerMock.createSetup(),
+      encryptedSavedObjects: encryptedSavedObjectsMock.createSetup(),
+    } as unknown as PluginSetupDependencies;
+
+    mockCoreStart = coreMock.createStart();
+    mockCoreStart.http.getServerInfo.mockReturnValue({
+      hostname: 'localhost',
+      name: 'kibana',
+      port: 80,
+      protocol: 'https',
+    });
+
+    mockCoreSetup.getStartServices.mockResolvedValue([
+      // @ts-expect-error only mocking the client we use
+      { elasticsearch: core.elasticsearch },
+      mockSetupDependencies.features,
+    ]);
+
+    mockStartDependencies = {
+      features: featuresPluginMock.createStart(),
+      licensing: licensingMock.createStart(),
+      taskManager: taskManagerMock.createStart(),
+      encryptedSavedObjects: encryptedSavedObjectsMock.createStart(),
+    };
+  });
+
+  describe('setup()', () => {
+    it('exposes proper contract', () => {
+      expect(plugin.setup(mockCoreSetup, mockSetupDependencies)).toMatchInlineSnapshot(`
+        Object {
+          "audit": Object {
+            "asScoped": [Function],
+            "withoutRequest": Object {
+              "enabled": false,
+              "includeSavedObjectNames": true,
+              "log": [Function],
+            },
+          },
+          "authc": Object {
+            "getCurrentUser": [Function],
+          },
+          "authz": Object {
+            "actions": Actions {
+              "aiIndex": AiIndexActions {
+                "prefix": "ai_index:",
+              },
+              "alerting": AlertingActions {
+                "prefix": "alerting:",
+              },
+              "alerts": AlertsActions {
+                "prefix": "alerts:",
+              },
+              "api": ApiActions {
+                "prefix": "api:",
+              },
+              "app": AppActions {
+                "prefix": "app:",
+              },
+              "cases": CasesActions {
+                "prefix": "cases:",
+              },
+              "login": "login:",
+              "savedObject": SavedObjectActions {
+                "prefix": "saved_object:",
+              },
+              "space": SpaceActions {
+                "prefix": "space:",
+              },
+              "ui": UIActions {
+                "prefix": "ui:",
+              },
+            },
+            "checkPrivilegesDynamicallyWithRequest": [Function],
+            "checkPrivilegesWithRequest": [Function],
+            "checkSavedObjectsPrivilegesWithRequest": [Function],
+            "checkUserProfilesPrivileges": [Function],
+            "mode": Object {
+              "useRbacForRequest": [Function],
+            },
+          },
+          "license": Object {
+            "features$": Observable {
+              "operator": [Function],
+              "source": Observable {
+                "_subscribe": [Function],
+              },
+            },
+            "getFeatures": [Function],
+            "getLicenseType": [Function],
+            "getUnavailableReason": [Function],
+            "hasAtLeast": [Function],
+            "isEnabled": [Function],
+            "isLicenseAvailable": [Function],
+          },
+          "privilegeDeprecationsService": Object {
+            "getKibanaRolesByFeatureId": [Function],
+          },
+        }
+      `);
+    });
+
+    it('calls core.security.registerSecurityDelegate', () => {
+      plugin.setup(mockCoreSetup, mockSetupDependencies);
+
+      expect(mockCoreSetup.security.registerSecurityDelegate).toHaveBeenCalledTimes(1);
+    });
+
+    it('calls core.userProfile.registerUserProfileDelegate', () => {
+      plugin.setup(mockCoreSetup, mockSetupDependencies);
+
+      expect(mockCoreSetup.userProfile.registerUserProfileDelegate).toHaveBeenCalledTimes(1);
+    });
+
+    it('logs the hash for the security encryption key', () => {
+      plugin.setup(mockCoreSetup, mockSetupDependencies);
+
+      const infoLogs = loggingSystemMock.collect(mockInitializerContext.logger).info;
+
+      expect(infoLogs.length).toBeGreaterThan(0);
+      infoLogs.forEach((log) => {
+        expect(log).toEqual([
+          `Hashed 'xpack.security.encryptionKey' for this instance: WLbjNGKEm7aA4NfJHYyW88jHUkHtyF7ENHcF0obYGBU=`,
+        ]);
+      });
+    });
+  });
+
+  describe('start()', () => {
+    it('exposes proper contract', async () => {
+      mockCoreSetup.http.getServerInfo.mockReturnValue({
+        hostname: 'localhost',
+        name: 'kibana',
+        port: 80,
+        protocol: 'https',
+      });
+
+      await plugin.setup(mockCoreSetup, mockSetupDependencies);
+      expect(plugin.start(mockCoreStart, mockStartDependencies)).toMatchInlineSnapshot(`
+        Object {
+          "authc": Object {
+            "apiKeys": Object {
+              "areAPIKeysEnabled": [Function],
+              "areCrossClusterAPIKeysEnabled": [Function],
+              "cloneAsInternalUser": [Function],
+              "create": [Function],
+              "grantAsInternalUser": [Function],
+              "invalidate": [Function],
+              "invalidateAsInternalUser": [Function],
+              "update": [Function],
+              "validate": [Function],
+            },
+            "getCurrentUser": [Function],
+            "systemIdentity": undefined,
+          },
+          "authz": Object {
+            "actions": Actions {
+              "aiIndex": AiIndexActions {
+                "prefix": "ai_index:",
+              },
+              "alerting": AlertingActions {
+                "prefix": "alerting:",
+              },
+              "alerts": AlertsActions {
+                "prefix": "alerts:",
+              },
+              "api": ApiActions {
+                "prefix": "api:",
+              },
+              "app": AppActions {
+                "prefix": "app:",
+              },
+              "cases": CasesActions {
+                "prefix": "cases:",
+              },
+              "login": "login:",
+              "savedObject": SavedObjectActions {
+                "prefix": "saved_object:",
+              },
+              "space": SpaceActions {
+                "prefix": "space:",
+              },
+              "ui": UIActions {
+                "prefix": "ui:",
+              },
+            },
+            "checkPrivilegesDynamicallyWithRequest": [Function],
+            "checkPrivilegesWithRequest": [Function],
+            "checkSavedObjectsPrivilegesWithRequest": [Function],
+            "checkUserProfilesPrivileges": [Function],
+            "mode": Object {
+              "useRbacForRequest": [Function],
+            },
+          },
+          "userProfiles": Object {
+            "bulkGet": [Function],
+            "getCurrent": [Function],
+            "getCurrentProfileId": [Function],
+            "suggest": [Function],
+          },
+        }
+      `);
+    });
+  });
+
+  describe('service accounts', () => {
+    it('hands the audit service to the service accounts service', () => {
+      const start = jest.spyOn(ServiceAccountsService.prototype, 'start').mockReturnValue(null);
+      try {
+        plugin.setup(mockCoreSetup, mockSetupDependencies);
+        plugin.start(mockCoreStart, mockStartDependencies);
+        expect(start).toHaveBeenCalledWith(
+          expect.objectContaining({
+            audit: expect.objectContaining({
+              asScoped: expect.any(Function),
+              withoutRequest: expect.anything(),
+            }),
+          })
+        );
+      } finally {
+        start.mockRestore();
+      }
+    });
+
+    it('lets the audit service identify fake requests once service accounts have started', () => {
+      const principal = {
+        type: 'service_account' as const,
+        serviceAccountId: 'kibana/relay',
+        variant: 'stack' as const,
+      };
+      const getFakeRequestPrincipal = jest.fn().mockReturnValue(principal);
+      const auditSetup = jest.spyOn(AuditService.prototype, 'setup');
+      const start = jest
+        .spyOn(ServiceAccountsService.prototype, 'start')
+        .mockReturnValue({ backend: { getFakeRequestPrincipal } } as never);
+      try {
+        plugin.setup(mockCoreSetup, mockSetupDependencies);
+        const [[params]] = auditSetup.mock.calls;
+        const request = {} as never;
+
+        expect(params.getFakeRequestPrincipal!(request)).toBeNull();
+
+        plugin.start(mockCoreStart, mockStartDependencies);
+
+        expect(params.getFakeRequestPrincipal!(request)).toBe(principal);
+        expect(getFakeRequestPrincipal).toHaveBeenCalledWith(request);
+      } finally {
+        auditSetup.mockRestore();
+        start.mockRestore();
+      }
+    });
+  });
+
+  describe('service account project context', () => {
+    it.each([
+      [
+        'complete',
+        'organization-id',
+        'project-id',
+        'vectordb',
+        { organizationId: 'organization-id', projectId: 'project-id', projectType: 'vectordb' },
+      ],
+      ['missing organization', undefined, 'project-id', 'vectordb', undefined],
+      ['missing project', 'organization-id', undefined, 'vectordb', undefined],
+      ['missing type', 'organization-id', 'project-id', undefined, undefined],
+    ] as const)(
+      'passes %s context to the service',
+      (_label, organizationId, projectId, projectType, expected) => {
+        const cloud = cloudMock.createSetup();
+        cloud.organizationId = organizationId;
+        cloud.serverless = { ...cloud.serverless, projectId, projectType };
+        mockSetupDependencies.cloud = cloud;
+        const start = jest.spyOn(ServiceAccountsService.prototype, 'start').mockReturnValue(null);
+        try {
+          plugin.setup(mockCoreSetup, mockSetupDependencies);
+          plugin.start(mockCoreStart, mockStartDependencies);
+          expect(start).toHaveBeenCalledWith(
+            expect.objectContaining({ cloudProjectContext: expected })
+          );
+        } finally {
+          start.mockRestore();
+        }
+      }
+    );
+  });
+
+  describe('serverless', () => {
+    const serverlessPlugin = (uiam?: Record<string, unknown>) => {
+      const context = coreMock.createPluginInitializerContext(
+        ConfigSchema.validate(
+          { encryptionKey: 'z'.repeat(32), ...(uiam ? { uiam } : {}) },
+          { serverless: true, dist: true }
+        )
+      );
+      // Force type-cast to convert `ReadOnly<PackageInfo>` to mutable `PackageInfo`.
+      (context.env.packageInfo as PackageInfo).buildFlavor = 'serverless';
+      return new SecurityPlugin(context);
+    };
+
+    it('setup() throws when UIAM is not enabled', () => {
+      expect(() => serverlessPlugin().setup(mockCoreSetup, mockSetupDependencies)).toThrow(
+        '`xpack.security.uiam.enabled` must be `true` on serverless deployments.'
+      );
+    });
+
+    it('setup() succeeds when UIAM is enabled', () => {
+      expect(() =>
+        serverlessPlugin({
+          enabled: true,
+          url: 'https://uiam',
+          sharedSecret: 'shared-secret',
+        }).setup(mockCoreSetup, mockSetupDependencies)
+      ).not.toThrow();
+    });
+  });
+
+  describe('stop()', () => {
+    beforeEach(async () => await plugin.setup(mockCoreSetup, mockSetupDependencies));
+
+    it('close does not throw', async () => {
+      await plugin.stop();
+    });
+  });
+});

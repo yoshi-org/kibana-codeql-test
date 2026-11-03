@@ -1,0 +1,166 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`esdsl correctly handles filter, query and timerange on context 1`] = `
+Object {
+  "body": Object {
+    "params": Object {
+      "_source": false,
+      "index": "kibana_sample_data_logs",
+      "kibanaQueryContext": Object {
+        "kibanaFilters": Array [
+          Object {
+            "meta": Object {
+              "alias": "test",
+              "disabled": false,
+              "index": "1",
+              "negate": false,
+            },
+            "query": Object {
+              "match_phrase": Object {
+                "gender": "male",
+              },
+            },
+          },
+        ],
+        "kqlQuery": Object {
+          "language": "lucene",
+          "query": "*",
+        },
+      },
+      "query": Object {
+        "term": Object {
+          "machine.os.keyword": "osx",
+        },
+      },
+      "size": 4,
+    },
+  },
+  "type": "es_raw_response",
+}
+`;
+
+exports[`esdsl correctly handles input adds filters 1`] = `
+Object {
+  "body": Object {
+    "params": Object {
+      "index": "test",
+      "kibanaQueryContext": Object {
+        "kibanaFilters": Array [
+          Object {
+            "meta": Object {
+              "alias": "test",
+              "disabled": false,
+              "index": "1",
+              "negate": false,
+            },
+            "query": Object {
+              "match_phrase": Object {
+                "gender": "male",
+              },
+            },
+          },
+        ],
+        "kqlQuery": undefined,
+      },
+      "size": 0,
+    },
+  },
+  "type": "es_raw_response",
+}
+`;
+
+exports[`esdsl correctly handles input adds filters to query with filters 1`] = `
+Object {
+  "body": Object {
+    "params": Object {
+      "_source": false,
+      "index": "kibana_sample_data_logs",
+      "kibanaQueryContext": Object {
+        "kibanaFilters": Array [
+          Object {
+            "meta": Object {
+              "alias": "test",
+              "disabled": false,
+              "index": "1",
+              "negate": false,
+            },
+            "query": Object {
+              "match_phrase": Object {
+                "gender": "male",
+              },
+            },
+          },
+        ],
+        "kqlQuery": undefined,
+      },
+      "query": Object {
+        "term": Object {
+          "machine.os.keyword": "osx",
+        },
+      },
+      "size": 4,
+    },
+  },
+  "type": "es_raw_response",
+}
+`;
+
+exports[`esdsl correctly handles input adds query 1`] = `
+Object {
+  "body": Object {
+    "params": Object {
+      "index": "test",
+      "kibanaQueryContext": Object {
+        "kibanaFilters": undefined,
+        "kqlQuery": Object {
+          "language": "lucene",
+          "query": "*",
+        },
+      },
+      "size": 0,
+    },
+  },
+  "type": "es_raw_response",
+}
+`;
+
+exports[`esdsl correctly handles input adds query to a query with filters 1`] = `
+Object {
+  "body": Object {
+    "params": Object {
+      "_source": false,
+      "index": "kibana_sample_data_logs",
+      "kibanaQueryContext": Object {
+        "kibanaFilters": undefined,
+        "kqlQuery": Object {
+          "language": "lucene",
+          "query": "*",
+        },
+      },
+      "query": Object {
+        "term": Object {
+          "machine.os.keyword": "osx",
+        },
+      },
+      "size": 4,
+    },
+  },
+  "type": "es_raw_response",
+}
+`;
+
+exports[`esdsl correctly handles input ignores timerange 1`] = `
+Object {
+  "body": Object {
+    "params": Object {
+      "index": "test",
+      "kibanaQueryContext": Object {
+        "kibanaFilters": undefined,
+        "kqlQuery": undefined,
+      },
+      "size": 0,
+    },
+  },
+  "type": "es_raw_response",
+}
+`;

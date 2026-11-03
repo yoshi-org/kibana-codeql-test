@@ -1,0 +1,172 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import type { estypes } from '@elastic/elasticsearch';
+import type { ISearchRequestParams } from '@kbn/search-types';
+import { AGENT_ACTIONS_RESULTS_INDEX } from '@kbn/fleet-plugin/common';
+import { isEmpty } from 'lodash';
+import moment from 'moment';
+import {
+  ACTION_RESPONSES_DATA_STREAM_INDEX,
+  ACTION_RESPONSES_INDEX,
+} from '../../../../../../common/constants';
+import type { ActionResultsRequestOptions } from '../../../../../../common/search_strategy';
+import { getQueryFilter } from '../../../../../utils/build_query';
+import { buildIndexNamesWithNamespaces } from '../../../../../utils/build_index_name_with_namespace';
+import { buildSpaceIdFilter } from '../../../../../utils/build_space_id_filter';
+import { prefixIndexPatternsWithCcs } from '../../../../../utils/ccs_utils';
+
+export const buildActionResultsQuery = ({
+  actionId,
+  agentIds,
+  kuery,
+  startDate,
+  sort,
+  pagination,
+  componentTemplateExists,
+  ccsEnabled,
+  useNewDataStream,
+  integrationNamespaces,
+  spaceId,
+  matchMissingSpaceId,
+  matchActionDataSpaceId,
+  skipSpaceFilter,
+}: ActionResultsRequestOptions & {
+  matchActionDataSpaceId?: boolean;
+  skipSpaceFilter?: boolean;
+}): ISearchRequestParams => {
+  const kueryFilter = kuery ? [getQueryFilter({ filter: kuery })] : [];
+
+  const timeRangeFilter: estypes.QueryDslQueryContainer[] =
+    startDate && !isEmpty(startDate)
+      ? [
+          {
+            range: {
+              'event.ingested': {
+                gte: startDate,
+                lte: moment(startDate).clone().add(30, 'minutes').toISOString(),
+              },
+            },
+          },
+        ]
+      : [];
+
+  const agentIdsFilter: estypes.QueryDslQueryContainer[] =
+    agentIds && agentIds.length > 0
+      ? [
+          {
+            bool: {
+              should: [
+                { terms: { 'agent.id': agentIds } },
+                { terms: { agent_id: agentIds } },
+              ] as estypes.QueryDslQueryContainer[],
+              minimum_should_match: 1,
+            },
+          },
+        ]
+      : [];
+
+  // Hit-level scoping is enforced centrally in the search strategy
+  // (enforceSpaceScope). The aggregation below is a separate filter context that
+  // the top-level query does not constrain, so it is scoped explicitly here.
+  //
+  // This read is bound to a single `action_id`, which the caller can only have
+  // learned from a space-stamped, Kibana-written action document. That binding is
+  // the authorization gate that makes honouring the agent-carried
+  // `action_data.space_id` safe here — see buildSpaceIdFilter. The strategy
+  // passes `matchActionDataSpaceId` from ID_BOUND_FACTORY_QUERY_TYPES so this
+  // aggregation cannot drift from the hit filter. Default off: omitting the
+  // flag must not enable the less-trusted field in aggregations only.
+  //
+  // `skipSpaceFilter` means the strategy already found this `action_id` on the
+  // Kibana-written action document in the active space and omitted the hit-level
+  // filter, so the aggregation omits it too and counts match the hits.
+  const spaceIdFilters: estypes.QueryDslQueryContainer[] = skipSpaceFilter
+    ? []
+    : [
+        buildSpaceIdFilter(spaceId, {
+          matchMissingSpaceId: matchMissingSpaceId ?? true,
+          matchActionDataSpaceId: matchActionDataSpaceId ?? false,
+        }),
+      ];
+
+  const filterQuery: estypes.QueryDslQueryContainer[] = [
+    ...timeRangeFilter,
+    ...agentIdsFilter,
+    { term: { action_id: actionId } },
+    ...kueryFilter,
+  ];
+
+  let baseIndex: string;
+  if (useNewDataStream) {
+    baseIndex = `${ACTION_RESPONSES_DATA_STREAM_INDEX}*`;
+  } else if (componentTemplateExists) {
+    baseIndex = `${ACTION_RESPONSES_INDEX}*`;
+  } else {
+    baseIndex = `${AGENT_ACTIONS_RESULTS_INDEX}*`;
+  }
+
+  const index = prefixIndexPatternsWithCcs(
+    buildIndexNamesWithNamespaces(baseIndex, integrationNamespaces),
+    ccsEnabled ?? false
+  );
+
+  return {
+    allow_no_indices: true,
+    index,
+    ignore_unavailable: true,
+    aggs: {
+      aggs: {
+        global: {},
+        aggs: {
+          responses_by_action_id: {
+            filter: {
+              bool: {
+                must: [
+                  {
+                    term: {
+                      action_id: actionId,
+                    },
+                  },
+                  ...spaceIdFilters,
+                ],
+              },
+            },
+            aggs: {
+              rows_count: {
+                sum: {
+                  field: 'action_response.osquery.count',
+                },
+              },
+              responses: {
+                terms: {
+                  script: {
+                    lang: 'painless',
+                    source:
+                      "if (doc['error.keyword'].size()==0) { return 'success' } else { return 'error' }",
+                  } as const,
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    query: { bool: { filter: filterQuery } },
+    from: pagination ? pagination.activePage * pagination.querySize : 0,
+    size: pagination?.querySize ?? 100,
+    track_total_hits: true,
+    fields: ['*'],
+    sort: [
+      {
+        [sort.field]: {
+          order: sort.direction,
+        },
+      },
+    ],
+  };
+};

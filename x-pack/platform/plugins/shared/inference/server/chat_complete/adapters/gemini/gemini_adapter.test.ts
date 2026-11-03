@@ -1,0 +1,894 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import { processVertexStreamMock, processVertexResponseMock } from './gemini_adapter.test.mocks';
+import { PassThrough } from 'stream';
+import { noop, tap, lastValueFrom, toArray, of } from 'rxjs';
+import { pick } from 'lodash';
+import { z } from '@kbn/zod/v4';
+import { loggerMock } from '@kbn/logging-mocks';
+import type { InferenceExecutor } from '../../utils/inference_executor';
+import { observableIntoEventSourceStream } from '../../../util/observable_into_event_source_stream';
+import type { ToolSchema } from '@kbn/inference-common';
+import { MessageRole, ToolChoiceType, InferenceConnectorType } from '@kbn/inference-common';
+import { geminiAdapter } from './gemini_adapter';
+
+describe('geminiAdapter', () => {
+  const logger = loggerMock.create();
+  const executorMock = {
+    invoke: jest.fn(),
+    getConnector: jest.fn(),
+  } as InferenceExecutor & {
+    invoke: jest.MockedFn<InferenceExecutor['invoke']>;
+    getConnector: jest.MockedFn<InferenceExecutor['getConnector']>;
+  };
+
+  beforeEach(() => {
+    executorMock.invoke.mockReset();
+    executorMock.getConnector.mockReset();
+    executorMock.getConnector.mockReturnValue({
+      type: InferenceConnectorType.Gemini,
+      name: 'gemini-connector',
+      connectorId: 'test-connector-id',
+      config: {},
+      capabilities: {},
+      isInferenceEndpoint: false,
+      isPreconfigured: false,
+    });
+    processVertexStreamMock.mockReset().mockImplementation(() => tap(noop));
+    processVertexResponseMock.mockReset().mockImplementation(() => tap(noop));
+  });
+
+  function getCallParams() {
+    const params = executorMock.invoke.mock.calls[0][0].subActionParams as Record<string, any>;
+    return {
+      messages: params.messages,
+      tools: params.tools,
+      toolConfig: params.toolConfig,
+      systemInstruction: params.systemInstruction,
+      temperature: params.temperature,
+    };
+  }
+
+  describe('#chatComplete()', () => {
+    beforeEach(() => {
+      executorMock.invoke.mockImplementation(async () => {
+        return {
+          actionId: '',
+          status: 'ok',
+          data: new PassThrough(),
+        };
+      });
+    });
+
+    it('calls `executor.invoke` with the right fixed parameters', () => {
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [
+            {
+              role: MessageRole.User,
+              content: 'question',
+            },
+          ],
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledTimes(1);
+      expect(executorMock.invoke).toHaveBeenCalledWith({
+        subAction: 'invokeAIRaw',
+        subActionParams: {
+          messages: [
+            {
+              parts: [{ text: 'question' }],
+              role: 'user',
+            },
+          ],
+          tools: [],
+          temperature: 0,
+          stopSequences: ['\n\nHuman:'],
+        },
+      });
+    });
+
+    it('forwards `maxContentLength` for buffered (invokeAIRaw) requests', () => {
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [{ role: MessageRole.User, content: 'question' }],
+          stream: false,
+          maxContentLength: 10 * 1024 * 1024,
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledWith(
+        expect.objectContaining({
+          subAction: 'invokeAIRaw',
+          subActionParams: expect.objectContaining({ maxContentLength: 10 * 1024 * 1024 }),
+        })
+      );
+    });
+
+    it('forwards `maxContentLength` for streaming (invokeStream) requests', () => {
+      // Streaming responses are still subject to the connector's axios `maxContentLength`
+      // (enforced while the response stream is consumed), so the override must be forwarded
+      // for streaming requests too.
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [{ role: MessageRole.User, content: 'question' }],
+          stream: true,
+          maxContentLength: 10 * 1024 * 1024,
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledWith(
+        expect.objectContaining({
+          subAction: 'invokeStream',
+          subActionParams: expect.objectContaining({ maxContentLength: 10 * 1024 * 1024 }),
+        })
+      );
+    });
+
+    it('forwards only connector-supported telemetry metadata', () => {
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [{ role: MessageRole.User, content: 'question' }],
+          metadata: {
+            connectorTelemetry: {
+              pluginId: 'feature',
+              aggregateBy: 'parent',
+              productSolution: 'solution',
+              productFeature: 'product-feature',
+              interactionId: 'interaction-1',
+            },
+          },
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke.mock.calls[0]?.[0].subActionParams?.telemetryMetadata).toEqual({
+        pluginId: 'feature',
+        aggregateBy: 'parent',
+      });
+    });
+
+    it('correctly format tools', () => {
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [
+            {
+              role: MessageRole.User,
+              content: 'question',
+            },
+          ],
+          tools: {
+            myFunction: {
+              description: 'myFunction',
+            },
+            myFunctionWithArgs: {
+              description: 'myFunctionWithArgs',
+              schema: {
+                type: 'object',
+                properties: {
+                  foo: {
+                    type: 'string',
+                    description: 'foo',
+                  },
+                  bar: {
+                    type: 'string',
+                    description: 'bar',
+                    enum: ['a', 'b'],
+                  },
+                },
+                required: ['foo'],
+              },
+            },
+          },
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledTimes(1);
+
+      const { tools } = getCallParams();
+      expect(tools).toEqual([
+        {
+          functionDeclarations: [
+            {
+              description: 'myFunction',
+              name: 'myFunction',
+              parameters: {
+                properties: {},
+                type: 'object',
+              },
+            },
+            {
+              description: 'myFunctionWithArgs',
+              name: 'myFunctionWithArgs',
+              parameters: {
+                properties: {
+                  foo: {
+                    description: 'foo',
+                    type: 'string',
+                  },
+                  bar: {
+                    description: 'bar',
+                    enum: ['a', 'b'],
+                    type: 'string',
+                  },
+                },
+                required: ['foo'],
+                type: 'object',
+              },
+            },
+          ],
+        },
+      ]);
+    });
+
+    it('preserves tool schema shapes emitted by zod', () => {
+      const schema = pick(
+        z.toJSONSchema(
+          z.object({
+            count: z.number().int(),
+            note: z.string().nullable(),
+            value: z.union([z.string(), z.number()]),
+            data: z.record(z.string(), z.string()),
+            operations: z.array(
+              z.discriminatedUnion('type', [
+                z.object({ type: z.literal('add'), name: z.string() }),
+                z.object({ type: z.literal('remove') }),
+              ])
+            ),
+          }),
+          { io: 'input' }
+        ),
+        ['type', 'properties', 'required']
+      ) as ToolSchema;
+
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [{ role: MessageRole.User, content: 'question' }],
+          tools: { myFunction: { description: 'myFunction', schema } },
+        })
+        .subscribe(noop);
+
+      const { tools } = getCallParams();
+      expect(tools[0].functionDeclarations[0].parameters).toEqual({
+        type: 'object',
+        properties: {
+          count: {
+            type: 'integer',
+            minimum: Number.MIN_SAFE_INTEGER,
+            maximum: Number.MAX_SAFE_INTEGER,
+          },
+          note: { type: 'string', nullable: true },
+          value: { anyOf: [{ type: 'string' }, { type: 'number' }] },
+          data: { type: 'object', additionalProperties: { type: 'string' } },
+          operations: {
+            type: 'array',
+            items: {
+              anyOf: [
+                {
+                  type: 'object',
+                  properties: {
+                    type: { type: 'string', enum: ['add'] },
+                    name: { type: 'string' },
+                  },
+                  required: ['type', 'name'],
+                },
+                {
+                  type: 'object',
+                  properties: {
+                    type: { type: 'string', enum: ['remove'] },
+                  },
+                  required: ['type'],
+                },
+              ],
+            },
+          },
+        },
+        required: ['count', 'note', 'value', 'data', 'operations'],
+      });
+    });
+
+    it('correctly format messages', () => {
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [
+            {
+              role: MessageRole.User,
+              content: 'question',
+            },
+            {
+              role: MessageRole.Assistant,
+              content: 'answer',
+            },
+            {
+              role: MessageRole.User,
+              content: 'another question',
+            },
+            {
+              role: MessageRole.Assistant,
+              content: null,
+              toolCalls: [
+                {
+                  function: {
+                    name: 'my_function',
+                    arguments: {
+                      foo: 'bar',
+                    },
+                  },
+                  toolCallId: '0',
+                },
+              ],
+            },
+            {
+              name: 'my_function',
+              role: MessageRole.Tool,
+              toolCallId: '0',
+              response: {
+                bar: 'foo',
+              },
+            },
+          ],
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledTimes(1);
+
+      const { messages } = getCallParams();
+      expect(messages).toEqual([
+        {
+          parts: [
+            {
+              text: 'question',
+            },
+          ],
+          role: 'user',
+        },
+        {
+          parts: [
+            {
+              text: 'answer',
+            },
+          ],
+          role: 'assistant',
+        },
+        {
+          parts: [
+            {
+              text: 'another question',
+            },
+          ],
+          role: 'user',
+        },
+        {
+          parts: [
+            {
+              functionCall: {
+                args: {
+                  foo: 'bar',
+                },
+                name: 'my_function',
+              },
+            },
+          ],
+          role: 'assistant',
+        },
+        {
+          parts: [
+            {
+              functionResponse: {
+                name: '0',
+                response: {
+                  bar: 'foo',
+                },
+              },
+            },
+          ],
+          role: 'user',
+        },
+      ]);
+    });
+
+    it('encapsulates string tool messages', () => {
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [
+            {
+              role: MessageRole.User,
+              content: 'question',
+            },
+            {
+              role: MessageRole.Assistant,
+              content: null,
+              toolCalls: [
+                {
+                  function: {
+                    name: 'my_function',
+                    arguments: {
+                      foo: 'bar',
+                    },
+                  },
+                  toolCallId: '0',
+                },
+              ],
+            },
+            {
+              name: 'my_function',
+              role: MessageRole.Tool,
+              toolCallId: '0',
+              response: JSON.stringify({ bar: 'foo' }),
+            },
+          ],
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledTimes(1);
+
+      const { messages } = getCallParams();
+      expect(messages[messages.length - 1]).toEqual({
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              name: '0',
+              response: {
+                response: JSON.stringify({ bar: 'foo' }),
+              },
+            },
+          },
+        ],
+      });
+    });
+
+    it('filters out messages with empty parts and re-merges consecutive same-role messages', () => {
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [
+            {
+              role: MessageRole.User,
+              content: 'first',
+            },
+            {
+              role: MessageRole.Assistant,
+              content: '',
+              toolCalls: [],
+            },
+            {
+              role: MessageRole.User,
+              content: 'second',
+            },
+          ],
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledTimes(1);
+      const { messages } = getCallParams();
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toEqual({
+        role: 'user',
+        parts: [{ text: 'first' }, { text: 'second' }],
+      });
+    });
+
+    it('correctly formats content parts', () => {
+      geminiAdapter
+        .chatComplete({
+          executor: executorMock,
+          logger,
+          messages: [
+            {
+              role: MessageRole.User,
+              content: [
+                {
+                  type: 'text',
+                  text: 'question',
+                },
+              ],
+            },
+            {
+              role: MessageRole.Assistant,
+              content: 'answer',
+            },
+            {
+              role: MessageRole.User,
+              content: [
+                {
+                  type: 'image',
+                  source: {
+                    data: 'aaaaaa',
+                    mimeType: 'image/png',
+                  },
+                },
+                {
+                  type: 'image',
+                  source: {
+                    data: 'bbbbbb',
+                    mimeType: 'image/png',
+                  },
+                },
+              ],
+            },
+          ],
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledTimes(1);
+
+      const { messages } = getCallParams();
+      expect(messages).toEqual([
+        {
+          parts: [
+            {
+              text: 'question',
+            },
+          ],
+          role: 'user',
+        },
+        {
+          parts: [
+            {
+              text: 'answer',
+            },
+          ],
+          role: 'assistant',
+        },
+        {
+          parts: [
+            {
+              inlineData: {
+                data: 'aaaaaa',
+                mimeType: 'image/png',
+              },
+            },
+            {
+              inlineData: {
+                data: 'bbbbbb',
+                mimeType: 'image/png',
+              },
+            },
+          ],
+          role: 'user',
+        },
+      ]);
+    });
+
+    it('groups messages from the same user', () => {
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [
+            {
+              role: MessageRole.User,
+              content: 'question',
+            },
+            {
+              role: MessageRole.User,
+              content: 'another question',
+            },
+            {
+              role: MessageRole.Assistant,
+              content: 'answer',
+            },
+            {
+              role: MessageRole.Assistant,
+              content: null,
+              toolCalls: [
+                {
+                  function: {
+                    name: 'my_function',
+                    arguments: {
+                      foo: 'bar',
+                    },
+                  },
+                  toolCallId: '0',
+                },
+              ],
+            },
+          ],
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledTimes(1);
+
+      const { messages } = getCallParams();
+      expect(messages).toEqual([
+        {
+          parts: [
+            {
+              text: 'question',
+            },
+            {
+              text: 'another question',
+            },
+          ],
+          role: 'user',
+        },
+        {
+          parts: [
+            {
+              text: 'answer',
+            },
+            {
+              functionCall: {
+                args: {
+                  foo: 'bar',
+                },
+                name: 'my_function',
+              },
+            },
+          ],
+          role: 'assistant',
+        },
+      ]);
+    });
+
+    it('correctly format system message', () => {
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          system: 'Some system message',
+          messages: [
+            {
+              role: MessageRole.User,
+              content: 'question',
+            },
+          ],
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledTimes(1);
+
+      const { systemInstruction } = getCallParams();
+      expect(systemInstruction).toEqual('Some system message');
+    });
+
+    it('correctly format tool choice', () => {
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [
+            {
+              role: MessageRole.User,
+              content: 'question',
+            },
+          ],
+          toolChoice: ToolChoiceType.required,
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledTimes(1);
+
+      const { toolConfig } = getCallParams();
+      expect(toolConfig).toEqual({ mode: 'ANY' });
+    });
+
+    it('correctly format tool choice for named function', () => {
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [
+            {
+              role: MessageRole.User,
+              content: 'question',
+            },
+          ],
+          toolChoice: { function: 'foobar' },
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledTimes(1);
+
+      const { toolConfig } = getCallParams();
+      expect(toolConfig).toEqual({ mode: 'ANY', allowedFunctionNames: ['foobar'] });
+    });
+
+    it('propagates the abort signal when provided', () => {
+      const abortController = new AbortController();
+
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [{ role: MessageRole.User, content: 'question' }],
+          abortSignal: abortController.signal,
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledTimes(1);
+      expect(executorMock.invoke).toHaveBeenCalledWith({
+        subAction: 'invokeAIRaw',
+        subActionParams: expect.objectContaining({
+          signal: abortController.signal,
+        }),
+      });
+    });
+
+    it('propagates the temperature parameter', () => {
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [{ role: MessageRole.User, content: 'question' }],
+          temperature: 0.6,
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledTimes(1);
+      expect(executorMock.invoke).toHaveBeenCalledWith({
+        subAction: 'invokeAIRaw',
+        subActionParams: expect.objectContaining({
+          temperature: 0.6,
+        }),
+      });
+    });
+
+    it('propagates the modelName parameter', () => {
+      geminiAdapter
+        .chatComplete({
+          logger,
+          executor: executorMock,
+          messages: [{ role: MessageRole.User, content: 'question' }],
+          modelName: 'gemini-1.5',
+        })
+        .subscribe(noop);
+
+      expect(executorMock.invoke).toHaveBeenCalledTimes(1);
+      expect(executorMock.invoke).toHaveBeenCalledWith({
+        subAction: 'invokeAIRaw',
+        subActionParams: expect.objectContaining({
+          model: 'gemini-1.5',
+        }),
+      });
+    });
+
+    describe('non-streaming mode', () => {
+      it('process response events via processVertexResponse', async () => {
+        const response = { dummy: 'response' };
+
+        const tapFn = jest.fn();
+        processVertexResponseMock.mockImplementation(() => tap(tapFn));
+
+        executorMock.invoke.mockImplementation(async () => {
+          return {
+            actionId: '',
+            status: 'ok',
+            data: response,
+          };
+        });
+
+        const response$ = geminiAdapter.chatComplete({
+          stream: false,
+          logger,
+          executor: executorMock,
+          messages: [
+            {
+              role: MessageRole.User,
+              content: 'question',
+            },
+          ],
+        });
+
+        const events = await lastValueFrom(response$.pipe(toArray()));
+
+        expect(tapFn).toHaveBeenCalledTimes(1);
+        expect(tapFn).toHaveBeenCalledWith(response);
+
+        expect(events).toEqual([response]);
+      });
+
+      it('throws an error if the connector response is in error', async () => {
+        executorMock.invoke.mockImplementation(async () => {
+          return {
+            actionId: 'actionId',
+            status: 'error',
+            serviceMessage: 'something went wrong',
+            data: undefined,
+          };
+        });
+
+        await expect(
+          lastValueFrom(
+            geminiAdapter
+              .chatComplete({
+                stream: false,
+                logger,
+                executor: executorMock,
+                messages: [{ role: MessageRole.User, content: 'Hello' }],
+              })
+              .pipe(toArray())
+          )
+        ).rejects.toThrowErrorMatchingInlineSnapshot(
+          `"Error calling connector: something went wrong"`
+        );
+      });
+    });
+
+    describe('streaming mode', () => {
+      it('process response events via processVertexStream', async () => {
+        const source$ = of({ chunk: 1 }, { chunk: 2 });
+
+        const tapFn = jest.fn();
+        processVertexStreamMock.mockImplementation(() => tap(tapFn));
+
+        executorMock.invoke.mockImplementation(async () => {
+          return {
+            actionId: '',
+            status: 'ok',
+            data: observableIntoEventSourceStream(source$, logger),
+          };
+        });
+
+        const response$ = geminiAdapter.chatComplete({
+          stream: true,
+          logger,
+          executor: executorMock,
+          messages: [
+            {
+              role: MessageRole.User,
+              content: 'question',
+            },
+          ],
+        });
+
+        const allChunks = await lastValueFrom(response$.pipe(toArray()));
+
+        expect(allChunks).toEqual([{ chunk: 1 }, { chunk: 2 }]);
+
+        expect(tapFn).toHaveBeenCalledTimes(2);
+        expect(tapFn).toHaveBeenCalledWith({ chunk: 1 });
+        expect(tapFn).toHaveBeenCalledWith({ chunk: 2 });
+      });
+
+      it('throws an error if the connector response is in error', async () => {
+        executorMock.invoke.mockImplementation(async () => {
+          return {
+            actionId: 'actionId',
+            status: 'error',
+            serviceMessage: 'something went wrong',
+            data: undefined,
+          };
+        });
+
+        await expect(
+          lastValueFrom(
+            geminiAdapter
+              .chatComplete({
+                stream: true,
+                logger,
+                executor: executorMock,
+                messages: [{ role: MessageRole.User, content: 'Hello' }],
+              })
+              .pipe(toArray())
+          )
+        ).rejects.toThrowErrorMatchingInlineSnapshot(
+          `"Error calling connector: something went wrong"`
+        );
+      });
+    });
+  });
+});

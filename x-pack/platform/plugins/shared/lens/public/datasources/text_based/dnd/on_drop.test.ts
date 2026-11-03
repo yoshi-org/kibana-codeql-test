@@ -1,0 +1,406 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import type { DropType } from '@kbn/dom-drag-drop';
+import type { DatatableColumn } from '@kbn/expressions-plugin/common';
+import { onDrop } from './on_drop';
+import { column1, column2, column3, emptyDimensionTarget, defaultProps, fieldList } from './mocks';
+import type {
+  DatasourceDimensionDropHandlerProps,
+  TextBasedLayerColumn,
+  TextBasedPrivateState,
+} from '@kbn/lens-common';
+import { addColumnsToCache } from '../fieldlist_cache';
+
+describe('onDrop', () => {
+  addColumnsToCache(
+    {
+      esql: 'FROM "kibana_sample_data_ecommerce"',
+    },
+    fieldList.map((f) => {
+      return {
+        id: f.columnId,
+        name: f.fieldName,
+        meta: f?.meta,
+        ...(f.columnId === 'products.base_price' && { variable: 'field' }),
+      } as DatatableColumn;
+    })
+  );
+  describe.each<{ description: string; referenceColumn: TextBasedLayerColumn }>([
+    {
+      description: 'query',
+      referenceColumn: {
+        ...column1,
+        fieldName: 'threshold',
+        label: 'Threshold',
+        customLabel: true,
+        meta: { type: 'number' },
+        params: { format: { id: 'number', params: { decimals: 2 } } },
+      },
+    },
+  ])('reference column $description', ({ referenceColumn }) => {
+    it.each([
+      {
+        dropType: 'duplicate_compatible' as const,
+        target: emptyDimensionTarget,
+        expectedColumns: [
+          referenceColumn,
+          column2,
+          column3,
+          { ...referenceColumn, columnId: emptyDimensionTarget.columnId },
+        ],
+      },
+      {
+        dropType: 'replace_duplicate_compatible' as const,
+        target: {
+          ...emptyDimensionTarget,
+          columnId: column2.columnId,
+          id: column2.columnId,
+          isNewColumn: false,
+        },
+        expectedColumns: [
+          referenceColumn,
+          column3,
+          { ...referenceColumn, columnId: column2.columnId },
+        ],
+      },
+      {
+        dropType: 'move_compatible' as const,
+        target: emptyDimensionTarget,
+        expectedColumns: [
+          column2,
+          column3,
+          { ...referenceColumn, columnId: emptyDimensionTarget.columnId },
+        ],
+      },
+    ])(
+      'preserves the column configuration for $dropType',
+      ({ dropType, target, expectedColumns }) => {
+        const state = {
+          ...defaultProps.state,
+          layers: {
+            ...defaultProps.state.layers,
+            first: {
+              ...defaultProps.state.layers.first,
+              columns: [referenceColumn, column2, column3],
+            },
+          },
+        };
+        const result = onDrop({
+          ...defaultProps,
+          state,
+          target,
+          dropType,
+        });
+        expect(result?.layers.first.columns).toEqual(expectedColumns);
+      }
+    );
+  });
+
+  describe.each(['move_compatible', 'duplicate_compatible'] as const)('%s', (dropType) => {
+    it.each([
+      { sourceIsMetric: true, targetIsMetric: false },
+      { sourceIsMetric: false, targetIsMetric: true },
+    ])(
+      'uses destination metric placement when source=$sourceIsMetric and target=$targetIsMetric',
+      ({ sourceIsMetric, targetIsMetric }) => {
+        const sourceColumn = { ...column1, inMetricDimension: sourceIsMetric };
+        const result = onDrop({
+          ...defaultProps,
+          dropType,
+          state: {
+            ...defaultProps.state,
+            layers: {
+              ...defaultProps.state.layers,
+              first: {
+                ...defaultProps.state.layers.first,
+                columns: [sourceColumn, column2, column3],
+              },
+            },
+          },
+          target: { ...emptyDimensionTarget, isMetricDimension: targetIsMetric },
+        });
+
+        expect(result?.layers.first.columns).toEqual([
+          ...(dropType === 'duplicate_compatible' ? [sourceColumn] : []),
+          column2,
+          column3,
+          {
+            ...sourceColumn,
+            columnId: emptyDimensionTarget.columnId,
+            inMetricDimension: targetIsMetric ? true : undefined,
+          },
+        ]);
+      }
+    );
+  });
+
+  it('should return false if dropType is not in the list', () => {
+    const props = {
+      ...defaultProps,
+      dropType: 'not_in_the_list' as DropType,
+    };
+    expect(onDrop(props)).toEqual(undefined);
+  });
+  it('should swap the dimensions if dropType is swap_compatible', () => {
+    const props = {
+      ...defaultProps,
+      dropType: 'swap_compatible' as DropType,
+    };
+    const expectedColumns = [
+      { ...column3, columnId: 'columnId1' },
+      column2,
+      { ...column1, columnId: 'columnId3', inMetricDimension: true },
+    ];
+    expect(onDrop(props)).toEqual(
+      expect.objectContaining({
+        layers: {
+          first: expect.objectContaining({
+            columns: expectedColumns,
+          }),
+        },
+      })
+    );
+  });
+  it('should reorder the dimensions if dropType is reorder', () => {
+    const props = {
+      ...defaultProps,
+      dropType: 'reorder' as DropType,
+    };
+    const expectedColumns = [column2, column3, column1];
+    expect(onDrop(props)).toEqual(
+      expect.objectContaining({
+        layers: {
+          first: expect.objectContaining({
+            columns: expectedColumns,
+          }),
+        },
+      })
+    );
+  });
+  it('should move the dimension if dropType is move_compatible and remove the original one', () => {
+    const props = {
+      ...defaultProps,
+      target: emptyDimensionTarget,
+      dropType: 'move_compatible' as DropType,
+    };
+    const expectedColumns = [column2, column3, { ...column1, columnId: 'newId' }];
+    expect(onDrop(props)).toEqual(
+      expect.objectContaining({
+        layers: {
+          first: expect.objectContaining({
+            columns: expectedColumns,
+          }),
+        },
+      })
+    );
+  });
+  it('should add the column when dropping a field', () => {
+    const props = {
+      ...defaultProps,
+      source: {
+        field: 'currency',
+        id: 'currency',
+        humanData: {
+          label: 'currency',
+        },
+      },
+      target: {
+        layerId: 'first',
+        groupId: 'x',
+        isNewColumn: true,
+        indexPatternId: '9de9a3c2-ae98-4180-b019-4d208e516b70',
+        humanData: {
+          groupLabel: 'Vertical axis',
+          layerNumber: 1,
+          position: 1,
+          label: 'Empty dimension',
+          nextLabel: 'currency',
+          canDuplicate: false,
+        },
+        columnId: 'empty',
+        id: 'empty',
+      },
+      dropType: 'field_add' as DropType,
+    } as unknown as DatasourceDimensionDropHandlerProps<TextBasedPrivateState>;
+    const expectedColumns = [
+      column1,
+      column2,
+      column3,
+      { columnId: 'empty', fieldName: 'currency', meta: { type: 'string' } },
+    ];
+    expect(onDrop(props)).toEqual(
+      expect.objectContaining({
+        layers: {
+          first: expect.objectContaining({
+            columns: expectedColumns,
+          }),
+        },
+      })
+    );
+  });
+  it('should add the column when dropping a field controlled by a variable', () => {
+    const props = {
+      ...defaultProps,
+      source: {
+        field: 'field',
+        id: 'field',
+        humanData: {
+          label: '??field',
+        },
+      },
+      target: {
+        layerId: 'first',
+        groupId: 'x',
+        isNewColumn: true,
+        indexPatternId: '9de9a3c2-ae98-4180-b019-4d208e516b70',
+        humanData: {
+          groupLabel: 'Vertical axis',
+          layerNumber: 1,
+          position: 1,
+          label: 'Empty dimension',
+          nextLabel: '??field',
+          canDuplicate: false,
+        },
+        columnId: 'empty',
+        id: 'empty',
+      },
+      dropType: 'field_add' as DropType,
+    } as unknown as DatasourceDimensionDropHandlerProps<TextBasedPrivateState>;
+    const expectedColumns = [
+      column1,
+      column2,
+      column3,
+      { columnId: 'empty', fieldName: '??field', meta: { type: 'number' }, variable: 'field' },
+    ];
+    expect(onDrop(props)).toEqual(
+      expect.objectContaining({
+        layers: {
+          first: expect.objectContaining({
+            columns: expectedColumns,
+          }),
+        },
+      })
+    );
+  });
+  it('should replace the column with the field', () => {
+    const props = {
+      ...defaultProps,
+      source: {
+        field: 'currency',
+        id: 'currency',
+        humanData: {
+          label: 'currency',
+        },
+      },
+      dropType: 'field_replace' as DropType,
+    };
+    const expectedColumns = [
+      column1,
+      column2,
+      {
+        columnId: 'columnId3',
+        fieldName: 'currency',
+        meta: { type: 'string' },
+        inMetricDimension: true,
+      },
+    ];
+    expect(onDrop(props)).toEqual(
+      expect.objectContaining({
+        layers: {
+          first: expect.objectContaining({
+            columns: expectedColumns,
+          }),
+        },
+      })
+    );
+  });
+  it('should replace the column with the field if the field is controlled by a variable', () => {
+    const props = {
+      ...defaultProps,
+      source: {
+        field: 'field',
+        id: 'field',
+        humanData: {
+          label: '??field',
+        },
+      },
+      dropType: 'field_replace' as DropType,
+    };
+    const expectedColumns = [
+      column1,
+      column2,
+      {
+        columnId: 'columnId3',
+        fieldName: '??field',
+        meta: { type: 'number' },
+        variable: 'field',
+        inMetricDimension: true,
+      },
+    ];
+    expect(onDrop(props)).toEqual(
+      expect.objectContaining({
+        layers: {
+          first: expect.objectContaining({
+            columns: expectedColumns,
+          }),
+        },
+      })
+    );
+  });
+  it('should duplicate the dimension if dropType is duplicate_compatible', () => {
+    const props = {
+      ...defaultProps,
+      dropType: 'duplicate_compatible' as DropType,
+    };
+    const expectedColumns = [
+      column1,
+      column2,
+      { ...column1, columnId: 'columnId3', inMetricDimension: true },
+    ];
+    expect(onDrop(props)).toEqual(
+      expect.objectContaining({
+        layers: {
+          first: expect.objectContaining({
+            columns: expectedColumns,
+          }),
+        },
+      })
+    );
+  });
+  it('should not set inMetricDimension when target is not a metric dimension', () => {
+    const props = {
+      ...defaultProps,
+      source: {
+        field: 'currency',
+        id: 'currency',
+        humanData: {
+          label: 'currency',
+        },
+      },
+      target: {
+        ...defaultProps.target,
+        isMetricDimension: false,
+      },
+      dropType: 'field_replace' as DropType,
+    } as unknown as DatasourceDimensionDropHandlerProps<TextBasedPrivateState>;
+    const expectedColumns = [
+      column1,
+      column2,
+      { columnId: 'columnId3', fieldName: 'currency', meta: { type: 'string' } },
+    ];
+    expect(onDrop(props)).toEqual(
+      expect.objectContaining({
+        layers: {
+          first: expect.objectContaining({
+            columns: expectedColumns,
+          }),
+        },
+      })
+    );
+  });
+});

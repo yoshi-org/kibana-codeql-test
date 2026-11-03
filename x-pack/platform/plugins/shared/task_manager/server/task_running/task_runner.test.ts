@@ -1,0 +1,4599 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import _ from 'lodash';
+import { errors } from '@elastic/elasticsearch';
+import { secondsFromNow, secondsFromDate } from '../lib/intervals';
+import { asOk, asErr } from '../lib/result_type';
+import {
+  createTaskRunError,
+  TaskErrorSource,
+  TaskManagerRunner,
+  TaskRunningStage,
+  TaskRunResult,
+} from '.';
+import type { TaskEvent, TaskRun } from '../task_events';
+import { asTaskRunEvent, TaskPersistence, asTaskManagerStatEvent } from '../task_events';
+import type { ConcreteTaskInstance, TaskEventLogger } from '../task';
+import {
+  getDeleteTaskRunResult,
+  TaskPriority,
+  TaskStatus,
+  TaskCost,
+  InstanceTaskCost,
+} from '../task';
+import { SavedObjectsErrorHelpers } from '@kbn/core/server';
+import moment from 'moment';
+import type { TaskDefinitionRegistry } from '../task_type_dictionary';
+import { TaskTypeDictionary } from '../task_type_dictionary';
+import { mockLogger } from '../test_utils';
+import { throwRetryableError, throwUnrecoverableError } from './errors';
+import apm from 'elastic-apm-node';
+import { SpanStatusCode, trace } from '@opentelemetry/api';
+import { tracing } from '@elastic/opentelemetry-node/sdk';
+import { executionContextServiceMock } from '@kbn/core/server/mocks';
+import { usageCountersServiceMock } from '@kbn/usage-collection-plugin/server/usage_counters/usage_counters_service.mock';
+import { bufferedTaskStoreMock } from '../buffered_task_store.mock';
+import { TASK_MANAGER_RUN_TRANSACTION_TYPE } from './task_runner';
+import { schema } from '@kbn/config-schema';
+import * as nextRunAtUtils from '../lib/get_next_run_at';
+import { configMock } from '../config.mock';
+import { EsApiKeyStrategy } from '../api_key_strategy';
+import { taskManagerUiamTelemetry } from '../otel/uiam_telemetry';
+import { asSpaceId } from '@kbn/core-spaces-common';
+
+const baseDelay = 5 * 60 * 1000;
+const executionContext = executionContextServiceMock.createSetupContract();
+const minutesFromNow = (mins: number): Date => secondsFromNow(mins * 60);
+const minutesFromDate = (date: Date, mins: number): Date => secondsFromDate(date, mins * 60);
+const getNextRunAtSpy = jest.spyOn(nextRunAtUtils, 'getNextRunAt');
+const eventLoggerMock = {
+  logEvent: jest.fn(),
+} as unknown as TaskEventLogger;
+const dateRegExp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
+
+const TASK_EXECUTION_UUID = 'NEW_UUID';
+jest.mock('uuid', () => ({
+  v4: () => TASK_EXECUTION_UUID,
+}));
+
+beforeAll(() => {
+  jest.useFakeTimers();
+});
+
+beforeEach(() => {
+  jest.setSystemTime(new Date('1970-01-01T00:00:00.000Z'));
+});
+
+afterAll(() => jest.useRealTimers());
+
+describe('TaskManagerRunner', () => {
+  const pendingStageSetup = (opts: TestOpts) => testOpts(TaskRunningStage.PENDING, opts);
+  const readyToRunStageSetup = (opts: TestOpts) => testOpts(TaskRunningStage.READY_TO_RUN, opts);
+  const mockApmTrans = {
+    end: jest.fn(),
+    addLabels: jest.fn(),
+    setLabel: jest.fn(),
+  };
+
+  let otelExporter: tracing.InMemorySpanExporter;
+  let otelProvider: tracing.BasicTracerProvider;
+
+  beforeAll(() => {
+    otelExporter = new tracing.InMemorySpanExporter();
+    otelProvider = new tracing.BasicTracerProvider({
+      spanProcessors: [new tracing.SimpleSpanProcessor(otelExporter)],
+    });
+    trace.setGlobalTracerProvider(otelProvider);
+  });
+
+  beforeEach(() => {
+    otelExporter?.reset();
+  });
+
+  afterAll(async () => {
+    await otelProvider.shutdown();
+  });
+
+  test('execution ID', async () => {
+    const { runner } = await pendingStageSetup({
+      instance: {
+        id: 'foo',
+        taskType: 'bar',
+      },
+    });
+
+    expect(runner.taskExecutionId).toEqual(`foo::NEW_UUID`);
+    expect(runner.isSameTask(`foo::ANOTHER_UUID`)).toEqual(true);
+    expect(runner.isSameTask(`bar::ANOTHER_UUID`)).toEqual(false);
+  });
+
+  describe('Pending Stage', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+      jest
+        .spyOn(apm, 'startTransaction')
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        .mockImplementation(() => mockApmTrans as any);
+    });
+
+    test('provides execution context on run', async () => {
+      const { runner } = await readyToRunStageSetup({
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { state: {} };
+              },
+            }),
+          },
+        },
+      });
+      await runner.run();
+      expect(executionContext.withContext).toHaveBeenCalledTimes(1);
+      expect(executionContext.withContext).toHaveBeenCalledWith(
+        {
+          description: 'run task',
+          id: 'foo',
+          name: 'run bar',
+          type: 'task manager',
+        },
+        expect.any(Function)
+      );
+    });
+
+    test('provides details about the task that is running', async () => {
+      const { runner } = await pendingStageSetup({
+        instance: {
+          id: 'foo',
+          taskType: 'bar',
+        },
+      });
+
+      expect(runner.id).toEqual('foo');
+      expect(runner.taskType).toEqual('bar');
+      expect(runner.toString()).toEqual('bar "foo"');
+    });
+
+    test('skips marking task as running for mget claim strategy', async () => {
+      const { runner, store } = await pendingStageSetup({
+        instance: {
+          schedule: {
+            interval: '10m',
+          },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              run: async () => undefined,
+            }),
+          },
+        },
+      });
+      const result = await runner.markTaskAsRunning();
+
+      expect(result).toBe(true);
+      expect(apm.startTransaction).not.toHaveBeenCalled();
+      expect(mockApmTrans.end).not.toHaveBeenCalled();
+
+      const spans = otelExporter.getFinishedSpans();
+      expect(spans.find((s) => s.name === 'mark-task-as-running')).toBeUndefined();
+
+      expect(runner.id).toEqual('foo');
+      expect(runner.taskType).toEqual('bar');
+      expect(runner.toString()).toEqual('bar "foo"');
+
+      expect(store.update).not.toHaveBeenCalled();
+    });
+
+    describe('cost', () => {
+      test('task instance cost takes precedence over task definition cost', async () => {
+        const { runner } = await pendingStageSetup({
+          instance: { id: 'foo', taskType: 'bar', cost: InstanceTaskCost.Tiny },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              cost: TaskCost.ExtraLarge,
+              createTaskRunner: () => ({ run: async () => ({ state: {} }) }),
+            },
+          },
+        });
+        expect(runner.cost).toEqual(TaskCost.Tiny);
+      });
+
+      test('uses task definition cost when there is no task instance cost set', async () => {
+        const { runner } = await pendingStageSetup({
+          instance: { id: 'foo', taskType: 'bar' },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              cost: TaskCost.Tiny,
+              createTaskRunner: () => ({ run: async () => ({ state: {} }) }),
+            },
+          },
+        });
+        expect(runner.cost).toEqual(TaskCost.Tiny);
+      });
+
+      test('uses "normal" cost when there is no task instance or definition cost set', async () => {
+        const { runner } = await pendingStageSetup({
+          instance: { id: 'foo', taskType: 'bar' },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({ run: async () => ({ state: {} }) }),
+            },
+          },
+        });
+        expect(runner.cost).toEqual(TaskCost.Normal);
+      });
+    });
+  });
+
+  describe('Ready To Run Stage', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+    test('makes calls to APM as expected when task runs successfully', async () => {
+      const { runner } = await readyToRunStageSetup({
+        instance: {
+          params: { a: 'b' },
+          state: { hey: 'there' },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { state: {} };
+              },
+            }),
+          },
+        },
+      });
+      await runner.run();
+      expect(apm.startTransaction).toHaveBeenCalledWith('bar', TASK_MANAGER_RUN_TRANSACTION_TYPE, {
+        childOf: 'apmTraceparent',
+      });
+      expect(mockApmTrans.end).toHaveBeenCalledWith('success');
+
+      const spans = otelExporter.getFinishedSpans();
+      const span = spans.find((s) => s.name === 'task-manager-run');
+      expect(span).toBeDefined();
+      expect(span!.attributes['transaction.type']).toBe(TASK_MANAGER_RUN_TRANSACTION_TYPE);
+      expect(span!.attributes['kibana.task.type']).toBe('bar');
+      expect(span!.status.code).not.toBe(SpanStatusCode.ERROR);
+    });
+    test('makes calls to APM and logs errors as expected when task fails', async () => {
+      const { runner, logger } = await readyToRunStageSetup({
+        instance: {
+          params: { a: 'b' },
+          state: { hey: 'there' },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                throw new Error('rar');
+              },
+            }),
+          },
+        },
+      });
+      await runner.run();
+      expect(apm.startTransaction).toHaveBeenCalledWith('bar', TASK_MANAGER_RUN_TRANSACTION_TYPE, {
+        childOf: 'apmTraceparent',
+      });
+      expect(mockApmTrans.end).toHaveBeenCalledWith('failure');
+
+      const spans = otelExporter.getFinishedSpans();
+      const span = spans.find((s) => s.name === 'task-manager-run');
+      expect(span).toBeDefined();
+      expect(span!.attributes['transaction.type']).toBe(TASK_MANAGER_RUN_TRANSACTION_TYPE);
+      expect(span!.attributes['kibana.task.type']).toBe('bar');
+
+      const loggerCall = logger.error.mock.calls[0][0];
+      const loggerMeta = logger.error.mock.calls[0][1];
+      expect(loggerCall as string).toMatchInlineSnapshot(`"Task bar \\"foo\\" failed: Error: rar"`);
+      expect(loggerMeta?.tags).toEqual(['bar', 'foo', 'task-run-failed', 'framework-error']);
+      expect(loggerMeta?.error?.stack_trace).toBeDefined();
+    });
+    describe('task with a credential', () => {
+      const credential = {
+        type: 'service_account',
+        workloadType: 'workflow',
+        workloadId: 'workflow-1',
+        spaceId: 'default',
+        expectedServiceAccountId: null,
+      };
+
+      test('does not run a one-off task and retries it in 5 minutes without using up an attempt', async () => {
+        const createTaskRunner = jest.fn();
+        const onTaskEvent = jest.fn();
+        const { runner, logger, store, instance } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: { attempts: 1, credential },
+          definitions: { bar: { title: 'Bar!', createTaskRunner } },
+        });
+
+        await runner.run();
+
+        expect(createTaskRunner).not.toHaveBeenCalled();
+        const loggerCall = logger.error.mock.calls[0][0];
+        const loggerMeta = logger.error.mock.calls[0][1];
+        expect(loggerCall as string).toMatchInlineSnapshot(
+          `"Task bar \\"foo\\" failed: Error: Task type \\"bar\\" can't run as a service account because it doesn't define runAs"`
+        );
+        expect(loggerMeta?.tags).toEqual(['bar', 'foo', 'task-run-failed', 'framework-error']);
+        expect(store.remove).not.toHaveBeenCalled();
+        expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+        expect(store.partialUpdate.mock.calls[0][0]).toMatchObject({
+          runAt: minutesFromNow(5),
+          attempts: 0,
+          status: TaskStatus.Idle,
+        });
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              instance.id,
+              asErr({
+                task: instance,
+                persistence: TaskPersistence.NonRecurring,
+                result: TaskRunResult.Success,
+                error: new Error(
+                  `Task type "bar" can't run as a service account because it doesn't define runAs`
+                ),
+                isExpired: false,
+              })
+            )
+          )
+        );
+        expect(store.getVerifiedCredential).not.toHaveBeenCalled();
+      });
+
+      test('keeps a one-off task that has used up its attempts', async () => {
+        const { runner, store } = await readyToRunStageSetup({
+          instance: { attempts: 5, credential },
+          definitions: { bar: { title: 'Bar!', maxAttempts: 5, createTaskRunner: jest.fn() } },
+        });
+
+        await runner.run();
+
+        expect(store.remove).not.toHaveBeenCalled();
+        expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+        expect(store.partialUpdate.mock.calls[0][0]).toMatchObject({
+          runAt: minutesFromNow(5),
+          attempts: 0,
+        });
+      });
+
+      test('does not run a recurring task and keeps its schedule', async () => {
+        const createTaskRunner = jest.fn();
+        const { runner, store } = await readyToRunStageSetup({
+          instance: { attempts: 1, credential, schedule: { interval: '10m' } },
+          definitions: { bar: { title: 'Bar!', createTaskRunner } },
+        });
+
+        await runner.run();
+
+        expect(createTaskRunner).not.toHaveBeenCalled();
+        expect(store.remove).not.toHaveBeenCalled();
+        expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+        expect(store.partialUpdate.mock.calls[0][0]).toMatchObject({
+          schedule: { interval: '10m' },
+          attempts: 0,
+          status: TaskStatus.Idle,
+        });
+      });
+
+      test('does not run a task with a credential type added in a later version', async () => {
+        const createTaskRunner = jest.fn();
+        const { runner, logger, store } = await readyToRunStageSetup({
+          instance: { attempts: 1, credential: { type: 'future_credential_type' } },
+          definitions: { bar: { title: 'Bar!', createTaskRunner } },
+        });
+
+        await runner.run();
+
+        expect(createTaskRunner).not.toHaveBeenCalled();
+        expect(logger.error.mock.calls[0][0] as string).toMatchInlineSnapshot(
+          `"Task bar \\"foo\\" failed: Error: Task uses credential type \\"future_credential_type\\", which this version of Kibana cannot run"`
+        );
+        expect(store.remove).not.toHaveBeenCalled();
+        expect(store.partialUpdate.mock.calls[0][0]).toMatchObject({
+          runAt: minutesFromNow(5),
+          attempts: 0,
+          status: TaskStatus.Idle,
+        });
+      });
+
+      describe('of a task type that defines runAs', () => {
+        const withScopedRequest = jest.fn();
+        const createTaskRunner = jest.fn();
+        const definitions = {
+          bar: {
+            title: 'Bar!',
+            runAs: { workloadTypes: ['workflow'], withScopedRequest },
+            createTaskRunner,
+          },
+        };
+        const encryptedCredential = 'canary';
+        let recordTaskRunSpy: jest.SpyInstance;
+
+        beforeEach(() => {
+          withScopedRequest.mockImplementation(async (_params, fn) => fn({}));
+          createTaskRunner.mockImplementation(() => ({
+            async run() {
+              return { state: {} };
+            },
+          }));
+          recordTaskRunSpy = jest
+            .spyOn(taskManagerUiamTelemetry, 'recordTaskRun')
+            .mockImplementation(() => {});
+        });
+
+        afterEach(() => {
+          recordTaskRunSpy.mockRestore();
+        });
+
+        test('runs the task as its workload instead of with an API key', async () => {
+          const enrichFakeRequest = jest.fn();
+          const { runner, store } = await readyToRunStageSetup({
+            instance: {
+              credential,
+              encryptedCredential,
+              apiKey: 'aw4badfg333',
+              userScope: {
+                apiKeyId: 'abcdefg',
+                spaceId: asSpaceId('default'),
+                apiKeyCreatedByUser: false,
+                userProfileId: 'u_profile_123',
+              },
+            },
+            definitions,
+            enrichFakeRequest,
+          });
+          store.getVerifiedCredential.mockResolvedValue(asOk(credential));
+
+          await runner.run();
+
+          expect(store.getVerifiedCredential).toHaveBeenCalledWith('foo');
+          expect(recordTaskRunSpy).toHaveBeenCalledTimes(1);
+          expect(recordTaskRunSpy).toHaveBeenCalledWith('service_account', 'run_as');
+          const context = createTaskRunner.mock.calls[0][0];
+          expect(context.runAs).toEqual({ withScopedRequest: expect.any(Function) });
+          expect(context).not.toHaveProperty('fakeRequest');
+          expect(context).not.toHaveProperty('enrichRequest');
+          expect(enrichFakeRequest).not.toHaveBeenCalled();
+          expect(context.taskInstance).toEqual(mockInstance());
+
+          await expect(context.runAs.withScopedRequest(async () => 'result')).resolves.toBe(
+            'result'
+          );
+          expect(withScopedRequest).toHaveBeenCalledWith(
+            { workloadType: 'workflow', workloadId: 'workflow-1', spaceId: 'default' },
+            expect.any(Function)
+          );
+        });
+
+        test('runs the task as the workload of the verified credential', async () => {
+          const { runner, store } = await readyToRunStageSetup({
+            instance: { credential, encryptedCredential },
+            definitions,
+          });
+          store.getVerifiedCredential.mockResolvedValue(
+            asOk({ ...credential, workloadId: 'workflow-2', expectedServiceAccountId: 'sa-2' })
+          );
+
+          await runner.run();
+          await createTaskRunner.mock.calls[0][0].runAs.withScopedRequest(async () => {});
+
+          expect(withScopedRequest).toHaveBeenCalledWith(
+            {
+              workloadType: 'workflow',
+              workloadId: 'workflow-2',
+              spaceId: 'default',
+              expectedServiceAccountId: 'sa-2',
+            },
+            expect.any(Function)
+          );
+        });
+
+        test.each([
+          ['one-off', {}, TaskPersistence.NonRecurring],
+          ['recurring', { schedule: { interval: '10m' } }, TaskPersistence.Recurring],
+        ])(
+          'marks a %s task as failed instead of removing it when its credential fails the integrity check',
+          async (_description, instanceFields, persistence) => {
+            const onTaskEvent = jest.fn();
+            const { runner, store, logger, instance } = await readyToRunStageSetup({
+              onTaskEvent,
+              instance: {
+                ...instanceFields,
+                attempts: 2,
+                credential,
+                encryptedCredential,
+                version: '123',
+              },
+              definitions,
+            });
+            const error = new Error(
+              'Task credential failed its integrity check: Unable to decrypt attribute "encryptedCredential"'
+            );
+            store.getVerifiedCredential.mockResolvedValue(asErr(error));
+
+            await expect(runner.run()).resolves.toEqual(asErr({ error, state: {} }));
+
+            expect(createTaskRunner).not.toHaveBeenCalled();
+            expect(recordTaskRunSpy).not.toHaveBeenCalled();
+            expect(store.remove).not.toHaveBeenCalled();
+            expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+            expect(store.partialUpdate).toHaveBeenCalledWith(
+              {
+                id: 'foo',
+                version: '123',
+                status: TaskStatus.Failed,
+                attempts: 1,
+                startedAt: null,
+                retryAt: null,
+                ownerId: null,
+              },
+              { validate: false, doc: instance }
+            );
+            expect(logger.error.mock.calls[0][0] as string).toBe(
+              `Task bar "foo" failed: Error: ${error.message}`
+            );
+            expect(logger.error.mock.calls[0][1]?.tags).toEqual([
+              'bar',
+              'foo',
+              'task-run-failed',
+              'framework-error',
+            ]);
+            expect(onTaskEvent).toHaveBeenCalledWith(
+              withAnyTiming(
+                asTaskRunEvent(
+                  'foo',
+                  asErr({
+                    task: instance,
+                    persistence,
+                    result: TaskRunResult.Failed,
+                    error,
+                    isExpired: false,
+                  })
+                )
+              )
+            );
+            expect(eventLoggerMock.logEvent).toHaveBeenCalledWith(
+              expect.objectContaining({
+                event: expect.objectContaining({ action: 'task-run', outcome: 'failure' }),
+                message: 'Task bar "foo" failed.',
+                error: expect.objectContaining({ message: error.message }),
+              })
+            );
+          }
+        );
+
+        test.each([
+          ['an incomplete service account', { type: 'service_account', workloadType: 'workflow' }],
+          ['an API key', { type: 'api_key' }],
+        ])(
+          'marks the task as failed when its verified credential is %s credential',
+          async (_description, verifiedCredential) => {
+            const { runner, store, logger } = await readyToRunStageSetup({
+              instance: { credential, encryptedCredential },
+              definitions,
+            });
+            store.getVerifiedCredential.mockResolvedValue(asOk(verifiedCredential));
+
+            await runner.run();
+
+            expect(createTaskRunner).not.toHaveBeenCalled();
+            expect(store.remove).not.toHaveBeenCalled();
+            expect(store.partialUpdate.mock.calls[0][0]).toMatchObject({
+              status: TaskStatus.Failed,
+            });
+            expect(logger.error.mock.calls[0][0] as string).toMatchInlineSnapshot(
+              `"Task bar \\"foo\\" failed: Error: Task credential failed its integrity check: it is not a complete service account credential"`
+            );
+          }
+        );
+
+        test.each([
+          ['an error', new Error('Conflict'), 'Conflict'],
+          [
+            'a bulk update item',
+            { type: 'task', id: 'foo', status: 409, error: { type: 'version_conflict' } },
+            '{"type":"task","id":"foo","status":409,"error":{"type":"version_conflict"}}',
+          ],
+        ])(
+          "doesn't remove the task when marking it as failed rejects with %s",
+          async (_description, updateError, loggedReason) => {
+            const onTaskEvent = jest.fn();
+            const { runner, store, logger } = await readyToRunStageSetup({
+              onTaskEvent,
+              instance: { credential, encryptedCredential },
+              definitions,
+            });
+            store.getVerifiedCredential.mockResolvedValue(
+              asErr(new Error('Task credential failed its integrity check: Unable to decrypt'))
+            );
+            store.partialUpdate.mockRejectedValueOnce(updateError);
+
+            await runner.run();
+
+            expect(store.remove).not.toHaveBeenCalled();
+            expect(logger.warn).toHaveBeenCalledWith(
+              `Unable to mark task bar "foo" as failed: ${loggedReason}`,
+              { tags: ['foo', 'bar'] }
+            );
+            expect(onTaskEvent).toHaveBeenCalledWith(
+              expect.objectContaining({
+                event: asErr(expect.objectContaining({ result: TaskRunResult.Failed })),
+              })
+            );
+          }
+        );
+
+        test.each([
+          [
+            "its credential can't be read",
+            (store: ReturnType<typeof bufferedTaskStoreMock.create>) =>
+              store.getVerifiedCredential.mockRejectedValue(new Error('Unavailable')),
+            'Unavailable',
+          ],
+          [
+            "its task type doesn't allow its workload type",
+            (store: ReturnType<typeof bufferedTaskStoreMock.create>) =>
+              store.getVerifiedCredential.mockResolvedValue(
+                asOk({ ...credential, workloadType: 'other_workload' })
+              ),
+            'Task type "bar" doesn\'t allow running as workload type "other_workload"',
+          ],
+        ])(
+          'retries a one-off task in 5 minutes without using up an attempt when %s',
+          async (_description, mockVerifiedCredential, reason) => {
+            const { runner, store, logger } = await readyToRunStageSetup({
+              instance: { attempts: 1, credential, encryptedCredential },
+              definitions,
+            });
+            mockVerifiedCredential(store);
+
+            await runner.run();
+
+            expect(createTaskRunner).not.toHaveBeenCalled();
+            expect(recordTaskRunSpy).not.toHaveBeenCalled();
+            expect(store.remove).not.toHaveBeenCalled();
+            expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+            expect(store.partialUpdate.mock.calls[0][0]).toMatchObject({
+              runAt: minutesFromNow(5),
+              attempts: 0,
+              status: TaskStatus.Idle,
+            });
+            expect(logger.error.mock.calls[0][0] as string).toBe(
+              `Task bar "foo" failed: Error: ${reason}`
+            );
+            expect(logger.error.mock.calls[0][1]?.tags).toEqual([
+              'bar',
+              'foo',
+              'task-run-failed',
+              'framework-error',
+            ]);
+          }
+        );
+      });
+    });
+    test('logs user errors as expected when task fails', async () => {
+      const { runner, logger } = await readyToRunStageSetup({
+        instance: {
+          params: { a: 'b' },
+          state: { hey: 'there' },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                throw createTaskRunError(new Error('rar'), TaskErrorSource.USER);
+              },
+            }),
+          },
+        },
+      });
+      await runner.run();
+
+      const loggerCall = logger.error.mock.calls[0][0];
+      const loggerMeta = logger.error.mock.calls[0][1];
+      expect(loggerCall as string).toMatchInlineSnapshot(`"Task bar \\"foo\\" failed: Error: rar"`);
+      expect(loggerMeta?.tags).toEqual(['bar', 'foo', 'task-run-failed', 'user-error']);
+    });
+    test('logs ES auth errors as user errors', async () => {
+      const { runner, logger } = await readyToRunStageSetup({
+        instance: {
+          params: { a: 'b' },
+          state: { hey: 'there' },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                throw new errors.ResponseError({
+                  warnings: [],
+                  meta: {} as never,
+                  statusCode: 401,
+                });
+              },
+            }),
+          },
+        },
+      });
+      await runner.run();
+
+      const loggerCall = logger.error.mock.calls[0][0];
+      const loggerMeta = logger.error.mock.calls[0][1];
+      expect(loggerCall as string).toMatchInlineSnapshot(
+        `"Task bar \\"foo\\" failed: ResponseError: Response Error"`
+      );
+      expect(loggerMeta?.tags).toEqual(['bar', 'foo', 'task-run-failed', 'user-error']);
+    });
+    test('logs plain object errors with JSON.stringify instead of [object Object]', async () => {
+      const { runner, logger } = await readyToRunStageSetup({
+        instance: {
+          params: { a: 'b' },
+          state: { hey: 'there' },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                // eslint-disable-next-line no-throw-literal
+                throw { message: 'some error', statusCode: 500 };
+              },
+            }),
+          },
+        },
+      });
+      await runner.run();
+
+      const loggerCall = logger.error.mock.calls[0][0];
+      const loggerMeta = logger.error.mock.calls[0][1];
+      expect(loggerCall as string).toMatchInlineSnapshot(
+        `"Task bar \\"foo\\" failed: {\\"message\\":\\"some error\\",\\"statusCode\\":500}"`
+      );
+      expect(loggerMeta?.tags).toEqual(['bar', 'foo', 'task-run-failed', 'framework-error']);
+      expect(loggerMeta?.error?.stack_trace).toBeUndefined();
+    });
+    test('provides execution context on run', async () => {
+      const { runner } = await readyToRunStageSetup({
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { state: {} };
+              },
+            }),
+          },
+        },
+      });
+      await runner.run();
+      expect(executionContext.withContext).toHaveBeenCalledTimes(1);
+      expect(executionContext.withContext).toHaveBeenCalledWith(
+        {
+          description: 'run task',
+          id: 'foo',
+          name: 'run bar',
+          type: 'task manager',
+        },
+        expect.any(Function)
+      );
+    });
+    test('provides fakeRequest when task has apiKey', async () => {
+      const createTaskRunnerFn = jest.fn();
+      const instance = mockInstance();
+      const { runner } = await readyToRunStageSetup({
+        instance: {
+          ...instance,
+          apiKey: 'aw4badfg333',
+          userScope: {
+            apiKeyId: 'abcdefg',
+            spaceId: asSpaceId('default'),
+            apiKeyCreatedByUser: false,
+          },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: createTaskRunnerFn,
+          },
+        },
+      });
+      await runner.run();
+      const createTaskRunnerParams = createTaskRunnerFn.mock.calls[0][0];
+      expect(createTaskRunnerParams.fakeRequest).toBeDefined();
+      expect(createTaskRunnerParams.taskInstance).toEqual(instance);
+    });
+
+    test('calls enrichFakeRequest with the fake request and userProfileId when both are present', async () => {
+      const enrichFakeRequest = jest.fn();
+      const createTaskRunnerFn = jest.fn();
+      const { runner } = await readyToRunStageSetup({
+        instance: {
+          ...mockInstance(),
+          apiKey: 'aw4badfg333',
+          userScope: {
+            apiKeyId: 'abcdefg',
+            spaceId: asSpaceId('default'),
+            apiKeyCreatedByUser: false,
+            userProfileId: 'u_profile_123',
+          },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: createTaskRunnerFn,
+          },
+        },
+        enrichFakeRequest,
+      });
+
+      await runner.run();
+
+      expect(enrichFakeRequest).toHaveBeenCalledTimes(1);
+      expect(enrichFakeRequest).toHaveBeenCalledWith(
+        expect.objectContaining({ headers: expect.any(Object) }),
+        { profileId: 'u_profile_123', username: undefined }
+      );
+    });
+
+    test('passes enrichRequest on RunContext when userProfileId is present', async () => {
+      const enrichFakeRequest = jest.fn();
+      const createTaskRunnerFn = jest.fn();
+      const { runner } = await readyToRunStageSetup({
+        instance: {
+          ...mockInstance(),
+          apiKey: 'aw4badfg333',
+          userScope: {
+            apiKeyId: 'abcdefg',
+            spaceId: asSpaceId('default'),
+            apiKeyCreatedByUser: false,
+            userProfileId: 'u_profile_123',
+          },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: createTaskRunnerFn,
+          },
+        },
+        enrichFakeRequest,
+      });
+
+      await runner.run();
+
+      const createTaskRunnerParams = createTaskRunnerFn.mock.calls[0][0];
+      expect(createTaskRunnerParams.enrichRequest).toBeDefined();
+      expect(typeof createTaskRunnerParams.enrichRequest).toBe('function');
+    });
+
+    test('enrichRequest is undefined when userProfileId is absent', async () => {
+      const enrichFakeRequest = jest.fn();
+      const createTaskRunnerFn = jest.fn();
+      const { runner } = await readyToRunStageSetup({
+        instance: {
+          ...mockInstance(),
+          apiKey: 'aw4badfg333',
+          userScope: {
+            apiKeyId: 'abcdefg',
+            spaceId: asSpaceId('default'),
+            apiKeyCreatedByUser: false,
+          },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: createTaskRunnerFn,
+          },
+        },
+        enrichFakeRequest,
+      });
+
+      await runner.run();
+
+      expect(enrichFakeRequest).not.toHaveBeenCalled();
+      const createTaskRunnerParams = createTaskRunnerFn.mock.calls[0][0];
+      expect(createTaskRunnerParams.enrichRequest).toBeUndefined();
+    });
+
+    test('enrichRequest calls enrichFakeRequest for child requests', async () => {
+      const enrichFakeRequest = jest.fn();
+      const createTaskRunnerFn = jest.fn();
+      const { runner } = await readyToRunStageSetup({
+        instance: {
+          ...mockInstance(),
+          apiKey: 'aw4badfg333',
+          userScope: {
+            apiKeyId: 'abcdefg',
+            spaceId: asSpaceId('default'),
+            apiKeyCreatedByUser: false,
+            userProfileId: 'u_profile_123',
+          },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: createTaskRunnerFn,
+          },
+        },
+        enrichFakeRequest,
+      });
+
+      await runner.run();
+
+      const createTaskRunnerParams = createTaskRunnerFn.mock.calls[0][0];
+      const childRequest = { fake: 'child-request' };
+      createTaskRunnerParams.enrichRequest(childRequest);
+
+      expect(enrichFakeRequest).toHaveBeenCalledTimes(2);
+      expect(enrichFakeRequest).toHaveBeenLastCalledWith(childRequest, {
+        profileId: 'u_profile_123',
+        username: undefined,
+      });
+    });
+
+    test('runs without error and passes undefined enrichRequest when no enrichFakeRequest hook is provided', async () => {
+      const createTaskRunnerFn = jest.fn();
+      const { runner } = await readyToRunStageSetup({
+        instance: {
+          ...mockInstance(),
+          apiKey: 'aw4badfg333',
+          userScope: {
+            apiKeyId: 'abcdefg',
+            spaceId: asSpaceId('default'),
+            apiKeyCreatedByUser: false,
+            userProfileId: 'u_profile_123',
+          },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: createTaskRunnerFn,
+          },
+        },
+        // no enrichFakeRequest supplied (simulates Core without the hook)
+      });
+
+      await runner.run();
+
+      const createTaskRunnerParams = createTaskRunnerFn.mock.calls[0][0];
+      expect(createTaskRunnerParams.fakeRequest).toBeDefined();
+      expect(createTaskRunnerParams.enrichRequest).toBeUndefined();
+    });
+
+    test('still enriches when apiKeyCreatedByUser is true but userProfileId is present', async () => {
+      const enrichFakeRequest = jest.fn();
+      const createTaskRunnerFn = jest.fn();
+      const { runner } = await readyToRunStageSetup({
+        instance: {
+          ...mockInstance(),
+          apiKey: 'aw4badfg333',
+          userScope: {
+            apiKeyId: 'abcdefg',
+            spaceId: asSpaceId('default'),
+            apiKeyCreatedByUser: true,
+            userProfileId: 'u_profile_123',
+          },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: createTaskRunnerFn,
+          },
+        },
+        enrichFakeRequest,
+      });
+
+      await runner.run();
+
+      expect(enrichFakeRequest).toHaveBeenCalledTimes(1);
+      expect(enrichFakeRequest).toHaveBeenCalledWith(
+        expect.objectContaining({ headers: expect.any(Object) }),
+        { profileId: 'u_profile_123', username: undefined }
+      );
+      const createTaskRunnerParams = createTaskRunnerFn.mock.calls[0][0];
+      expect(createTaskRunnerParams.enrichRequest).toBeDefined();
+    });
+
+    test('propagates enrichFakeRequest errors when enrichRequest is called on a non-fake child request', async () => {
+      let callCount = 0;
+      const enrichFakeRequest = jest.fn().mockImplementation(() => {
+        callCount += 1;
+        // succeed on the initial fake-request enrichment, throw on the child request
+        if (callCount > 1) {
+          throw new Error('boom');
+        }
+      });
+      const createTaskRunnerFn = jest.fn();
+      const { runner } = await readyToRunStageSetup({
+        instance: {
+          ...mockInstance(),
+          apiKey: 'aw4badfg333',
+          userScope: {
+            apiKeyId: 'abcdefg',
+            spaceId: asSpaceId('default'),
+            apiKeyCreatedByUser: false,
+            userProfileId: 'u_profile_123',
+          },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: createTaskRunnerFn,
+          },
+        },
+        enrichFakeRequest,
+      });
+
+      await runner.run();
+
+      const createTaskRunnerParams = createTaskRunnerFn.mock.calls[0][0];
+      const childRequest = { fake: 'child-request' };
+
+      expect(() => createTaskRunnerParams.enrichRequest(childRequest)).toThrow('boom');
+    });
+
+    test('queues a reattempt if the task fails', async () => {
+      const initialAttempts = _.random(0, 2);
+      const id = Date.now().toString();
+      const { runner, store } = await readyToRunStageSetup({
+        instance: {
+          id,
+          attempts: initialAttempts,
+          params: { a: 'b' },
+          state: { hey: 'there' },
+          enabled: true,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                throw new Error('Dangit!');
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      const instance = store.partialUpdate.mock.calls[0][0];
+
+      expect(instance.id).toEqual(id);
+
+      const minRunAt = Date.now();
+      const maxRunAt = minRunAt + baseDelay * Math.pow(2, initialAttempts - 2);
+      expect(instance.runAt?.getTime()).toBeGreaterThanOrEqual(minRunAt);
+      expect(instance.runAt?.getTime()).toBeLessThanOrEqual(maxRunAt);
+
+      expect(instance.params).not.toBeDefined();
+      expect(instance.enabled).not.toBeDefined();
+      expect(instance.state).toEqual({ hey: 'there' });
+
+      expect(getNextRunAtSpy).not.toHaveBeenCalled();
+    });
+
+    test('reschedules tasks that have an schedule', async () => {
+      const { runner, store } = await readyToRunStageSetup({
+        instance: {
+          schedule: { interval: '10m' },
+          status: TaskStatus.Running,
+          startedAt: new Date(),
+          enabled: true,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { state: {} };
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      const instance = store.partialUpdate.mock.calls[0][0];
+
+      expect(instance.runAt?.getTime()).toBeGreaterThan(minutesFromNow(9).getTime());
+      expect(instance.runAt?.getTime()).toBeLessThanOrEqual(minutesFromNow(10).getTime());
+      expect(instance.enabled).not.toBeDefined();
+
+      expect(getNextRunAtSpy).toHaveBeenCalled();
+    });
+
+    test('expiration returns time after which timeout will have elapsed from start', async () => {
+      const now = moment();
+      const { runner } = await readyToRunStageSetup({
+        instance: {
+          schedule: { interval: '10m' },
+          status: TaskStatus.Running,
+          startedAt: now.toDate(),
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: `1m`,
+            createTaskRunner: () => ({
+              async run() {
+                return { state: {} };
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(runner.isExpired).toBe(false);
+      expect(runner.expiration).toEqual(now.add(1, 'm').toDate());
+    });
+
+    test('runDuration returns duration which has elapsed since start', async () => {
+      const now = moment().subtract(30, 's').toDate();
+      const { runner } = await readyToRunStageSetup({
+        instance: {
+          schedule: { interval: '10m' },
+          status: TaskStatus.Running,
+          startedAt: now,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: `1m`,
+            createTaskRunner: () => ({
+              async run() {
+                return { state: {} };
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(runner.isExpired).toBe(false);
+      expect(runner.startedAt).toEqual(now);
+    });
+
+    test.each([undefined, TaskPriority.Standard, TaskPriority.UserInteractive])(
+      'reschedules tasks that return a runAt with priority %s',
+      async (priority) => {
+        const runAt = minutesFromNow(_.random(1, 10));
+        const { instance, runner, store } = await readyToRunStageSetup({
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              allowPriorityOverride: true,
+              createTaskRunner: () => ({
+                async run() {
+                  return { runAt, state: {}, priority };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+        expect(store.partialUpdate).toHaveBeenCalledWith(expect.objectContaining({ runAt }), {
+          validate: true,
+          doc: instance,
+        });
+
+        const [update] = store.partialUpdate.mock.calls[0];
+        if (priority === undefined) {
+          expect(update).not.toHaveProperty('priority');
+        } else {
+          expect(update).toHaveProperty('priority', priority);
+        }
+
+        expect(getNextRunAtSpy).not.toHaveBeenCalled();
+      }
+    );
+
+    test('ignores a returned priority when the task type has not opted in', async () => {
+      const runAt = minutesFromNow(_.random(1, 10));
+      const { runner, store, logger } = await readyToRunStageSetup({
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { runAt, state: {}, priority: TaskPriority.UserInteractive };
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      const [update] = store.partialUpdate.mock.calls[0];
+      expect(update).toHaveProperty('runAt', runAt);
+      expect(update).not.toHaveProperty('priority');
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('does not allow priority overrides'),
+        { tags: ['bar'] }
+      );
+    });
+
+    test('reschedules tasks that return a schedule', async () => {
+      const runAt = minutesFromNow(1);
+      const schedule = {
+        interval: '1m',
+      };
+      const { instance, runner, store, logger } = await readyToRunStageSetup({
+        instance: {
+          status: TaskStatus.Running,
+          startedAt: new Date(),
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { schedule, state: {} };
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      expect(store.partialUpdate).toHaveBeenCalledWith(expect.objectContaining({ runAt }), {
+        validate: true,
+        doc: instance,
+      });
+
+      expect(getNextRunAtSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ schedule }),
+        expect.any(Number),
+        logger
+      );
+    });
+
+    test(`doesn't reschedule recurring tasks that throw an unrecoverable error`, async () => {
+      const id = _.random(1, 20).toString();
+      const error = new Error('Dangit!');
+      const onTaskEvent = jest.fn();
+      const {
+        runner,
+        store,
+        instance: originalInstance,
+      } = await readyToRunStageSetup({
+        onTaskEvent,
+        instance: {
+          id,
+          schedule: { interval: '20m' },
+          status: TaskStatus.Running,
+          startedAt: new Date(),
+          enabled: true,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                throwUnrecoverableError(error);
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(store.remove).toHaveBeenCalled();
+      expect(store.update).not.toHaveBeenCalled();
+
+      expect(onTaskEvent).toHaveBeenCalledWith(
+        withAnyTiming(
+          asTaskRunEvent(
+            id,
+            asErr({
+              error,
+              persistence: TaskPersistence.Recurring,
+              task: originalInstance,
+              result: TaskRunResult.Failed,
+              isExpired: false,
+            })
+          )
+        )
+      );
+      expect(onTaskEvent).toHaveBeenCalledWith(
+        asTaskManagerStatEvent('runDelay', asOk(expect.any(Number)))
+      );
+      expect(onTaskEvent).toHaveBeenCalledTimes(2);
+    });
+
+    test(`doesn't reschedule recurring tasks that return shouldDeleteTask = true`, async () => {
+      const id = _.random(1, 20).toString();
+      const onTaskEvent = jest.fn();
+      const {
+        runner,
+        store,
+        instance: originalInstance,
+      } = await readyToRunStageSetup({
+        onTaskEvent,
+        instance: {
+          id,
+          schedule: { interval: '20m' },
+          status: TaskStatus.Running,
+          startedAt: new Date(),
+          enabled: true,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return getDeleteTaskRunResult();
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(store.remove).toHaveBeenCalled();
+      expect(store.update).not.toHaveBeenCalled();
+
+      expect(onTaskEvent).toHaveBeenCalledWith(
+        withAnyTiming(
+          asTaskRunEvent(
+            id,
+            asOk({
+              persistence: TaskPersistence.Recurring,
+              task: originalInstance,
+              result: TaskRunResult.Deleted,
+              isExpired: false,
+            })
+          )
+        )
+      );
+      expect(onTaskEvent).toHaveBeenCalledWith(
+        asTaskManagerStatEvent('runDelay', asOk(expect.any(Number)))
+      );
+      expect(onTaskEvent).toHaveBeenCalledTimes(2);
+    });
+
+    test('tasks that return runAt override the schedule', async () => {
+      const runAt = minutesFromNow(_.random(5));
+      const { instance, runner, store } = await readyToRunStageSetup({
+        instance: {
+          schedule: { interval: '20m' },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { runAt, state: {} };
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      expect(store.partialUpdate).toHaveBeenCalledWith(expect.objectContaining({ runAt }), {
+        validate: true,
+        doc: instance,
+      });
+    });
+
+    test('removes non-recurring tasks after they complete', async () => {
+      const id = _.random(1, 20).toString();
+      const { runner, store } = await readyToRunStageSetup({
+        instance: {
+          id,
+          schedule: undefined,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return undefined;
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(store.remove).toHaveBeenCalledTimes(1);
+      expect(store.remove).toHaveBeenCalledWith(id);
+    });
+
+    test('cancel cancels the task runner, if it is cancellable', async () => {
+      let wasCancelled = false;
+      const abortSpy = jest.spyOn(AbortController.prototype, 'abort');
+
+      const { runner, logger } = await readyToRunStageSetup({
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 1000));
+                jest.advanceTimersByTime(1000);
+                await promise;
+              },
+              async cancel() {
+                wasCancelled = true;
+              },
+            }),
+          },
+        },
+      });
+
+      const promise = runner.run();
+      await Promise.resolve();
+      await runner.cancel();
+      await promise;
+
+      expect(wasCancelled).toBeTruthy();
+      expect(abortSpy).toHaveBeenCalledTimes(1);
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    test('debug logs if cancel is called on a non-cancellable task', async () => {
+      const { runner, logger } = await readyToRunStageSetup({
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              run: async () => undefined,
+            }),
+          },
+        },
+      });
+
+      const promise = runner.run();
+      await runner.cancel();
+      await promise;
+
+      expect(logger.debug).toHaveBeenCalledWith(`The task bar "foo" is not cancellable.`);
+    });
+
+    test('throws retry error (returning date) on error when defined', async () => {
+      const initialAttempts = _.random(1, 3);
+      const nextRetry = new Date(Date.now() + _.random(15, 100) * 1000);
+      const id = Date.now().toString();
+      const error = new Error('Dangit!');
+      const {
+        instance: taskInstance,
+        runner,
+        store,
+      } = await readyToRunStageSetup({
+        instance: {
+          id,
+          attempts: initialAttempts,
+          enabled: true,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                throw throwRetryableError(error, nextRetry);
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      expect(store.partialUpdate).toHaveBeenCalledWith(expect.any(Object), {
+        validate: true,
+        doc: taskInstance,
+      });
+      const instance = store.partialUpdate.mock.calls[0][0];
+
+      expect(instance.runAt?.getTime()).toEqual(nextRetry.getTime());
+      expect(instance.enabled).not.toBeDefined();
+    });
+
+    test('throws retry error (returning true) on error when defined', async () => {
+      const initialAttempts = _.random(1, 3);
+      const id = Date.now().toString();
+      const error = new Error('Dangit!');
+      const {
+        instance: taskInstance,
+        runner,
+        store,
+      } = await readyToRunStageSetup({
+        instance: {
+          id,
+          attempts: initialAttempts,
+          enabled: true,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              run: async () => {
+                throwRetryableError(error, true);
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      expect(store.partialUpdate).toHaveBeenCalledWith(expect.any(Object), {
+        validate: true,
+        doc: taskInstance,
+      });
+
+      const instance = store.partialUpdate.mock.calls[0][0];
+
+      const minRunAt = Date.now();
+      const maxRunAt = minRunAt + baseDelay * Math.pow(2, initialAttempts - 2);
+      expect(instance.runAt?.getTime()).toBeGreaterThanOrEqual(minRunAt);
+      expect(instance.runAt?.getTime()).toBeLessThanOrEqual(maxRunAt);
+
+      expect(instance.enabled).not.toBeDefined();
+    });
+
+    test('throws retry error (returning false) on error when defined', async () => {
+      const initialAttempts = _.random(1, 3);
+      const id = Date.now().toString();
+      const error = new Error('Dangit!');
+      const { runner, store } = await readyToRunStageSetup({
+        instance: {
+          id,
+          attempts: initialAttempts,
+          enabled: true,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                throwRetryableError(error, false);
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(store.remove).toHaveBeenCalled();
+      expect(store.update).not.toHaveBeenCalled();
+    });
+
+    test('bypasses getRetry function (returning false) on error of a recurring task', async () => {
+      const initialAttempts = _.random(1, 3);
+      const id = Date.now().toString();
+      const error = new Error('Dangit!');
+      const {
+        instance: taskInstance,
+        runner,
+        store,
+      } = await readyToRunStageSetup({
+        instance: {
+          id,
+          attempts: initialAttempts,
+          schedule: { interval: '1m' },
+          startedAt: new Date(),
+          enabled: true,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                throw error;
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      expect(store.partialUpdate).toHaveBeenCalledWith(expect.any(Object), {
+        validate: true,
+        doc: taskInstance,
+      });
+
+      const instance = store.partialUpdate.mock.calls[0][0];
+
+      const nextIntervalDelay = 60000; // 1m
+      const expectedRunAt = new Date(Date.now() + nextIntervalDelay);
+      expect(instance.runAt?.getTime()).toEqual(expectedRunAt.getTime());
+      expect(instance.enabled).not.toBeDefined();
+    });
+
+    test('Fails non-recurring task when maxAttempts reached', async () => {
+      const id = _.random(1, 20).toString();
+      const initialAttempts = 3;
+      const { runner, store } = await readyToRunStageSetup({
+        instance: {
+          id,
+          attempts: initialAttempts,
+          schedule: undefined,
+          enabled: true,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            maxAttempts: 3,
+            createTaskRunner: () => ({
+              run: async () => {
+                throw new Error();
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(store.remove).toHaveBeenCalled();
+      expect(store.partialUpdate).not.toHaveBeenCalled();
+    });
+
+    test(`Doesn't fail recurring tasks when maxAttempts reached`, async () => {
+      const id = _.random(1, 20).toString();
+      const initialAttempts = 3;
+      const intervalSeconds = 10;
+      const {
+        instance: taskInstance,
+        runner,
+        store,
+      } = await readyToRunStageSetup({
+        instance: {
+          id,
+          attempts: initialAttempts,
+          schedule: { interval: `${intervalSeconds}s` },
+          startedAt: new Date(),
+          enabled: true,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            maxAttempts: 3,
+            createTaskRunner: () => ({
+              run: async () => {
+                throw new Error();
+              },
+            }),
+          },
+        },
+      });
+
+      await runner.run();
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      const instance = store.partialUpdate.mock.calls[0][0];
+      expect(instance.attempts).toEqual(3);
+      expect(instance.status).toEqual('idle');
+      expect(instance.runAt?.getTime()).toEqual(
+        new Date(Date.now() + intervalSeconds * 1000).getTime()
+      );
+      expect(instance.enabled).not.toBeDefined();
+      expect(store.partialUpdate).toHaveBeenCalledWith(expect.any(Object), {
+        validate: true,
+        doc: taskInstance,
+      });
+    });
+
+    test('throws error when the task has invalid state', async () => {
+      const mockTaskInstance: Partial<ConcreteTaskInstance> = {
+        schedule: { interval: '10m' },
+        status: TaskStatus.Idle,
+        startedAt: new Date(),
+        enabled: true,
+        runAt: new Date(),
+        params: { foo: true },
+        state: { foo: true, bar: 'test', baz: 'test' },
+        stateVersion: 4,
+      };
+
+      const {
+        instance: taskInstance,
+        runner,
+        logger,
+        store,
+      } = await readyToRunStageSetup({
+        instance: mockTaskInstance,
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { state: { foo: 'bar' } };
+              },
+            }),
+            stateSchemaByVersion: {
+              1: {
+                up: (state: Record<string, unknown>) => ({ foo: state.foo || '' }),
+                schema: schema.object({
+                  foo: schema.string(),
+                }),
+              },
+              2: {
+                up: (state: Record<string, unknown>) => ({ ...state, bar: state.bar || '' }),
+                schema: schema.object({
+                  foo: schema.string(),
+                  bar: schema.string(),
+                }),
+              },
+              3: {
+                up: (state: Record<string, unknown>) => ({ ...state, baz: state.baz || '' }),
+                schema: schema.object({
+                  foo: schema.string(),
+                  bar: schema.string(),
+                  baz: schema.string(),
+                }),
+              },
+            },
+          },
+        },
+      });
+
+      expect(await runner.run()).toEqual({
+        error: {
+          error: new Error('[foo]: expected value of type [string] but got [boolean]'),
+          shouldValidate: false,
+          state: { bar: 'test', baz: 'test', foo: true },
+        },
+        tag: 'err',
+      });
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Task (bar/foo) has a validation error: [foo]: expected value of type [string] but got [boolean]'
+      );
+      expect(store.partialUpdate).toHaveBeenCalledWith(expect.any(Object), {
+        validate: false,
+        doc: taskInstance,
+      });
+    });
+
+    test('does not throw error and runs when the task has invalid state and allowReadingInvalidState = true', async () => {
+      const mockTaskInstance: Partial<ConcreteTaskInstance> = {
+        schedule: { interval: '10m' },
+        status: TaskStatus.Idle,
+        startedAt: new Date(),
+        enabled: true,
+        runAt: new Date(),
+        params: { foo: true },
+        state: { foo: true, bar: 'test', baz: 'test' },
+        stateVersion: 4,
+      };
+
+      const { runner, store, logger } = await readyToRunStageSetup({
+        instance: mockTaskInstance,
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { state: { foo: 'bar' } };
+              },
+            }),
+            stateSchemaByVersion: {
+              1: {
+                up: (state: Record<string, unknown>) => ({ foo: state.foo || '' }),
+                schema: schema.object({
+                  foo: schema.string(),
+                }),
+              },
+              2: {
+                up: (state: Record<string, unknown>) => ({ ...state, bar: state.bar || '' }),
+                schema: schema.object({
+                  foo: schema.string(),
+                  bar: schema.string(),
+                }),
+              },
+              3: {
+                up: (state: Record<string, unknown>) => ({ ...state, baz: state.baz || '' }),
+                schema: schema.object({
+                  foo: schema.string(),
+                  bar: schema.string(),
+                  baz: schema.string(),
+                }),
+              },
+            },
+          },
+        },
+        allowReadingInvalidState: true,
+      });
+
+      const result = await runner.run();
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      const instance = store.partialUpdate.mock.calls[0][0];
+      expect(instance.state).toEqual({
+        foo: 'bar',
+      });
+      expect(instance.attempts).toBe(0);
+      expect(logger.warn).not.toHaveBeenCalled();
+      expect(result).toEqual(asOk({ state: { foo: 'bar' } }));
+    });
+
+    test('updates retryAt on an interval for long running tasks', async () => {
+      const { runner, store } = await readyToRunStageSetup({
+        instance: {
+          status: TaskStatus.Running,
+          startedAt: new Date(),
+          enabled: true,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: `365d`,
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 60000));
+                jest.advanceTimersByTime(60000);
+                await promise;
+                return { state: {} };
+              },
+            }),
+          },
+        },
+      });
+      const now = new Date();
+      await runner.run();
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+
+      const instance = store.partialUpdate.mock.calls[0][0];
+      expect(instance.retryAt?.getTime()).toBeGreaterThan(minutesFromDate(now, 5).getTime());
+      expect(instance.retryAt?.getTime()).toBeLessThan(minutesFromDate(now, 6.5).getTime());
+    });
+
+    test('stops the interval and cancels the task if the retryAt conflict is caused by a reclaim by another Kibana', async () => {
+      let wasCancelled = false;
+      const { runner, store, logger, instance } = await readyToRunStageSetup({
+        instance: {
+          status: TaskStatus.Running,
+          startedAt: new Date(),
+          enabled: true,
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: `365d`,
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 60000));
+                jest.advanceTimersByTime(60000);
+                await promise;
+                return { state: {} };
+              },
+              async cancel() {
+                wasCancelled = true;
+              },
+            }),
+          },
+        },
+      });
+      store.partialUpdate.mockRejectedValueOnce(
+        SavedObjectsErrorHelpers.decorateConflictError(new Error('Saved object [type/id] conflict'))
+      );
+      // The doc was reclaimed by another Kibana (ownerId changed).
+      store.get.mockResolvedValue({ ...instance, ownerId: 'another-kibana-node' });
+      await runner.run();
+
+      expect(store.get).toHaveBeenCalledWith('foo');
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Conflict error trying to update retryAt for a long-running task. Cancelling task: foo',
+        {
+          tags: ['foo', 'bar'],
+        }
+      );
+      expect(wasCancelled).toBeTruthy();
+    });
+
+    test('does not revert a schedule that was updated while the task was running', async () => {
+      let wasCancelled = false;
+      const runAt = new Date();
+      const { runner, store, logger, instance } = await readyToRunStageSetup({
+        instance: {
+          id: 'foo',
+          status: TaskStatus.Running,
+          runAt,
+          startedAt: new Date(),
+          enabled: true,
+          schedule: { interval: '1h' },
+          version: 'WzEsMV0=',
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: `365d`,
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 60000));
+                jest.advanceTimersByTime(60000);
+                await promise;
+                return { state: {} };
+              },
+              async cancel() {
+                wasCancelled = true;
+              },
+            }),
+          },
+        },
+      });
+
+      // Another writer (e.g. bulkUpdateSchedules with includeRunningTasks) changed the schedule
+      // to 3h and bumped the version while the task was running. `runAt` is left untouched for
+      // running tasks, so it still reflects when this execution was due.
+      const currentTask = {
+        ...instance,
+        version: 'WzIsMV0=',
+        schedule: { interval: '3h' },
+      };
+      store.partialUpdate.mockRejectedValueOnce(
+        SavedObjectsErrorHelpers.decorateConflictError(new Error('Saved object [type/id] conflict'))
+      );
+      store.get.mockResolvedValue(currentTask);
+
+      await runner.run();
+
+      expect(store.partialUpdate).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ version: 'WzEsMV0=', retryAt: expect.any(Date) }),
+        expect.anything()
+      );
+      expect(store.get).toHaveBeenCalledWith('foo');
+      expect(wasCancelled).toBe(false);
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        'Conflict error trying to update retryAt for a long-running task. Cancelling task: foo',
+        expect.anything()
+      );
+      // Completion persists the externally-updated 3h schedule, not the runner's stale 1h schedule,
+      // and the next runAt is one 3h interval from this run's due time.
+      expect(store.partialUpdate).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          schedule: { interval: '3h' },
+          runAt: new Date(runAt.getTime() + 3 * 60 * 60 * 1000),
+        }),
+        expect.objectContaining({ validate: expect.any(Boolean) })
+      );
+    });
+
+    test('prefers a schedule updated while the task was running over the schedule returned by the task runner', async () => {
+      const runAt = new Date();
+      const { runner, store, instance } = await readyToRunStageSetup({
+        instance: {
+          id: 'foo',
+          status: TaskStatus.Running,
+          runAt,
+          startedAt: new Date(),
+          enabled: true,
+          schedule: { interval: '1h' },
+          version: 'WzEsMV0=',
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: `365d`,
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 60000));
+                jest.advanceTimersByTime(60000);
+                await promise;
+                // The runner echoes back the schedule it was claimed with, which is now stale.
+                return { state: {}, schedule: { interval: '1h' } };
+              },
+            }),
+          },
+        },
+      });
+
+      store.partialUpdate.mockRejectedValueOnce(
+        SavedObjectsErrorHelpers.decorateConflictError(new Error('Saved object [type/id] conflict'))
+      );
+      store.get.mockResolvedValue({
+        ...instance,
+        version: 'WzIsMV0=',
+        schedule: { interval: '3h' },
+      });
+
+      await runner.run();
+
+      expect(store.partialUpdate).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          schedule: { interval: '3h' },
+          runAt: new Date(runAt.getTime() + 3 * 60 * 60 * 1000),
+        }),
+        expect.objectContaining({ validate: expect.any(Boolean) })
+      );
+    });
+
+    test('does not run heartbeat updates while processing recurring task result', async () => {
+      let sawProcessResultUpdate = false;
+      let heartbeatUpdateCount = 0;
+      let heartbeatCountBeforeProcessResult: number | undefined;
+      const { runner, store } = await readyToRunStageSetup({
+        instance: {
+          id: 'foo',
+          status: TaskStatus.Running,
+          startedAt: new Date(),
+          enabled: true,
+          schedule: { interval: '1m' },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: `365d`,
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 60000));
+                jest.advanceTimersByTime(60000);
+                await promise;
+                return { state: {} };
+              },
+            }),
+          },
+        },
+      });
+
+      store.partialUpdate.mockImplementation(async (doc) => {
+        if (doc.retryAt && !doc.status) {
+          heartbeatUpdateCount += 1;
+        }
+
+        if (doc.status === TaskStatus.Idle) {
+          sawProcessResultUpdate = true;
+          heartbeatCountBeforeProcessResult = heartbeatUpdateCount;
+          // If heartbeat timer is still running while processResult persists task state,
+          // advancing time here will trigger an additional retryAt update.
+          jest.advanceTimersByTime(60000);
+        }
+        return mockInstance({
+          ...doc,
+          schedule: { interval: '1m' },
+        }) as ConcreteTaskInstance;
+      });
+
+      await runner.run();
+
+      expect(sawProcessResultUpdate).toBe(true);
+      expect(heartbeatUpdateCount).toBeGreaterThan(0);
+      expect(heartbeatCountBeforeProcessResult).toBeDefined();
+      expect(heartbeatUpdateCount).toBe(heartbeatCountBeforeProcessResult);
+    });
+
+    describe('TaskEvents', () => {
+      test('emits TaskEvent when a task is run successfully', async () => {
+        const id = _.random(1, 20).toString();
+        const onTaskEvent = jest.fn();
+        const { runner, instance } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  return { state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asOk({
+                task: instance,
+                persistence: TaskPersistence.NonRecurring,
+                result: TaskRunResult.Success,
+                isExpired: false,
+              })
+            )
+          )
+        );
+      });
+
+      test('emits TaskEvent when a task is run successfully but completes after timeout', async () => {
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 0, 0, 0));
+        const id = _.random(1, 20).toString();
+        const onTaskEvent = jest.fn();
+        const { runner, instance } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              timeout: `1s`,
+              createTaskRunner: () => ({
+                async run() {
+                  return { state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 10, 0, 0));
+        await runner.run();
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asOk({
+                task: instance,
+                persistence: TaskPersistence.NonRecurring,
+                result: TaskRunResult.Success,
+                isExpired: true,
+              })
+            )
+          )
+        );
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          asTaskManagerStatEvent('runDelay', asOk(expect.any(Number)))
+        );
+      });
+
+      test('emits TaskEvent when a recurring task is run successfully', async () => {
+        const id = _.random(1, 20).toString();
+        const runAt = minutesFromNow(_.random(5));
+        const onTaskEvent = jest.fn();
+        const { runner, instance } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+            schedule: { interval: '1m' },
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  return { runAt, state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asOk({
+                task: instance,
+                persistence: TaskPersistence.Recurring,
+                result: TaskRunResult.Success,
+                isExpired: false,
+              })
+            )
+          )
+        );
+      });
+
+      test('emits TaskEvent when a recurring task is run successfully but completes after timeout', async () => {
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 0, 0, 0));
+        const id = _.random(1, 20).toString();
+        const runAt = minutesFromNow(_.random(5));
+        const onTaskEvent = jest.fn();
+        const { runner, instance } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+            schedule: { interval: '1m' },
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              timeout: `1s`,
+              createTaskRunner: () => ({
+                async run() {
+                  return { runAt, state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 10, 0, 0));
+        await runner.run();
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asOk({
+                task: instance,
+                persistence: TaskPersistence.Recurring,
+                result: TaskRunResult.Success,
+                isExpired: true,
+              })
+            )
+          )
+        );
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          asTaskManagerStatEvent('runDelay', asOk(expect.any(Number)))
+        );
+      });
+
+      test('emits TaskEvent when a recurring task returns a success result with taskRunError', async () => {
+        const id = _.random(1, 20).toString();
+        const runAt = minutesFromNow(_.random(5));
+        const onTaskEvent = jest.fn();
+        const { runner, instance } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+            schedule: { interval: '1m' },
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  return {
+                    runAt,
+                    state: {},
+                    taskRunError: createTaskRunError(new Error('test'), TaskErrorSource.FRAMEWORK),
+                  };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asErr({
+                task: instance,
+                persistence: TaskPersistence.Recurring,
+                result: TaskRunResult.Success,
+                error: new Error(`test`),
+                isExpired: false,
+              })
+            )
+          )
+        );
+      });
+
+      test('emits TaskEvent when a recurring task returns a success result with taskRunError but completes after timeout', async () => {
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 0, 0, 0));
+        const id = _.random(1, 20).toString();
+        const runAt = minutesFromNow(_.random(5));
+        const onTaskEvent = jest.fn();
+        const { runner, instance } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+            schedule: { interval: '1m' },
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              timeout: `1s`,
+              createTaskRunner: () => ({
+                async run() {
+                  return {
+                    runAt,
+                    state: {},
+                    taskRunError: createTaskRunError(new Error('test'), TaskErrorSource.FRAMEWORK),
+                  };
+                },
+              }),
+            },
+          },
+        });
+
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 10, 0, 0));
+        await runner.run();
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asErr({
+                task: instance,
+                persistence: TaskPersistence.Recurring,
+                result: TaskRunResult.Success,
+                isExpired: true,
+                error: new Error(`test`),
+              })
+            )
+          )
+        );
+      });
+
+      test('emits TaskEvent when a task run throws an error', async () => {
+        const id = _.random(1, 20).toString();
+        const error = new Error('Dangit!');
+        const onTaskEvent = jest.fn();
+        const { runner, instance } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  throw error;
+                },
+              }),
+            },
+          },
+        });
+        await runner.run();
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asErr({
+                error,
+                task: instance,
+                persistence: TaskPersistence.NonRecurring,
+                result: TaskRunResult.RetryScheduled,
+                isExpired: false,
+              })
+            )
+          )
+        );
+        expect(onTaskEvent).toHaveBeenCalledTimes(2);
+      });
+
+      test('emits TaskEvent when a recurring task run throws an error due to timeout', async () => {
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 0, 0, 0));
+        const id = _.random(1, 20).toString();
+        const error = new Error('Task was cancelled');
+        const onTaskEvent = jest.fn();
+        let wasCancelled = false;
+        const { runner, instance } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+            schedule: { interval: '1s' },
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              timeout: `15s`,
+              createTaskRunner: () => ({
+                async run() {
+                  const promise = new Promise((r) => setTimeout(r, 20000));
+                  jest.advanceTimersByTime(20000);
+                  await promise;
+                  if (wasCancelled) {
+                    throw error;
+                  }
+                },
+                async cancel() {
+                  wasCancelled = true;
+                },
+              }),
+            },
+          },
+        });
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 10, 0, 0));
+        const promise = runner.run();
+        await Promise.resolve();
+        await runner.cancel();
+        await promise;
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asErr({
+                error,
+                task: instance,
+                persistence: TaskPersistence.Recurring,
+                result: TaskRunResult.RetryScheduled,
+                isExpired: true,
+              })
+            )
+          )
+        );
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          asTaskManagerStatEvent('runDelay', asOk(expect.any(Number)))
+        );
+        expect(onTaskEvent).toHaveBeenCalledTimes(2);
+      });
+
+      test('emits TaskEvent when an ad-hoc task run throws an error due to timeout', async () => {
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 0, 0, 0));
+        const id = _.random(1, 20).toString();
+        const error = new Error('Task was cancelled');
+        const onTaskEvent = jest.fn();
+        let wasCancelled = false;
+        const { runner, instance } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              timeout: `15s`,
+              createTaskRunner: () => ({
+                async run() {
+                  const promise = new Promise((r) => setTimeout(r, 20000));
+                  jest.advanceTimersByTime(20000);
+                  await promise;
+                  if (wasCancelled) {
+                    throw error;
+                  }
+                },
+                async cancel() {
+                  wasCancelled = true;
+                },
+              }),
+            },
+          },
+        });
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 10, 0, 0));
+        const promise = runner.run();
+        await Promise.resolve();
+        await runner.cancel();
+        await promise;
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asErr({
+                error,
+                task: instance,
+                persistence: TaskPersistence.NonRecurring,
+                result: TaskRunResult.Failed,
+                isExpired: true,
+              })
+            )
+          )
+        );
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          asTaskManagerStatEvent('runDelay', asOk(expect.any(Number)))
+        );
+        expect(onTaskEvent).toHaveBeenCalledTimes(2);
+      });
+
+      test('emits TaskEvent when a recurring task run times out without throwing error', async () => {
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 0, 0, 0));
+        const id = _.random(1, 20).toString();
+        const onTaskEvent = jest.fn();
+        const { runner, instance } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+            schedule: { interval: '1s' },
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              timeout: `15s`,
+              createTaskRunner: () => ({
+                async run() {
+                  const promise = new Promise((r) => setTimeout(r, 20000));
+                  jest.advanceTimersByTime(20000);
+                  await promise;
+                },
+              }),
+            },
+          },
+        });
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 10, 0, 0));
+        const promise = runner.run();
+        await Promise.resolve();
+        await runner.cancel();
+        await promise;
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asOk({
+                persistence: TaskPersistence.Recurring,
+                task: instance,
+                result: TaskRunResult.Success,
+                isExpired: true,
+              })
+            )
+          )
+        );
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          asTaskManagerStatEvent('runDelay', asOk(expect.any(Number)))
+        );
+        expect(onTaskEvent).toHaveBeenCalledTimes(2);
+      });
+
+      test('emits TaskEvent when an ad-hoc task run times out without throwing error', async () => {
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 0, 0, 0));
+        const id = _.random(1, 20).toString();
+        const onTaskEvent = jest.fn();
+        const { runner, instance } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              timeout: `15s`,
+              createTaskRunner: () => ({
+                async run() {
+                  const promise = new Promise((r) => setTimeout(r, 20000));
+                  jest.advanceTimersByTime(20000);
+                  await promise;
+                },
+              }),
+            },
+          },
+        });
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 10, 0, 0));
+        const promise = runner.run();
+        await Promise.resolve();
+        await runner.cancel();
+        await promise;
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asOk({
+                persistence: TaskPersistence.NonRecurring,
+                task: instance,
+                result: TaskRunResult.Success,
+                isExpired: true,
+              })
+            )
+          )
+        );
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          asTaskManagerStatEvent('runDelay', asOk(expect.any(Number)))
+        );
+        expect(onTaskEvent).toHaveBeenCalledTimes(2);
+      });
+
+      test('emits TaskEvent when a task run returns an error', async () => {
+        const id = _.random(1, 20).toString();
+        const error = new Error('Dangit!');
+        const onTaskEvent = jest.fn();
+        const { runner, instance } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+            schedule: { interval: '1m' },
+            startedAt: new Date(),
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  return { error, state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asErr({
+                error,
+                task: instance,
+                persistence: TaskPersistence.Recurring,
+                result: TaskRunResult.RetryScheduled,
+                isExpired: false,
+              })
+            )
+          )
+        );
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          asTaskManagerStatEvent('runDelay', asOk(expect.any(Number)))
+        );
+        expect(onTaskEvent).toHaveBeenCalledTimes(2);
+      });
+
+      test('emits TaskEvent when a task returns an error and is marked as failed', async () => {
+        const id = _.random(1, 20).toString();
+        const error = new Error('Dangit!');
+        const onTaskEvent = jest.fn();
+        const {
+          runner,
+          store,
+          instance: originalInstance,
+        } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+            startedAt: new Date(),
+            enabled: true,
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  try {
+                    throwUnrecoverableError(error);
+                  } catch (e) {
+                    return { error: e, state: {} };
+                  }
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        expect(store.remove).toHaveBeenCalled();
+        expect(store.partialUpdate).not.toHaveBeenCalled();
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asErr({
+                error,
+                task: originalInstance,
+                persistence: TaskPersistence.NonRecurring,
+                result: TaskRunResult.Failed,
+                isExpired: false,
+              })
+            )
+          )
+        );
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          asTaskManagerStatEvent('runDelay', asOk(expect.any(Number)))
+        );
+        expect(onTaskEvent).toHaveBeenCalledTimes(2);
+      });
+
+      test('emits TaskEvent when failing to update a recurring task', async () => {
+        const id = _.random(1, 20).toString();
+        const runAt = minutesFromNow(_.random(5));
+        const onTaskEvent = jest.fn();
+        const { runner, instance, store } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+            schedule: { interval: '1m' },
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  return { runAt, state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        const error = new Error('fail');
+
+        store.partialUpdate.mockImplementation(() => {
+          throw error;
+        });
+
+        await expect(runner.run()).rejects.toThrow('fail');
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asErr({
+                task: instance,
+                persistence: TaskPersistence.Recurring,
+                result: TaskRunResult.Failed,
+                isExpired: false,
+                error,
+              })
+            )
+          )
+        );
+      });
+
+      test('emits TaskEvent when failing to update a non-recurring task', async () => {
+        const id = _.random(1, 20).toString();
+        const runAt = minutesFromNow(_.random(5));
+        const onTaskEvent = jest.fn();
+        const { runner, instance, store } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  return { runAt, state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        const error = new Error('fail');
+
+        store.partialUpdate.mockImplementation(() => {
+          throw error;
+        });
+
+        await expect(runner.run()).rejects.toThrow('fail');
+
+        expect(onTaskEvent).toHaveBeenCalledWith(
+          withAnyTiming(
+            asTaskRunEvent(
+              id,
+              asErr({
+                task: instance,
+                persistence: TaskPersistence.NonRecurring,
+                result: TaskRunResult.Failed,
+                isExpired: false,
+                error,
+              })
+            )
+          )
+        );
+      });
+    });
+
+    describe('logTaskRunStartEvent', () => {
+      test('eventLog logs a start event when a task begins running', async () => {
+        const id = _.random(1, 20).toString();
+        const { runner, instance } = await readyToRunStageSetup({
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  return { state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledWith({
+          event: {
+            action: 'task-run-start',
+            // start must equal task.startedAt so it aligns with the stored task document
+            start: instance.startedAt?.toISOString(),
+          },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              schedule_delay: expect.any(String),
+              scheduled: expect.any(String),
+              execution: { uuid: TASK_EXECUTION_UUID },
+            },
+          },
+          message: `Task bar "${id}" started.`,
+        });
+      });
+
+      test('eventLog logs the start event before the end event', async () => {
+        const id = _.random(1, 20).toString();
+        const { runner } = await readyToRunStageSetup({
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  return { state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        const calls = (eventLoggerMock.logEvent as jest.Mock).mock.calls;
+        const startCallIndex = calls.findIndex((c) => c[0].event.action === 'task-run-start');
+        const endCallIndex = calls.findIndex((c) => c[0].event.action === 'task-run');
+        expect(startCallIndex).toBeGreaterThanOrEqual(0);
+        expect(endCallIndex).toBeGreaterThanOrEqual(0);
+        expect(startCallIndex).toBeLessThan(endCallIndex);
+      });
+
+      test('task-run-start and task-run events share the same execution.uuid', async () => {
+        const id = _.random(1, 20).toString();
+        const { runner } = await readyToRunStageSetup({
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  return { state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        const calls = (eventLoggerMock.logEvent as jest.Mock).mock.calls;
+        const startEvent = calls.find((c) => c[0].event.action === 'task-run-start');
+        const endEvent = calls.find((c) => c[0].event.action === 'task-run');
+        expect(startEvent).toBeDefined();
+        expect(endEvent).toBeDefined();
+        const startUuid = startEvent![0].kibana.task.execution.uuid;
+        const endUuid = endEvent![0].kibana.task.execution.uuid;
+        expect(startUuid).toEqual(expect.any(String));
+        expect(startUuid).toBe(endUuid);
+      });
+
+      test('eventLog logs a start event even when a task run fails', async () => {
+        const id = _.random(1, 20).toString();
+        const { runner } = await readyToRunStageSetup({
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  throw new Error('Dangit!');
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledWith(
+          expect.objectContaining({
+            event: expect.objectContaining({ action: 'task-run-start' }),
+          })
+        );
+      });
+    });
+
+    describe('setCustomTaskRunEventFields', () => {
+      const findLoggedEvent = (action: string) =>
+        (eventLoggerMock.logEvent as jest.Mock).mock.calls
+          .map((call) => call[0])
+          .find((event) => event.event.action === action);
+
+      test('adds custom fields onto the task-run event under kibana.task.data', async () => {
+        const id = _.random(1, 20).toString();
+        const { runner } = await readyToRunStageSetup({
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: (context) => ({
+                async run() {
+                  context.setCustomTaskRunEventFields({
+                    alert_event_count: 5,
+                    metrics: { a: 1 },
+                  });
+                  return { state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        const runEvent = findLoggedEvent('task-run');
+        expect(runEvent).toMatchObject({
+          event: { action: 'task-run', outcome: 'success' },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              execution: { uuid: TASK_EXECUTION_UUID },
+              data: { alert_event_count: 5, metrics: { a: 1 } },
+            },
+          },
+          message: `Task bar "${id}" completed successfully.`,
+        });
+      });
+
+      test('replaces existing fields when called', async () => {
+        const id = _.random(1, 20).toString();
+        const { runner } = await readyToRunStageSetup({
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: (context) => ({
+                async run() {
+                  context.setCustomTaskRunEventFields({ a: 1 });
+                  context.setCustomTaskRunEventFields({ b: 2 });
+                  return { state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        const runEvent = findLoggedEvent('task-run');
+        expect(runEvent).toMatchObject({
+          event: { action: 'task-run', outcome: 'success' },
+          kibana: { task: { data: { b: 2 } } },
+        });
+        expect(runEvent.kibana.task.data.a).toBeUndefined();
+      });
+
+      test('cannot override task manager owned fields since custom fields are namespaced', async () => {
+        const id = _.random(1, 20).toString();
+        const { runner } = await readyToRunStageSetup({
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: (context) => ({
+                async run() {
+                  context.setCustomTaskRunEventFields({
+                    id: 'hacked',
+                    type: 'hacked',
+                    execution: { uuid: 'hacked' },
+                  });
+                  return { state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        const runEvent = findLoggedEvent('task-run');
+        expect(runEvent.event.action).toBe('task-run');
+        expect(runEvent.event.outcome).toBe('success');
+        expect(runEvent.event.duration).toEqual(expect.any(String));
+        expect(runEvent.kibana.task).toEqual({
+          id,
+          type: 'bar',
+          schedule_delay: expect.any(String),
+          scheduled: expect.any(String),
+          execution: { uuid: TASK_EXECUTION_UUID },
+          data: { id: 'hacked', type: 'hacked', execution: { uuid: 'hacked' } },
+        });
+      });
+
+      test('adds custom fields onto the task-run event when the task throws', async () => {
+        const id = _.random(1, 20).toString();
+        const { runner } = await readyToRunStageSetup({
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: (context) => ({
+                async run() {
+                  context.setCustomTaskRunEventFields({ failed: true });
+                  throw new Error('Dangit!');
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        const runEvent = findLoggedEvent('task-run');
+        expect(runEvent).toMatchObject({
+          event: { action: 'task-run', outcome: 'failure' },
+          kibana: { task: { data: { failed: true } } },
+        });
+      });
+
+      test('adds custom fields onto the task-run event when a taskRunError is returned', async () => {
+        const id = _.random(1, 20).toString();
+        const { runner } = await readyToRunStageSetup({
+          instance: { id, schedule: { interval: '1m' } },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: (context) => ({
+                async run() {
+                  context.setCustomTaskRunEventFields({ degraded: true });
+                  return {
+                    state: {},
+                    taskRunError: createTaskRunError(new Error('test'), TaskErrorSource.FRAMEWORK),
+                  };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        const runEvent = findLoggedEvent('task-run');
+        expect(runEvent).toMatchObject({
+          event: { action: 'task-run', outcome: 'failure' },
+          kibana: { task: { data: { degraded: true } } },
+        });
+      });
+
+      test('drops custom fields when the serialized size exceeds 4 KB and logs a warning', async () => {
+        const id = _.random(1, 20).toString();
+        const bigValue = 'x'.repeat(5000);
+        const { runner, logger } = await readyToRunStageSetup({
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: (context) => ({
+                async run() {
+                  context.setCustomTaskRunEventFields({ big: bigValue });
+                  return { state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        const runEvent = findLoggedEvent('task-run');
+        expect(runEvent.event.action).toBe('task-run');
+        expect(runEvent.event.outcome).toBe('success');
+        expect(runEvent.kibana.task.data).toBeUndefined();
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'Dropping custom task run event fields for task bar because the serialized size'
+          )
+        );
+      });
+
+      test('keeps the previously set fields when a subsequent oversized payload is dropped', async () => {
+        const id = _.random(1, 20).toString();
+        const bigValue = 'x'.repeat(5000);
+        const { runner } = await readyToRunStageSetup({
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: (context) => ({
+                async run() {
+                  context.setCustomTaskRunEventFields({ ok: true });
+                  context.setCustomTaskRunEventFields({ big: bigValue });
+                  return { state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        const runEvent = findLoggedEvent('task-run');
+        expect(runEvent).toMatchObject({
+          event: { action: 'task-run', outcome: 'success' },
+          kibana: { task: { data: { ok: true } } },
+        });
+        expect(runEvent.kibana.task.data.big).toBeUndefined();
+      });
+
+      test('silently drops custom fields that cannot be serialized to JSON and logs a warning', async () => {
+        const id = _.random(1, 20).toString();
+        const circular: Record<string, unknown> = {};
+        circular.self = circular;
+        const { runner, logger } = await readyToRunStageSetup({
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: (context) => ({
+                async run() {
+                  context.setCustomTaskRunEventFields(circular);
+                  return { state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        const runEvent = findLoggedEvent('task-run');
+        expect(runEvent.event.action).toBe('task-run');
+        expect(runEvent.event.outcome).toBe('success');
+        expect(runEvent.kibana.task.data).toBeUndefined();
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'Dropping custom task run event fields for task bar because they could not be serialized to JSON'
+          )
+        );
+      });
+
+      test('adds custom fields set before cancellation onto the task-cancel event', async () => {
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 0, 0, 0));
+        const id = _.random(1, 20).toString();
+        const { runner } = await readyToRunStageSetup({
+          instance: { id, schedule: { interval: '1s' } },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              timeout: `15s`,
+              createTaskRunner: (context) => ({
+                async run() {
+                  context.setCustomTaskRunEventFields({ started: true });
+                  const promise = new Promise((r) => setTimeout(r, 20000));
+                  jest.advanceTimersByTime(20000);
+                  await promise;
+                },
+              }),
+            },
+          },
+        });
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 10, 0, 0));
+        const promise = runner.run();
+        await Promise.resolve();
+        await runner.cancel();
+        await promise;
+
+        const cancelEvent = findLoggedEvent('task-cancel');
+        expect(cancelEvent).toMatchObject({
+          event: { action: 'task-cancel' },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              execution: { uuid: TASK_EXECUTION_UUID },
+              data: { started: true },
+            },
+          },
+          message: `Task bar "${id}" has been cancelled.`,
+        });
+      });
+    });
+
+    describe('logTaskRunEvent', () => {
+      test('eventLog logs an event when a task is run successfully', async () => {
+        const id = _.random(1, 20).toString();
+        const onTaskEvent = jest.fn();
+        const { runner } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  return { state: {} };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledWith({
+          event: {
+            action: 'task-run',
+            duration: expect.any(String),
+            end: expect.stringMatching(dateRegExp),
+            outcome: 'success',
+            start: expect.stringMatching(dateRegExp),
+          },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              schedule_delay: expect.any(String),
+              scheduled: expect.any(String),
+              execution: { uuid: TASK_EXECUTION_UUID },
+            },
+          },
+          message: `Task bar "${id}" completed successfully.`,
+        });
+      });
+
+      test('eventLog logs a failure event when a recurring task returns a success result with taskRunError', async () => {
+        const id = _.random(1, 20).toString();
+        const runAt = minutesFromNow(_.random(5));
+        const onTaskEvent = jest.fn();
+        const { runner } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+            schedule: { interval: '1m' },
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  return {
+                    runAt,
+                    state: {},
+                    taskRunError: createTaskRunError(new Error('test'), TaskErrorSource.FRAMEWORK),
+                  };
+                },
+              }),
+            },
+          },
+        });
+
+        await runner.run();
+
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledWith({
+          error: expect.any(Object),
+          event: {
+            action: 'task-run',
+            duration: expect.any(String),
+            end: expect.stringMatching(dateRegExp),
+            outcome: 'failure',
+            start: expect.stringMatching(dateRegExp),
+          },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              schedule_delay: expect.any(String),
+              scheduled: expect.any(String),
+              execution: { uuid: TASK_EXECUTION_UUID },
+            },
+          },
+          message: `Task bar "${id}" failed with a taskRunError.`,
+        });
+      });
+
+      test('eventLog logs a failure event when a task run throws an error', async () => {
+        const id = _.random(1, 20).toString();
+        const error = new Error('Dangit!');
+        const onTaskEvent = jest.fn();
+        const { runner } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              createTaskRunner: () => ({
+                async run() {
+                  throw error;
+                },
+              }),
+            },
+          },
+        });
+        await runner.run();
+
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledWith({
+          error: expect.any(Object),
+          event: {
+            action: 'task-run',
+            duration: expect.any(String),
+            end: expect.stringMatching(dateRegExp),
+            outcome: 'failure',
+            start: expect.stringMatching(dateRegExp),
+          },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              schedule_delay: expect.any(String),
+              scheduled: expect.any(String),
+              execution: { uuid: TASK_EXECUTION_UUID },
+            },
+          },
+          message: `Task bar "${id}" failed.`,
+        });
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledTimes(2);
+      });
+
+      test('eventLog logs failure and cancel events when a recurring task run throws an error due to timeout', async () => {
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 0, 0, 0));
+        const id = _.random(1, 20).toString();
+        const error = new Error('Task was cancelled');
+        const onTaskEvent = jest.fn();
+        let wasCancelled = false;
+        const { runner } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+            schedule: { interval: '1s' },
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              timeout: `15s`,
+              createTaskRunner: () => ({
+                async run() {
+                  const promise = new Promise((r) => setTimeout(r, 20000));
+                  jest.advanceTimersByTime(20000);
+                  await promise;
+                  if (wasCancelled) {
+                    throw error;
+                  }
+                },
+                async cancel() {
+                  wasCancelled = true;
+                },
+              }),
+            },
+          },
+        });
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 10, 0, 0));
+        const promise = runner.run();
+        await Promise.resolve();
+        await runner.cancel();
+        await promise;
+
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledWith({
+          event: {
+            action: 'task-cancel',
+            duration: expect.any(String),
+            end: expect.stringMatching(dateRegExp),
+            start: expect.stringMatching(dateRegExp),
+          },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              scheduled: expect.any(String),
+              execution: { uuid: TASK_EXECUTION_UUID },
+            },
+          },
+          message: `Task bar "${id}" has been cancelled.`,
+        });
+
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledWith({
+          error: expect.any(Object),
+          event: {
+            action: 'task-run',
+            duration: expect.any(String),
+            end: expect.stringMatching(dateRegExp),
+            outcome: 'failure',
+            start: expect.stringMatching(dateRegExp),
+            reason: `Task "${id}" was cancelled.`,
+          },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              schedule_delay: expect.any(String),
+              scheduled: expect.any(String),
+              execution: { uuid: TASK_EXECUTION_UUID },
+            },
+          },
+          message: `Task bar "${id}" failed.`,
+        });
+
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledTimes(3);
+      });
+
+      test('eventLog logs failure and cancel events when an ad-hoc task run throws an error due to timeout', async () => {
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 0, 0, 0));
+        const id = _.random(1, 20).toString();
+        const error = new Error('Task was cancelled');
+        const onTaskEvent = jest.fn();
+        let wasCancelled = false;
+        const { runner } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              timeout: `15s`,
+              createTaskRunner: () => ({
+                async run() {
+                  const promise = new Promise((r) => setTimeout(r, 20000));
+                  jest.advanceTimersByTime(20000);
+                  await promise;
+                  if (wasCancelled) {
+                    throw error;
+                  }
+                },
+                async cancel() {
+                  wasCancelled = true;
+                },
+              }),
+            },
+          },
+        });
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 10, 0, 0));
+        const promise = runner.run();
+        await Promise.resolve();
+        await runner.cancel();
+        await promise;
+
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledWith({
+          event: {
+            action: 'task-cancel',
+            duration: expect.any(String),
+            end: expect.stringMatching(dateRegExp),
+            start: expect.stringMatching(dateRegExp),
+          },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              scheduled: expect.any(String),
+              execution: { uuid: TASK_EXECUTION_UUID },
+            },
+          },
+          message: `Task bar "${id}" has been cancelled.`,
+        });
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledWith({
+          error: expect.any(Object),
+          event: {
+            action: 'task-run',
+            duration: expect.any(String),
+            end: expect.stringMatching(dateRegExp),
+            outcome: 'failure',
+            start: expect.stringMatching(dateRegExp),
+            reason: `Task "${id}" was cancelled.`,
+          },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              schedule_delay: expect.any(String),
+              scheduled: expect.any(String),
+              execution: { uuid: TASK_EXECUTION_UUID },
+            },
+          },
+          message: `Task bar "${id}" failed.`,
+        });
+
+        expect(onTaskEvent).toHaveBeenCalledTimes(2);
+      });
+
+      test('emits TaskEvent when a recurring task run times out without throwing error', async () => {
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 0, 0, 0));
+        const id = _.random(1, 20).toString();
+        const onTaskEvent = jest.fn();
+        const { runner } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: {
+            id,
+            schedule: { interval: '1s' },
+          },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              timeout: `15s`,
+              createTaskRunner: () => ({
+                async run() {
+                  const promise = new Promise((r) => setTimeout(r, 20000));
+                  jest.advanceTimersByTime(20000);
+                  await promise;
+                },
+              }),
+            },
+          },
+        });
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 10, 0, 0));
+        const promise = runner.run();
+        await Promise.resolve();
+        await runner.cancel();
+        await promise;
+
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledWith({
+          event: {
+            action: 'task-cancel',
+            duration: expect.any(String),
+            end: expect.stringMatching(dateRegExp),
+            start: expect.stringMatching(dateRegExp),
+          },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              scheduled: expect.any(String),
+              execution: { uuid: TASK_EXECUTION_UUID },
+            },
+          },
+          message: `Task bar "${id}" has been cancelled.`,
+        });
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledWith({
+          event: {
+            action: 'task-run',
+            duration: expect.any(String),
+            end: expect.stringMatching(dateRegExp),
+            outcome: 'success',
+            start: expect.stringMatching(dateRegExp),
+          },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              schedule_delay: expect.any(String),
+              scheduled: expect.any(String),
+              execution: { uuid: TASK_EXECUTION_UUID },
+            },
+          },
+          message: `Task bar "${id}" completed successfully.`,
+        });
+
+        expect(onTaskEvent).toHaveBeenCalledTimes(2);
+      });
+
+      test('emits TaskEvent when an ad-hoc task run times out without throwing error', async () => {
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 0, 0, 0));
+        const id = _.random(1, 20).toString();
+        const onTaskEvent = jest.fn();
+        const { runner } = await readyToRunStageSetup({
+          onTaskEvent,
+          instance: { id },
+          definitions: {
+            bar: {
+              title: 'Bar!',
+              timeout: `15s`,
+              createTaskRunner: () => ({
+                async run() {
+                  const promise = new Promise((r) => setTimeout(r, 20000));
+                  jest.advanceTimersByTime(20000);
+                  await promise;
+                },
+              }),
+            },
+          },
+        });
+        jest.setSystemTime(new Date(2023, 1, 1, 0, 10, 0, 0));
+        const promise = runner.run();
+        await Promise.resolve();
+        await runner.cancel();
+        await promise;
+
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledWith({
+          event: {
+            action: 'task-cancel',
+            duration: expect.any(String),
+            end: expect.stringMatching(dateRegExp),
+            start: expect.stringMatching(dateRegExp),
+          },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              scheduled: expect.any(String),
+              execution: { uuid: TASK_EXECUTION_UUID },
+            },
+          },
+          message: `Task bar "${id}" has been cancelled.`,
+        });
+        expect(eventLoggerMock.logEvent).toHaveBeenCalledWith({
+          event: {
+            action: 'task-run',
+            duration: expect.any(String),
+            end: expect.stringMatching(dateRegExp),
+            outcome: 'success',
+            start: expect.stringMatching(dateRegExp),
+          },
+          kibana: {
+            task: {
+              id,
+              type: 'bar',
+              schedule_delay: expect.any(String),
+              scheduled: expect.any(String),
+              execution: { uuid: TASK_EXECUTION_UUID },
+            },
+          },
+          message: `Task bar "${id}" completed successfully.`,
+        });
+
+        expect(onTaskEvent).toHaveBeenCalledTimes(2);
+      });
+    });
+
+    test('does not update saved object if recurring task expires without throwing error and timeout is greater than schedule', async () => {
+      const id = _.random(1, 20).toString();
+      const onTaskEvent = jest.fn();
+      const { runner, store, usageCounter } = await readyToRunStageSetup({
+        onTaskEvent,
+        instance: {
+          id,
+          startedAt: moment().subtract(5, 'm').toDate(),
+          schedule: { interval: '1s' },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: '15s',
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 20000));
+                jest.advanceTimersByTime(20000);
+                await promise;
+              },
+            }),
+          },
+        },
+      });
+
+      const promise = runner.run();
+      await Promise.resolve();
+      await runner.cancel();
+      await promise;
+
+      expect(store.partialUpdate).not.toHaveBeenCalled();
+      expect(usageCounter.incrementCounter).toHaveBeenCalledWith({
+        counterName: 'taskManagerUpdateSkippedDueToTaskExpiration',
+        counterType: 'taskManagerTaskRunner',
+        incrementBy: 1,
+      });
+    });
+
+    test('does not update saved object if recurring task throws error due to expiration and timeout is greater than schedule', async () => {
+      const id = _.random(1, 20).toString();
+      const onTaskEvent = jest.fn();
+      let wasCancelled = false;
+      const { runner, store, usageCounter } = await readyToRunStageSetup({
+        onTaskEvent,
+        instance: {
+          id,
+          startedAt: moment().subtract(5, 'm').toDate(),
+          schedule: { interval: '1s' },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: '15s',
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 20000));
+                jest.advanceTimersByTime(20000);
+                await promise;
+                if (wasCancelled) {
+                  throw new Error('Task was cancelled');
+                }
+              },
+              async cancel() {
+                wasCancelled = true;
+              },
+            }),
+          },
+        },
+      });
+
+      const promise = runner.run();
+      await Promise.resolve();
+      await runner.cancel();
+      await promise;
+
+      expect(store.partialUpdate).not.toHaveBeenCalled();
+      expect(usageCounter.incrementCounter).toHaveBeenCalledWith({
+        counterName: 'taskManagerUpdateSkippedDueToTaskExpiration',
+        counterType: 'taskManagerTaskRunner',
+        incrementBy: 1,
+      });
+    });
+
+    test('updates saved object if recurring task expires without throwing error and schedule is greater than timeout', async () => {
+      const id = _.random(1, 20).toString();
+      const onTaskEvent = jest.fn();
+      const {
+        instance: taskInstance,
+        runner,
+        store,
+        usageCounter,
+      } = await readyToRunStageSetup({
+        onTaskEvent,
+        instance: {
+          id,
+          startedAt: moment().subtract(5, 'm').toDate(),
+          schedule: { interval: '30s' },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: '15s',
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 20000));
+                jest.advanceTimersByTime(20000);
+                await promise;
+              },
+            }),
+          },
+        },
+      });
+
+      const promise = runner.run();
+      await Promise.resolve();
+      await runner.cancel();
+      await promise;
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      expect(store.partialUpdate).toHaveBeenCalledWith(
+        {
+          id: expect.any(String),
+          ownerId: null,
+          retryAt: null,
+          runAt: expect.any(Date),
+          startedAt: null,
+          status: 'idle',
+          version: undefined,
+        },
+        {
+          validate: true,
+          doc: taskInstance,
+        }
+      );
+      expect(usageCounter.incrementCounter).toHaveBeenCalledWith({
+        counterName: 'taskManagerUpdateSkippedDueToTaskExpiration',
+        counterType: 'taskManagerTaskRunner',
+        incrementBy: 1,
+      });
+    });
+
+    test('updates saved object if recurring task throws error due to expiration and schedule is greater than timeout', async () => {
+      const id = _.random(1, 20).toString();
+      const onTaskEvent = jest.fn();
+      let wasCancelled = false;
+      const {
+        instance: taskInstance,
+        runner,
+        store,
+        usageCounter,
+      } = await readyToRunStageSetup({
+        onTaskEvent,
+        instance: {
+          id,
+          startedAt: moment().subtract(5, 'm').toDate(),
+          schedule: { interval: '30s' },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: '15s',
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 20000));
+                jest.advanceTimersByTime(20000);
+                await promise;
+                if (wasCancelled) {
+                  throw new Error('Task was cancelled');
+                }
+              },
+              async cancel() {
+                wasCancelled = true;
+              },
+            }),
+          },
+        },
+      });
+
+      const promise = runner.run();
+      await Promise.resolve();
+      await runner.cancel();
+      await promise;
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      expect(store.partialUpdate).toHaveBeenCalledWith(
+        {
+          id: expect.any(String),
+          ownerId: null,
+          retryAt: null,
+          runAt: expect.any(Date),
+          startedAt: null,
+          status: 'idle',
+          version: undefined,
+        },
+        {
+          validate: true,
+          doc: taskInstance,
+        }
+      );
+      expect(usageCounter.incrementCounter).toHaveBeenCalledWith({
+        counterName: 'taskManagerUpdateSkippedDueToTaskExpiration',
+        counterType: 'taskManagerTaskRunner',
+        incrementBy: 1,
+      });
+    });
+
+    test('updates saved object with a later runAt if rrule task expires and the gap between occurrences is greater than timeout', async () => {
+      const id = _.random(1, 20).toString();
+      const runAt = moment().subtract(1, 'h').startOf('hour').toDate();
+      const {
+        instance: taskInstance,
+        runner,
+        store,
+      } = await readyToRunStageSetup({
+        instance: {
+          id,
+          runAt,
+          startedAt: moment().subtract(5, 'm').toDate(),
+          schedule: { rrule: { freq: 4, interval: 1, tzid: 'UTC', byminute: [0] } },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: '15s',
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 20000));
+                jest.advanceTimersByTime(20000);
+                await promise;
+              },
+            }),
+          },
+        },
+      });
+
+      const promise = runner.run();
+      await Promise.resolve();
+      await runner.cancel();
+      await promise;
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      expect(store.partialUpdate).toHaveBeenCalledWith(
+        {
+          id: expect.any(String),
+          ownerId: null,
+          retryAt: null,
+          runAt: expect.any(Date),
+          startedAt: null,
+          status: 'idle',
+          version: undefined,
+        },
+        {
+          validate: true,
+          doc: taskInstance,
+        }
+      );
+      const [{ runAt: updatedRunAt }] = store.partialUpdate.mock.calls[0];
+      expect(updatedRunAt!.getTime()).toBeGreaterThan(runAt.getTime());
+    });
+
+    test('updates saved object if a nonuniform rrule task expires and the gap after its runAt is greater than timeout', async () => {
+      const id = _.random(1, 20).toString();
+      const { runner, store } = await readyToRunStageSetup({
+        instance: {
+          id,
+          runAt: moment().subtract(1, 'h').startOf('hour').add(5, 'm').toDate(),
+          startedAt: moment().subtract(5, 'm').toDate(),
+          schedule: { rrule: { freq: 4, interval: 1, tzid: 'UTC', byminute: [0, 5] } },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: '15m',
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 20 * 60 * 1000));
+                jest.advanceTimersByTime(20 * 60 * 1000);
+                await promise;
+              },
+            }),
+          },
+        },
+      });
+
+      const promise = runner.run();
+      await Promise.resolve();
+      await runner.cancel();
+      await promise;
+
+      expect(store.partialUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'idle', runAt: expect.any(Date) }),
+        expect.anything()
+      );
+    });
+
+    test('does not update saved object if rrule task expires and timeout is greater than the gap between occurrences', async () => {
+      const id = _.random(1, 20).toString();
+      const { runner, store } = await readyToRunStageSetup({
+        instance: {
+          id,
+          runAt: moment().subtract(1, 'h').startOf('hour').toDate(),
+          startedAt: moment().subtract(5, 'm').toDate(),
+          schedule: { rrule: { freq: 4, interval: 1, tzid: 'UTC', byminute: [0] } },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: '2h',
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 3 * 60 * 60 * 1000));
+                jest.advanceTimersByTime(3 * 60 * 60 * 1000);
+                await promise;
+              },
+            }),
+          },
+        },
+      });
+
+      const promise = runner.run();
+      await Promise.resolve();
+      await runner.cancel();
+      await promise;
+
+      // the long running task retryAt updates are expected, the expired task update is not
+      expect(store.partialUpdate).not.toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'idle' }),
+        expect.anything()
+      );
+    });
+
+    test('handles a version conflict gracefully when an expired recurring task is reclaimed while running and schedule is greater than timeout', async () => {
+      const id = _.random(1, 20).toString();
+      const onTaskEvent = jest.fn();
+      const { runner, store, logger, instance } = await readyToRunStageSetup({
+        onTaskEvent,
+        instance: {
+          id,
+          startedAt: moment().subtract(5, 'm').toDate(),
+          schedule: { interval: '30s' },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: '15s',
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 20000));
+                jest.advanceTimersByTime(20000);
+                await promise;
+              },
+            }),
+          },
+        },
+      });
+
+      // another Kibana reclaimed and updated the task
+      store.partialUpdate.mockRejectedValueOnce({
+        type: 'task',
+        id,
+        status: 409,
+        error: {
+          type: 'version_conflict_engine_exception',
+          reason: `[task:${id}]: version conflict, required seqNo [1], primary term [1]. current document has seqNo [64000] and primary term [1]`,
+        },
+      });
+      store.get.mockResolvedValue({ ...instance, ownerId: 'another-kibana-node' });
+
+      const promise = runner.run();
+      await Promise.resolve();
+      await runner.cancel();
+      await promise;
+
+      expect(store.partialUpdate).toHaveBeenCalledTimes(1);
+      expect(store.get).toHaveBeenCalledWith(id);
+
+      const frameworkErrorLogs = logger.error.mock.calls.filter(([, meta]) =>
+        ((meta as { tags?: string[] })?.tags ?? []).includes('task-run-failed')
+      );
+      expect(frameworkErrorLogs).toEqual([]);
+
+      expect(logger.error).toHaveBeenCalledWith(
+        `Skipping resolving task document version conflict after task run: Unable to resolve task document conflicts for task "bar:${id}": task has been claimed by another worker`,
+        { tags: [id, 'bar', 'task-doc-resolve-conflict'] }
+      );
+    });
+
+    test('resolves a version conflict on an expired recurring task when the schedule was updated while running and the task was not reclaimed', async () => {
+      const id = 'expired-schedule-updated';
+      const runAt = moment().subtract(5, 'm').toDate();
+      const { runner, store, logger, instance } = await readyToRunStageSetup({
+        instance: {
+          id,
+          runAt,
+          startedAt: moment().subtract(5, 'm').toDate(),
+          schedule: { interval: '1h' },
+          ownerId: 'kibana-node-1',
+          version: 'WzEsMV0=',
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            timeout: '15s',
+            createTaskRunner: () => ({
+              async run() {
+                const promise = new Promise((r) => setTimeout(r, 20000));
+                jest.advanceTimersByTime(20000);
+                await promise;
+                return { state: {} };
+              },
+            }),
+          },
+        },
+      });
+
+      // bulkUpdateSchedules with includeRunningTasks bumped the version but did not reclaim the task
+      const currentTask = {
+        ...instance,
+        version: 'WzIsMV0=',
+        schedule: { interval: '3h' },
+      };
+      store.partialUpdate
+        .mockRejectedValueOnce(
+          SavedObjectsErrorHelpers.decorateConflictError(new Error('Saved object conflict'))
+        )
+        .mockResolvedValueOnce(currentTask);
+      store.get.mockResolvedValue(currentTask);
+
+      await runner.run();
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        `Resolved task document version conflict after task run for task "bar:${id}"`,
+        { tags: [id, 'bar', 'task-doc-resolve-conflict'] }
+      );
+      expect(store.partialUpdate).toHaveBeenCalledTimes(2);
+      expect(store.partialUpdate).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          version: 'WzIsMV0=',
+          status: TaskStatus.Idle,
+          schedule: { interval: '3h' },
+          runAt: new Date(runAt.getTime() + 3 * 60 * 60 * 1000),
+        }),
+        { validate: false, doc: currentTask }
+      );
+    });
+
+    test('resolves a version conflict when updating a recurring task after a successful run', async () => {
+      const id = 'conflict-success';
+      const startedAt = new Date();
+      const { runner, store, logger, instance } = await readyToRunStageSetup({
+        instance: {
+          id,
+          schedule: { interval: '1m' },
+          startedAt,
+          ownerId: 'kibana-node-1',
+          version: 'WzEsMV0=',
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { state: { foo: 'bar' } };
+              },
+            }),
+          },
+        },
+      });
+
+      const currentTask = {
+        ...instance,
+        version: 'WzIsMV0=',
+        schedule: { interval: '5m' },
+        runAt: minutesFromNow(5),
+      };
+
+      store.partialUpdate
+        .mockRejectedValueOnce(
+          SavedObjectsErrorHelpers.decorateConflictError(new Error('Saved object conflict'))
+        )
+        .mockResolvedValueOnce(currentTask);
+      store.get.mockResolvedValue(currentTask);
+
+      await runner.run();
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        `Resolving task document version conflict after task run for task "bar:${id}"`,
+        {
+          tags: [id, 'bar', 'task-doc-resolve-conflict'],
+        }
+      );
+      expect(logger.warn).toHaveBeenCalledWith(
+        `Resolved task document version conflict after task run for task "bar:${id}"`,
+        {
+          tags: [id, 'bar', 'task-doc-resolve-conflict'],
+        }
+      );
+      expect(store.get).toHaveBeenCalledWith(id);
+      expect(store.partialUpdate).toHaveBeenCalledTimes(2);
+      expect(store.partialUpdate).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          version: 'WzIsMV0=',
+          schedule: { interval: '5m' },
+          runAt: currentTask.runAt,
+          state: { foo: 'bar' },
+        }),
+        { validate: false, doc: currentTask }
+      );
+    });
+
+    test('recomputes runAt from the updated schedule when resolving a version conflict caused by a schedule-only change', async () => {
+      const id = 'conflict-schedule-only';
+      const runAt = new Date();
+      const { runner, store, instance } = await readyToRunStageSetup({
+        instance: {
+          id,
+          schedule: { interval: '1h' },
+          runAt,
+          startedAt: new Date(),
+          ownerId: 'kibana-node-1',
+          version: 'WzEsMV0=',
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { state: {} };
+              },
+            }),
+          },
+        },
+      });
+
+      // bulkUpdateSchedules with includeRunningTasks changed only the schedule, runAt is untouched
+      const currentTask = {
+        ...instance,
+        version: 'WzIsMV0=',
+        schedule: { interval: '3h' },
+      };
+
+      store.partialUpdate
+        .mockRejectedValueOnce(
+          SavedObjectsErrorHelpers.decorateConflictError(new Error('Saved object conflict'))
+        )
+        .mockResolvedValueOnce(currentTask);
+      store.get.mockResolvedValue(currentTask);
+
+      await runner.run();
+
+      // the runner's runAt was derived from the stale 1h schedule
+      expect(store.partialUpdate).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ runAt: new Date(runAt.getTime() + 60 * 60 * 1000) }),
+        expect.anything()
+      );
+      expect(store.partialUpdate).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          version: 'WzIsMV0=',
+          schedule: { interval: '3h' },
+          runAt: new Date(runAt.getTime() + 3 * 60 * 60 * 1000),
+        }),
+        { validate: false, doc: currentTask }
+      );
+    });
+
+    test('resolves a version_conflict_engine_exception when updating a recurring task', async () => {
+      const id = 'conflict-engine';
+      const startedAt = new Date();
+      const { runner, store, logger, instance } = await readyToRunStageSetup({
+        instance: {
+          id,
+          schedule: { interval: '1m' },
+          startedAt,
+          ownerId: 'kibana-node-1',
+          version: 'WzEsMV0=',
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { state: {} };
+              },
+            }),
+          },
+        },
+      });
+
+      const currentTask = {
+        ...instance,
+        version: 'WzMsMV0=',
+      };
+
+      store.partialUpdate
+        .mockRejectedValueOnce({
+          type: 'task',
+          id,
+          status: 409,
+          error: {
+            type: 'version_conflict_engine_exception',
+            reason: `[task:${id}]: version conflict`,
+          },
+        })
+        .mockResolvedValueOnce(currentTask);
+      store.get.mockResolvedValue(currentTask);
+
+      await runner.run();
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        `Resolving task document version conflict after task run for task "bar:${id}"`,
+        {
+          tags: [id, 'bar', 'task-doc-resolve-conflict'],
+        }
+      );
+      expect(logger.warn).toHaveBeenCalledWith(
+        `Resolved task document version conflict after task run for task "bar:${id}"`,
+        {
+          tags: [id, 'bar', 'task-doc-resolve-conflict'],
+        }
+      );
+      expect(store.get).toHaveBeenCalledWith(id);
+      expect(store.partialUpdate).toHaveBeenCalledTimes(2);
+    });
+
+    test('Prints debug logs on task start/end', async () => {
+      const { runner, logger } = await readyToRunStageSetup({
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { state: {} };
+              },
+            }),
+          },
+        },
+      });
+      await runner.run();
+
+      expect(logger.debug).toHaveBeenCalledTimes(2);
+      expect(logger.debug).toHaveBeenNthCalledWith(1, 'Running task bar "foo"', {
+        tags: ['task:start', 'foo', 'bar'],
+      });
+      expect(logger.debug).toHaveBeenNthCalledWith(2, 'Task bar "foo" ended', {
+        tags: ['task:end', 'foo', 'bar'],
+      });
+    });
+
+    test('Prints debug logs on task start/end even if it throws error', async () => {
+      const { runner, logger } = await readyToRunStageSetup({
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                throw new Error();
+              },
+            }),
+          },
+        },
+      });
+      await runner.run();
+
+      expect(logger.debug).toHaveBeenCalledTimes(3);
+      expect(logger.debug).toHaveBeenNthCalledWith(1, 'Running task bar "foo"', {
+        tags: ['task:start', 'foo', 'bar'],
+      });
+      expect(logger.debug).toHaveBeenNthCalledWith(3, 'Task bar "foo" ended', {
+        tags: ['task:end', 'foo', 'bar'],
+      });
+    });
+
+    test('Disables task if shouldDisableTask: true is returned', async () => {
+      const { runner, store, logger } = await readyToRunStageSetup({
+        instance: {
+          schedule: {
+            interval: `1m`,
+          },
+        },
+        definitions: {
+          bar: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return {
+                  state: {},
+                  shouldDisableTask: true,
+                };
+              },
+            }),
+          },
+        },
+      });
+      await runner.run();
+      expect(store.partialUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          enabled: false,
+          id: 'foo',
+          status: 'idle',
+        }),
+        expect.anything()
+      );
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Disabling task bar:foo as it indicated it should disable itself',
+        { tags: ['bar'] }
+      );
+    });
+  });
+
+  describe('isAdHocTaskAndOutOfAttempts', () => {
+    it(`should return false if the task doesn't have a schedule`, async () => {
+      const { runner } = await pendingStageSetup({
+        instance: {
+          id: 'foo',
+          taskType: 'testbar',
+        },
+      });
+
+      expect(runner.isAdHocTaskAndOutOfAttempts).toEqual(false);
+    });
+
+    it(`should return false if the recurring task still has attempts remaining`, async () => {
+      const { runner } = await pendingStageSetup({
+        instance: {
+          id: 'foo',
+          taskType: 'testbar',
+          attempts: 4,
+        },
+      });
+
+      expect(runner.isAdHocTaskAndOutOfAttempts).toEqual(false);
+    });
+
+    it(`should return true if the recurring task is out of attempts`, async () => {
+      const { runner } = await pendingStageSetup({
+        instance: {
+          id: 'foo',
+          taskType: 'testbar',
+          attempts: 5,
+        },
+      });
+
+      expect(runner.isAdHocTaskAndOutOfAttempts).toEqual(true);
+    });
+
+    it(`should return true if attempts = max attempts and in claiming status`, async () => {
+      const { runner } = await pendingStageSetup({
+        instance: {
+          id: 'foo',
+          taskType: 'testbar',
+          attempts: 5,
+          status: TaskStatus.Claiming,
+        },
+      });
+
+      expect(runner.isAdHocTaskAndOutOfAttempts).toEqual(true);
+    });
+
+    it(`should return false if attempts = max attempts and in running status`, async () => {
+      const { runner } = await pendingStageSetup({
+        instance: {
+          id: 'foo',
+          taskType: 'testbar',
+          attempts: 5,
+          status: TaskStatus.Running,
+        },
+      });
+
+      expect(runner.isAdHocTaskAndOutOfAttempts).toEqual(false);
+    });
+  });
+
+  describe('removeTask()', () => {
+    it(`should remove the task saved-object`, async () => {
+      const { runner, store } = await readyToRunStageSetup({
+        instance: {
+          id: 'foo',
+          taskType: 'testbar',
+        },
+      });
+
+      await runner.run();
+      await runner.removeTask();
+      expect(store.remove).toHaveBeenCalledWith('foo');
+    });
+
+    it(`should call the task cleanup function if defined`, async () => {
+      const cleanupFn = jest.fn();
+      const { runner } = await readyToRunStageSetup({
+        instance: {
+          id: 'foo',
+          taskType: 'testbar2',
+        },
+        definitions: {
+          testbar2: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { state: {} };
+              },
+              cancel: jest.fn(),
+              cleanup: cleanupFn,
+            }),
+          },
+        },
+      });
+
+      // Remove task is called after run() with the this.task object defined
+      await runner.run();
+      expect(cleanupFn).toHaveBeenCalledTimes(1);
+    });
+
+    it(`doesn't throw an error if the cleanup function throws an error`, async () => {
+      const cleanupFn = jest.fn().mockRejectedValue(new Error('Fail'));
+      const { runner, logger } = await readyToRunStageSetup({
+        instance: {
+          id: 'foo',
+          taskType: 'testbar2',
+        },
+        definitions: {
+          testbar2: {
+            title: 'Bar!',
+            createTaskRunner: () => ({
+              async run() {
+                return { state: {} };
+              },
+              cancel: jest.fn(),
+              cleanup: cleanupFn,
+            }),
+          },
+        },
+      });
+
+      // Remove task is called after run() with the this.task object defined
+      await runner.run();
+      expect(cleanupFn).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledWith(
+        `Error encountered when running onTaskRemoved() hook for testbar2 "foo": Fail`
+      );
+    });
+  });
+
+  interface TestOpts {
+    instance?: Partial<ConcreteTaskInstance>;
+    definitions?: TaskDefinitionRegistry;
+    onTaskEvent?: jest.Mock<(event: TaskEvent<unknown, unknown>) => void>;
+    allowReadingInvalidState?: boolean;
+    enrichFakeRequest?: jest.Mock;
+  }
+
+  function withAnyTiming(taskRun: TaskRun) {
+    return {
+      ...taskRun,
+      timing: {
+        start: expect.any(Number),
+        stop: expect.any(Number),
+        eventLoopBlockMs: expect.any(Number),
+      },
+    };
+  }
+
+  function mockInstance(instance: Partial<ConcreteTaskInstance> = {}) {
+    return Object.assign(
+      {
+        id: 'foo',
+        taskType: 'bar',
+        sequenceNumber: 32,
+        primaryTerm: 32,
+        runAt: new Date(),
+        scheduledAt: new Date(),
+        startedAt: new Date(),
+        retryAt: null,
+        attempts: 0,
+        params: {},
+        scope: ['reporting'],
+        state: {},
+        status: 'idle',
+        user: 'example',
+        ownerId: null,
+        traceparent: 'apmTraceparent',
+      },
+      instance
+    );
+  }
+
+  async function testOpts(stage: TaskRunningStage, opts: TestOpts) {
+    const logger = mockLogger();
+
+    const instance = mockInstance(opts.instance);
+
+    const store = bufferedTaskStoreMock.create();
+    const usageCounter = usageCountersServiceMock.createSetupContract().createUsageCounter('test');
+
+    store.update.mockResolvedValue(instance);
+    store.partialUpdate.mockResolvedValue(instance);
+
+    const definitions = new TaskTypeDictionary(logger);
+    definitions.registerTaskDefinitions({
+      testbar: {
+        title: 'Bar!',
+        createTaskRunner: jest.fn(),
+      },
+    });
+    if (opts.definitions) {
+      definitions.registerTaskDefinitions(opts.definitions);
+    }
+
+    const runner = new TaskManagerRunner({
+      defaultMaxAttempts: 5,
+      beforeRun: (context) => Promise.resolve(context),
+      logger,
+      store,
+      instance,
+      definitions,
+      onTaskEvent: opts.onTaskEvent,
+      executionContext,
+      usageCounter,
+      config: configMock.create({
+        event_loop_delay: {
+          monitor: true,
+          warn_threshold: 5000,
+        },
+      }),
+      allowReadingInvalidState: opts.allowReadingInvalidState || false,
+      getPollInterval: () => 500,
+      apiKeyStrategy: new EsApiKeyStrategy(),
+      eventLogger: eventLoggerMock,
+      enrichFakeRequest: opts.enrichFakeRequest,
+    });
+
+    if (stage === TaskRunningStage.READY_TO_RUN) {
+      await runner.markTaskAsRunning();
+      // as we're testing the ReadyToRun stage specifically, clear mocks cakked by setup
+      store.update.mockClear();
+      if (opts.onTaskEvent) {
+        opts.onTaskEvent.mockClear();
+      }
+    }
+
+    return {
+      runner,
+      logger,
+      store,
+      instance,
+      usageCounter,
+    };
+  }
+});

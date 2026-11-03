@@ -1,0 +1,222 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+export interface BootstrapTemplateData {
+  colorMode: string;
+  themeTagName: string;
+  jsDependencyPaths: string[];
+  publicPathMap: string;
+  useHMR?: boolean;
+}
+
+export const renderTemplate = ({
+  themeTagName,
+  colorMode,
+  jsDependencyPaths,
+  publicPathMap,
+  useHMR = false,
+}: BootstrapTemplateData) => {
+  const kbnThemeTagTemplate =
+    colorMode === 'system'
+      ? `window.__kbnThemeTag__ = window.matchMedia('(prefers-color-scheme: dark)').matches ? '${themeTagName}dark' : '${themeTagName}light';`
+      : `window.__kbnThemeTag__ = '${themeTagName}${colorMode}';`;
+
+  // React Fast Refresh requires __REACT_DEVTOOLS_GLOBAL_HOOK__ to exist
+  // BEFORE React-DOM loads so that the renderer calls hook.inject().
+  // Without this stub, react-refresh/runtime (loaded later in kibana.bundle.js)
+  // cannot capture the renderer and performReactRefresh() becomes a no-op.
+  const reactDevtoolsHookStub = useHMR
+    ? [
+        '',
+        "    if (typeof __REACT_DEVTOOLS_GLOBAL_HOOK__ === 'undefined') {",
+        '      var __hmrNextId = 0;',
+        '      __REACT_DEVTOOLS_GLOBAL_HOOK__ = {',
+        '        renderers: new Map(),',
+        '        supportsFiber: true,',
+        '        inject: function(internals) {',
+        '          var id = __hmrNextId++;',
+        '          __REACT_DEVTOOLS_GLOBAL_HOOK__.renderers.set(id, internals);',
+        '          return id;',
+        '        },',
+        '        onScheduleFiberRoot: function() {},',
+        '        onCommitFiberRoot: function() {},',
+        '        onCommitFiberUnmount: function() {},',
+        '      };',
+        '    }',
+        '',
+      ].join('\n')
+    : '';
+
+  return `
+function kbnBundlesLoader() {
+  var modules = {};
+
+  function has(prop) {
+    return Object.prototype.hasOwnProperty.call(modules, prop);
+  }
+
+  function define(key, bundleRequire, bundleModuleKey) {
+    if (has(key)) {
+      throw new Error('__kbnBundles__ already has a module defined for "' + key + '"');
+    }
+
+    modules[key] = {
+      bundleRequire,
+      bundleModuleKey,
+    };
+  }
+
+  function get(key) {
+    if (!has(key)) {
+      throw new Error('__kbnBundles__ does not have a module defined for "' + key + '"');
+    }
+
+    return modules[key].bundleRequire(modules[key].bundleModuleKey);
+  }
+
+  return { has: has, define: define, get: get };
+}
+
+var kbnCsp = JSON.parse(document.querySelector('kbn-csp').getAttribute('data'));
+var kbnHardenPrototypes = JSON.parse(document.querySelector('kbn-prototype-hardening').getAttribute('data'));
+window.__kbnHardenPrototypes__ = kbnHardenPrototypes.hardenPrototypes;
+window.__kbnStrictCsp__ = kbnCsp.strictCsp;
+${kbnThemeTagTemplate}
+window.__kbnPublicPath__ = ${publicPathMap};
+${useHMR ? 'window.__kbnHmrActive__ = true;' : ''}
+window.__kbnBundles__ = kbnBundlesLoader();
+
+if (window.__kbnStrictCsp__ && window.__kbnCspNotEnforced__) {
+  var legacyBrowserError = document.getElementById('kbn_legacy_browser_error');
+  legacyBrowserError.style.display = 'flex';
+} else {
+  if (!window.__kbnCspNotEnforced__ && window.console) {
+    window.console.log("^ A single error about an inline script not firing due to content security policy is expected!");
+  }
+  var loadingMessage = document.getElementById('kbn_loading_message');
+  loadingMessage.style.display = 'flex';
+
+  // The IIFE executes immediately -- safe because this script is at the bottom
+  // of <body> (DOM parsed) and <head> CSS is parser-blocking (loaded). Unlike
+  // window.onload, this avoids blocking on font/favicon downloads before
+  // starting bundle loads.
+  (function () {
+    function failure(event) {
+      var failedTarget = event && event.target ? event.target : {};
+      if (window.console) {
+        window.console.error('Kibana bootstrap failed: could not load ' + (failedTarget.src || failedTarget.href || 'a required asset'));
+      }
+
+      // make subsequent calls to failure() noop
+      failure = function () {};
+
+      var errorTitle =  document.querySelector('[data-error-message-title]').dataset.errorMessageTitle;
+      var errorText =  document.querySelector('[data-error-message-text]').dataset.errorMessageText;
+      var errorReload =  document.querySelector('[data-error-message-reload]').dataset.errorMessageReload;
+
+      var err = document.createElement('div');
+      err.style.textAlign = 'center';
+      err.style.padding = 'min(240px, 20vh) 20px';
+      err.style.fontFamily = 'Inter, BlinkMacSystemFont, Helvetica, Arial, sans-serif';
+      err.style.maxInlineSize = '420px';
+      err.style.margin = '0 auto';
+
+      var errorTitleEl = document.createElement('h1');
+      errorTitleEl.className = 'kbnBootstrapErrorTitle';
+      errorTitleEl.innerText = errorTitle;
+      errorTitleEl.style.fontSize = '24px';
+      errorTitleEl.style.fontWeight = '600';
+      errorTitleEl.style.lineHeight = '2rem';
+      errorTitleEl.style.letterSpacing = '-0.2px';
+      errorTitleEl.style.margin = '0 0 8px';
+
+      var errorTextEl = document.createElement('p');
+      errorTextEl.className = 'kbnBootstrapErrorText';
+      errorTextEl.innerText = errorText;
+      errorTextEl.style.fontSize = '14px';
+      errorTextEl.style.fontWeight = '400';
+      errorTextEl.style.lineHeight = '1.5';
+      errorTextEl.style.margin = '0 auto 24px';
+
+      var errorReloadEl = document.createElement('button');
+      errorReloadEl.className = 'kbnBootstrapErrorButton';
+      errorReloadEl.innerText = errorReload;
+      errorReloadEl.onclick = function () {
+        location.reload();
+      };
+      errorReloadEl.setAttribute('style',
+       'cursor: pointer; padding-inline: 12px; block-size: 40px; font-size: 14px; font-weight: 450; line-height: 40px; border-radius: 8px; border:none'
+      );
+
+      err.appendChild(errorTitleEl);
+      err.appendChild(errorTextEl);
+      err.appendChild(errorReloadEl);
+
+      document.body.innerHTML = '';
+      document.body.appendChild(err);
+    }
+
+    var stylesheetTarget = document.querySelector('head meta[name="add-styles-here"]')
+    function loadStyleSheet(url, cb) {
+      var dom = document.createElement('link');
+      dom.rel = 'stylesheet';
+      dom.type = 'text/css';
+      dom.href = url;
+      dom.addEventListener('error', failure);
+      dom.addEventListener('load', cb);
+      document.head.insertBefore(dom, stylesheetTarget);
+    }
+
+    var scriptsTarget = document.querySelector('head meta[name="add-scripts-here"]')
+    function loadScript(url, cb) {
+      var dom = document.createElement('script');
+      dom.async = false;
+      dom.src = url;
+      dom.addEventListener('error', failure);
+      dom.addEventListener('load', cb);
+      document.head.insertBefore(dom, scriptsTarget);
+    }
+
+    function load(urls, cb) {
+      var pending = urls.length;
+      urls.forEach(function (url) {
+        var innerCb = function () {
+          pending = pending - 1;
+          if (pending === 0 && typeof cb === 'function') {
+            cb();
+          }
+        }
+
+        if (typeof url !== 'string') {
+          load(url, innerCb);
+        } else if (url.slice(-4) === '.css') {
+          loadStyleSheet(url, innerCb);
+        } else {
+          loadScript(url, innerCb);
+        }
+      });
+    }
+${reactDevtoolsHookStub}
+    performance.mark('kbnLoad', {
+      detail: 'load_started',
+    })
+
+    load([
+      ${jsDependencyPaths.map((path) => `'${path}'`).join(',')}
+    ], async function () {
+      // RSPack progressive loading: wait for async plugin chunks to load
+      if (window.__kbnPluginsLoaded) {
+        await window.__kbnPluginsLoaded;
+      }
+      __kbnBundles__.get('entry/core/public').__kbnBootstrap__();
+    });
+  })();
+}
+  `;
+};

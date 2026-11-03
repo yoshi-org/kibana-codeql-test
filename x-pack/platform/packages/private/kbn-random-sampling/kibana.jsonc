@@ -1,0 +1,9 @@
+{
+  "type": "shared-browser",
+  "id": "@kbn/random-sampling",
+  "owner": [
+    "@elastic/kibana-dashboards"
+  ],
+  "group": "platform",
+  "visibility": "private"
+}

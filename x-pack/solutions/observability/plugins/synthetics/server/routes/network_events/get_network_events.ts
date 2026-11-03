@@ -1,0 +1,36 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import { z } from '@kbn/zod';
+import { queryNumber, routeId } from '../zod_query';
+import { getNetworkEvents } from '../../queries/get_network_events';
+import type { SyntheticsRestApiRouteFactory } from '../types';
+import { SYNTHETICS_API_URLS } from '../../../common/constants';
+
+export const createNetworkEventsRoute: SyntheticsRestApiRouteFactory = () => ({
+  method: 'GET',
+  path: SYNTHETICS_API_URLS.NETWORK_EVENTS,
+  validate: {
+    query: z.strictObject({
+      checkGroup: routeId,
+      stepIndex: queryNumber,
+      remoteName: z.string().max(256).optional(),
+      timestamp: z.string().max(30).optional(),
+    }),
+  },
+  handler: async ({ syntheticsEsClient, request }): Promise<any> => {
+    const { checkGroup, stepIndex, remoteName, timestamp } = request.query;
+
+    return await getNetworkEvents({
+      syntheticsEsClient,
+      checkGroup,
+      stepIndex: String(stepIndex),
+      remoteName,
+      timestamp,
+    });
+  },
+});

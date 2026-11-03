@@ -1,0 +1,296 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import { isObject, transform, snakeCase, isEmpty } from 'lodash';
+import type { ZodType } from '@kbn/zod/v4';
+import { stringifyZodError } from '@kbn/zod-helpers';
+
+import type { ToastInputFields } from '@kbn/core/public';
+import { builderMap as customFieldsBuilder } from '../components/custom_fields/builder';
+import {
+  CaseSchema,
+  CasesSchema,
+  ConfigurationSchema,
+  ConfigurationsSchema,
+  UserActionsSchema,
+} from '../../common/types/domain';
+import { isAlertAttachmentType, isAttackAttachmentType } from '../../common/utils/attachments';
+import type {
+  CasePatchRequest,
+  CaseResolveResponse,
+  CasesPatchResponse,
+  CaseUserActionStatsResponse,
+  FindCasesContainingAllAlertsResponse,
+  SingleCaseMetricsResponse,
+} from '../../common/types/api';
+import {
+  CaseResolveResponseSchema,
+  PatchCasesResponseSchema,
+  CaseUserActionStatsResponseSchema,
+  FindCasesContainingAllAlertsResponseSchema,
+  SingleCaseMetricsResponseSchema,
+} from '../../common/types/api';
+import type {
+  Case,
+  Cases,
+  Configuration,
+  Configurations,
+  User,
+  UserActions,
+} from '../../common/types/domain';
+import { NO_ASSIGNEES_FILTERING_KEYWORD } from '../../common/constants';
+import type { CaseUI, ExtendedFieldFilter, FilterOptions, UpdateByKey } from './types';
+import * as i18n from './translations';
+import type { CustomFieldFactoryFilterOption } from '../components/custom_fields/types';
+
+export const getTypedPayload = <T>(a: unknown): T => a as T;
+
+export const covertToSnakeCase = (obj: Record<string, unknown>) =>
+  transform(obj, (acc: Record<string, unknown>, value, key, target) => {
+    const camelKey = Array.isArray(target) ? key : snakeCase(key);
+    acc[camelKey] = isObject(value) ? covertToSnakeCase(value as Record<string, unknown>) : value;
+  });
+
+export const createToasterPlainError = (message: string) => new ToasterError([message]);
+
+export const decodeWithToasterError = <T>(schema: ZodType<unknown>, value: T): NonNullable<T> => {
+  const result = schema.safeParse(value);
+  if (result.success) return result.data as NonNullable<T>;
+  throw new ToasterError([stringifyZodError(result.error)]);
+};
+
+export const decodeCaseResponse = (respCase?: Case) => decodeWithToasterError(CaseSchema, respCase);
+
+export const decodeCaseResolveResponse = (respCase?: CaseResolveResponse) =>
+  decodeWithToasterError(CaseResolveResponseSchema, respCase);
+
+export const decodeSingleCaseMetricsResponse = (respCase?: SingleCaseMetricsResponse) =>
+  decodeWithToasterError(SingleCaseMetricsResponseSchema, respCase);
+
+export const decodeCasesResponse = (respCase?: Cases) =>
+  decodeWithToasterError(CasesSchema, respCase);
+
+export const decodeCasesWithUpdateSummaryResponse = (response?: CasesPatchResponse) =>
+  decodeWithToasterError(PatchCasesResponseSchema, response);
+
+export const decodeCaseConfigurationsResponse = (respCase?: Configurations) =>
+  decodeWithToasterError(ConfigurationsSchema, respCase);
+
+export const decodeCaseConfigureResponse = (respCase?: Configuration) =>
+  decodeWithToasterError(ConfigurationSchema, respCase);
+
+export const decodeCaseUserActionsResponse = (respUserActions?: UserActions) =>
+  decodeWithToasterError(UserActionsSchema, respUserActions);
+
+export const decodeCaseUserActionStatsResponse = (
+  caseUserActionsStats: CaseUserActionStatsResponse
+) => decodeWithToasterError(CaseUserActionStatsResponseSchema, caseUserActionsStats);
+
+export const decodeFindAllAttachedAlertsResponse = (
+  respCase?: FindCasesContainingAllAlertsResponse
+) => decodeWithToasterError(FindCasesContainingAllAlertsResponseSchema, respCase);
+
+export const valueToUpdateIsSettings = (
+  key: UpdateByKey['updateKey'],
+  value: UpdateByKey['updateValue']
+): value is CasePatchRequest['settings'] => key === 'settings';
+
+export const valueToUpdateIsStatus = (
+  key: UpdateByKey['updateKey'],
+  value: UpdateByKey['updateValue']
+): value is CasePatchRequest['status'] => key === 'status';
+
+export class ToasterError extends Error {
+  public readonly messages: string[];
+
+  constructor(messages: string[]) {
+    super(messages[0]);
+    this.name = 'ToasterError';
+    this.messages = messages;
+  }
+}
+export const createUpdateSuccessToaster = (
+  caseBeforeUpdate: CaseUI,
+  caseAfterUpdate: CaseUI,
+  key: UpdateByKey['updateKey'],
+  value: UpdateByKey['updateValue']
+): ToastInputFields => {
+  // Attacks sync with the case status too, so turning the toggle on is worth confirming even
+  // when the case has no alerts attached.
+  const caseHasAlerts = caseBeforeUpdate.comments.some(
+    (comment) => isAlertAttachmentType(comment.type) || isAttackAttachmentType(comment.type)
+  );
+
+  const toast: ToastInputFields = {
+    title: i18n.UPDATED_CASE(caseAfterUpdate.title),
+    className: 'eui-textBreakWord',
+  };
+
+  if (
+    valueToUpdateIsSettings(key, value) &&
+    value?.syncAlerts &&
+    caseHasAlerts &&
+    caseBeforeUpdate.settings.syncAlerts !== value?.syncAlerts
+  ) {
+    return {
+      ...toast,
+      title: i18n.SYNC_CASE(caseAfterUpdate.title),
+    };
+  }
+
+  if (
+    valueToUpdateIsSettings(key, value) &&
+    caseBeforeUpdate.settings.extractObservables !== value?.extractObservables
+  ) {
+    return {
+      ...toast,
+      title: i18n.EXTRACT_OBSERVABLES(caseAfterUpdate.title),
+    };
+  }
+
+  if (valueToUpdateIsStatus(key, value) && caseHasAlerts && caseBeforeUpdate.settings.syncAlerts) {
+    return {
+      ...toast,
+      text: i18n.STATUS_CHANGED_TOASTER_TEXT,
+    };
+  }
+
+  return toast;
+};
+
+export const constructAssigneesFilter = (
+  assignees: FilterOptions['assignees']
+): { assignees?: string | string[] } =>
+  assignees.length > 0
+    ? {
+        assignees: assignees?.map((assignee) =>
+          assignee === null ? NO_ASSIGNEES_FILTERING_KEYWORD : assignee
+        ) ?? [NO_ASSIGNEES_FILTERING_KEYWORD],
+      }
+    : {};
+
+export const constructReportersFilter = (reporters: User[]) => {
+  return reporters.length > 0
+    ? {
+        reporters: reporters
+          .map((reporter) => {
+            if (reporter.profile_uid != null) {
+              return reporter.profile_uid;
+            }
+
+            return reporter.username ?? '';
+          })
+          .filter((reporterID) => !isEmpty(reporterID)),
+      }
+    : {};
+};
+
+export const constructCustomFieldsFilter = (
+  optionKeysByCustomFieldKey: FilterOptions['customFields']
+) => {
+  if (!optionKeysByCustomFieldKey || Object.keys(optionKeysByCustomFieldKey).length === 0) {
+    return {};
+  }
+
+  const valuesByCustomFieldKey: {
+    [key in string]: Array<CustomFieldFactoryFilterOption['value']>;
+  } = {};
+
+  for (const [customFieldKey, customField] of Object.entries(optionKeysByCustomFieldKey)) {
+    const { type, options: selectedOptions } = customField;
+    if (customFieldsBuilder[type]) {
+      const { filterOptions: customFieldFilterOptionsConfig = [] } = customFieldsBuilder[type]();
+      const values = selectedOptions
+        .map((selectedOption) => {
+          const filterOptionConfig = customFieldFilterOptionsConfig.find(
+            (filterOption) => filterOption.key === selectedOption
+          );
+          return filterOptionConfig ? filterOptionConfig.value : undefined;
+        })
+        .filter((option) => option !== undefined) as Array<CustomFieldFactoryFilterOption['value']>;
+
+      if (values.length > 0) {
+        valuesByCustomFieldKey[customFieldKey] = values;
+      }
+    }
+  }
+
+  return Object.keys(valuesByCustomFieldKey).length
+    ? {
+        customFields: valuesByCustomFieldKey,
+      }
+    : {};
+};
+
+export interface ParsedExtendedFieldSearch {
+  extendedFieldFilters: ExtendedFieldFilter[];
+  freeText: string;
+}
+
+/**
+ * Parses a search string to extract field:value pairs for extended field filtering.
+ *
+ * Label syntax:
+ * - Single-word label:  `priority:high`
+ * - Multi-word label:   `"Effort Level":high`  (quoted label)
+ *
+ * Value syntax:
+ * - Unquoted value:     `priority:high`
+ * - Quoted value:       `notes:"value:with:colons"` (colons inside quotes are not separators)
+ *
+ * Multiple pairs: `priority:high region:emea` -> AND semantics
+ * Mixed with free text: `priority:high some text` -> filter + free text "some text"
+ */
+export const parseExtendedFieldSearch = (search: string): ParsedExtendedFieldSearch => {
+  const extendedFieldFilters: ExtendedFieldFilter[] = [];
+  // Matches:
+  //   "quoted label":value
+  //   "quoted label":"quoted value"
+  //   unquoted_label:value
+  //   unquoted_label:"quoted value"
+  const FIELD_VALUE_REGEX = /(?:"([^"]+)"|(\w+)):\s*(?:"([^"]*)"|([\S]+))/g;
+
+  const freeText = search
+    .replace(
+      FIELD_VALUE_REGEX,
+      (
+        _match,
+        quotedLabel?: string,
+        rawLabel?: string,
+        quotedValue?: string,
+        rawValue?: string
+      ) => {
+        const label = quotedLabel ?? rawLabel ?? '';
+        const value = quotedValue ?? rawValue ?? '';
+        extendedFieldFilters.push({ label, value });
+        return '';
+      }
+    )
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return { extendedFieldFilters, freeText };
+};
+
+export const getIncrementalIdSearchOverrides = (search: string) => {
+  const incrementalIdRegEx = /^#(\d{1,50})\s*$/;
+  // overrides for incremental_id search
+  let overrides: Partial<FilterOptions> = {};
+  let trimmedSearch = search?.trim();
+  const isIncrementalIdSearch = incrementalIdRegEx.test(trimmedSearch ?? '');
+  if (trimmedSearch && isIncrementalIdSearch) {
+    // extract the number portion of the inc id search: #123 -> 123
+    trimmedSearch = incrementalIdRegEx.exec(trimmedSearch)?.[1] ?? trimmedSearch;
+    // search only in `incremental_id` since types with `title`
+    // and `description` don't overlap
+    overrides = {
+      searchFields: ['cases.incremental_id.text'],
+      search: trimmedSearch,
+    };
+  }
+  return overrides;
+};

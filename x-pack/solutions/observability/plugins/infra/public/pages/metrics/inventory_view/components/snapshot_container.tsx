@@ -1,0 +1,61 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import React, { useEffect, useMemo } from 'react';
+import { findInventoryModel } from '@kbn/metrics-data-access-plugin/common';
+import { useAlertPrefillContext } from '../../../../alerting/use_alert_prefill';
+import { useSourceContext } from '../../../../containers/metrics_source';
+import { useSnapshot } from '../hooks/use_snaphot';
+import { useWaffleFiltersContext } from '../hooks/use_waffle_filters';
+import { useWaffleOptionsContext } from '../hooks/use_waffle_options';
+import { useWaffleTimeContext } from '../hooks/use_waffle_time';
+import { snapshotMetricForInventoryRequest } from '../lib/snapshot_metric_for_catalog';
+import { LayoutView } from './layout_view';
+import { getInventoryRequestSchema } from '../lib/get_inventory_request_schema';
+
+export const SnapshotContainer = React.memo(function SnapshotContainer() {
+  const { sourceId } = useSourceContext();
+  const { metric, groupBy, nodeType, accountId, region, preferredSchema } =
+    useWaffleOptionsContext();
+  const { currentTime } = useWaffleTimeContext();
+  const { filterQuery } = useWaffleFiltersContext();
+  const requestSchema = getInventoryRequestSchema(preferredSchema);
+  const inventoryModel = findInventoryModel(nodeType);
+  const requestMetric = useMemo(
+    () =>
+      snapshotMetricForInventoryRequest(nodeType, metric, inventoryModel.metrics.defaultSnapshot),
+    [inventoryModel.metrics.defaultSnapshot, metric, nodeType]
+  );
+
+  const { inventoryPrefill } = useAlertPrefillContext();
+
+  useEffect(() => {
+    return () => inventoryPrefill.reset();
+  }, [inventoryPrefill]);
+
+  const {
+    loading,
+    nodes,
+    interval = '60s',
+  } = useSnapshot(
+    {
+      kuery: filterQuery.query,
+      metrics: [requestMetric],
+      groupBy,
+      nodeType,
+      sourceId,
+      currentTime,
+      accountId,
+      region,
+      schema: requestSchema,
+      includeTimeseries: true,
+    },
+    { sendRequestImmediately: true }
+  );
+
+  return <LayoutView loading={loading} nodes={nodes} interval={interval} />;
+});

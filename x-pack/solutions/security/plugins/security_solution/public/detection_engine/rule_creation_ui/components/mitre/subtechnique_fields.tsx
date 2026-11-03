@@ -1,0 +1,290 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import {
+  EuiButtonIcon,
+  EuiFlexGroup,
+  EuiFlexItem,
+  EuiFormRow,
+  EuiSpacer,
+  EuiSuperSelect,
+  EuiToolTip,
+} from '@elastic/eui';
+import React, { useCallback, useMemo } from 'react';
+import styled from 'styled-components';
+
+import type { Threats, ThreatSubtechnique } from '@kbn/securitysolution-io-ts-alerting-types';
+import type { MitreSubtechniqueSummary } from '@kbn/security-mitre-attack-common';
+import { getMitreEntityDisplayName } from '@kbn/security-mitre-attack-common';
+import * as Rulei18n from '../../../common/translations';
+import type { FieldHook } from '../../../../shared_imports';
+import { MyAddItemButton } from '../add_item_form';
+import * as i18n from './translations';
+import { createUnsupportedMitreOption } from './unsupported_mitre_option';
+import { useIsExperimentalFeatureEnabled } from '../../../../common/hooks/use_experimental_features';
+
+const SubtechniqueContainer = styled.div`
+  margin-left: 48px;
+`;
+
+interface AddSubtechniqueProps {
+  field: FieldHook;
+  threatIndex: number;
+  techniqueIndex: number;
+  idAria: string;
+  isDisabled: boolean;
+  onFieldChange: (threats: Threats) => void;
+  subtechniques: MitreSubtechniqueSummary[];
+  labelPrefix: string;
+}
+
+export const MitreAttackSubtechniqueFields: React.FC<AddSubtechniqueProps> = ({
+  field,
+  idAria,
+  isDisabled,
+  threatIndex,
+  techniqueIndex,
+  onFieldChange,
+  subtechniques,
+  labelPrefix,
+}): JSX.Element => {
+  const isMitreAttackUpdatesUIEnabled = useIsExperimentalFeatureEnabled(
+    'mitreAttackUpdatesUIEnabled'
+  );
+
+  const values = field.value as Threats;
+
+  const technique = useMemo(() => {
+    return [...(values[threatIndex].technique ?? [])];
+  }, [values, threatIndex]);
+
+  const removeSubtechnique = useCallback(
+    (index: number) => {
+      const threats = [...(field.value as Threats)];
+      const subtechniqueList = technique[techniqueIndex].subtechnique ?? [];
+      subtechniqueList.splice(index, 1);
+
+      technique[techniqueIndex] = {
+        ...technique[techniqueIndex],
+        subtechnique: subtechniqueList,
+      };
+      threats[threatIndex].technique = technique;
+      onFieldChange(threats);
+    },
+    [field, onFieldChange, techniqueIndex, technique, threatIndex]
+  );
+
+  const addMitreAttackSubtechnique = useCallback(() => {
+    const threats = [...(field.value as Threats)];
+
+    const subtechniqueList = technique[techniqueIndex].subtechnique;
+
+    if (subtechniqueList != null) {
+      technique[techniqueIndex] = {
+        ...technique[techniqueIndex],
+        subtechnique: [...subtechniqueList, { id: 'none', name: 'none', reference: 'none' }],
+      };
+    } else {
+      technique[techniqueIndex] = {
+        ...technique[techniqueIndex],
+        subtechnique: [{ id: 'none', name: 'none', reference: 'none' }],
+      };
+    }
+    threats[threatIndex].technique = technique;
+    onFieldChange(threats);
+  }, [field, onFieldChange, techniqueIndex, technique, threatIndex]);
+
+  const updateSubtechnique = useCallback(
+    (index: number, optionId: string) => {
+      const threats = [...(field.value as Threats)];
+      const { id, reference, name } = subtechniques.find((t) => t.id === optionId) ?? {
+        id: '',
+        name: '',
+        reference: '',
+      };
+      const subtechniqueList = technique[techniqueIndex].subtechnique ?? [];
+      onFieldChange([
+        ...threats.slice(0, threatIndex),
+        {
+          ...threats[threatIndex],
+          technique: [
+            ...technique.slice(0, techniqueIndex),
+            {
+              ...technique[techniqueIndex],
+              subtechnique: [
+                ...subtechniqueList.slice(0, index),
+                {
+                  id,
+                  reference,
+                  name,
+                },
+                ...subtechniqueList.slice(index + 1),
+              ],
+            },
+            ...technique.slice(techniqueIndex + 1),
+          ],
+        },
+        ...threats.slice(threatIndex + 1),
+      ]);
+    },
+    [field.value, subtechniques, technique, techniqueIndex, onFieldChange, threatIndex]
+  );
+
+  const findCurrentSubtechniqueOption = useCallback(
+    (subtechnique: ThreatSubtechnique) =>
+      subtechnique.name === 'none' || subtechniques.length === 0
+        ? undefined
+        : subtechniques.find((s) => s.id === subtechnique.id),
+    [subtechniques]
+  );
+
+  const isUnsupportedSubtechnique = useCallback(
+    (subtechnique: ThreatSubtechnique) =>
+      isMitreAttackUpdatesUIEnabled &&
+      subtechniques.length > 0 &&
+      subtechnique.name !== 'none' &&
+      findCurrentSubtechniqueOption(subtechnique) === undefined,
+    [findCurrentSubtechniqueOption, isMitreAttackUpdatesUIEnabled, subtechniques]
+  );
+
+  const getSubtechniqueRenamedFromName = useCallback(
+    (subtechnique: ThreatSubtechnique) => {
+      if (!isMitreAttackUpdatesUIEnabled) {
+        return undefined;
+      }
+      const matchedOption = findCurrentSubtechniqueOption(subtechnique);
+      return matchedOption && matchedOption.name !== subtechnique.name
+        ? subtechnique.name
+        : undefined;
+    },
+    [findCurrentSubtechniqueOption, isMitreAttackUpdatesUIEnabled]
+  );
+
+  const parentTechniqueId = technique[techniqueIndex]?.id;
+  // Filter subtechniques belonging to the parent technique. The managed source returns
+  // entities name-ordered, so the filtered subset is already in the correct display order.
+  const baseSubtechniqueOptions = useMemo(
+    () =>
+      subtechniques
+        .filter((t) => t.technique_id === parentTechniqueId)
+        .map((option) => ({
+          inputDisplay: <>{getMitreEntityDisplayName(option)}</>,
+          value: option.id,
+          disabled: isDisabled,
+        })),
+    [subtechniques, parentTechniqueId, isDisabled]
+  );
+
+  const getSelectSubtechnique = useCallback(
+    (index: number, disabled: boolean, subtechnique: ThreatSubtechnique) => {
+      const isUnsupported = isUnsupportedSubtechnique(subtechnique);
+
+      return (
+        <>
+          <EuiSuperSelect
+            id={`mitreAttackSubtechnique-${threatIndex}-${techniqueIndex}-${index}`}
+            options={[
+              ...(subtechnique.name === 'none'
+                ? [
+                    {
+                      inputDisplay: <>{i18n.SUBTECHNIQUE_PLACEHOLDER}</>,
+                      value: 'none',
+                      disabled,
+                    },
+                  ]
+                : []),
+              ...(isUnsupported
+                ? [
+                    createUnsupportedMitreOption({
+                      id: subtechnique.id,
+                      name: subtechnique.name,
+                    }),
+                  ]
+                : []),
+              ...baseSubtechniqueOptions,
+            ]}
+            prepend={`${labelPrefix} ${i18n.SUBTECHNIQUE}`}
+            aria-label=""
+            onChange={updateSubtechnique.bind(null, index)}
+            fullWidth={true}
+            valueOfSelected={subtechnique.id}
+            data-test-subj="mitreAttackSubtechnique"
+            disabled={disabled}
+            placeholder={i18n.SUBTECHNIQUE_PLACEHOLDER}
+            isInvalid={isUnsupported}
+          />
+        </>
+      );
+    },
+    [
+      baseSubtechniqueOptions,
+      isUnsupportedSubtechnique,
+      labelPrefix,
+      updateSubtechnique,
+      techniqueIndex,
+      threatIndex,
+    ]
+  );
+
+  const subtechniqueList = useMemo(() => {
+    return technique[techniqueIndex].subtechnique;
+  }, [technique, techniqueIndex]);
+
+  return (
+    <SubtechniqueContainer>
+      {subtechniqueList != null &&
+        subtechniqueList.map((subtechnique, index) => {
+          const subtechniqueUnsupported = isUnsupportedSubtechnique(subtechnique);
+          const subtechniqueRenamedFrom = getSubtechniqueRenamedFromName(subtechnique);
+          return (
+            <div key={index}>
+              <EuiSpacer size="s" />
+              <EuiFormRow
+                fullWidth
+                describedByIds={idAria ? [`${idAria} ${i18n.SUBTECHNIQUE}`] : undefined}
+                isInvalid={subtechniqueUnsupported}
+                error={
+                  subtechniqueUnsupported
+                    ? i18n.UNSUPPORTED_MITRE_ID_ERROR(subtechnique.id, labelPrefix)
+                    : undefined
+                }
+                helpText={
+                  subtechniqueRenamedFrom
+                    ? i18n.RENAMED_FROM_HINT(subtechniqueRenamedFrom, labelPrefix)
+                    : undefined
+                }
+              >
+                <EuiFlexGroup gutterSize="s" alignItems="center">
+                  <EuiFlexItem grow>
+                    {getSelectSubtechnique(index, isDisabled, subtechnique)}
+                  </EuiFlexItem>
+                  <EuiFlexItem grow={false}>
+                    <EuiToolTip content={Rulei18n.DELETE} disableScreenReaderOutput>
+                      <EuiButtonIcon
+                        color="danger"
+                        iconType="trash"
+                        isDisabled={isDisabled}
+                        onClick={() => removeSubtechnique(index)}
+                        aria-label={Rulei18n.DELETE}
+                      />
+                    </EuiToolTip>
+                  </EuiFlexItem>
+                </EuiFlexGroup>
+              </EuiFormRow>
+            </div>
+          );
+        })}
+      <MyAddItemButton
+        data-test-subj="addMitreAttackSubtechnique"
+        onClick={addMitreAttackSubtechnique}
+        isDisabled={isDisabled}
+      >
+        {i18n.ADD_MITRE_SUBTECHNIQUE}
+      </MyAddItemButton>
+    </SubtechniqueContainer>
+  );
+};

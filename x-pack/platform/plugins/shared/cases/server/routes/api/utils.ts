@@ -1,0 +1,126 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import type { Boom } from '@hapi/boom';
+import { badRequest as boomBadRequest, boomify, isBoom } from '@hapi/boom';
+import { schema } from '@kbn/config-schema';
+import type {
+  CustomHttpResponseOptions,
+  ResponseError,
+  Logger,
+  RouteValidationFunction,
+} from '@kbn/core/server';
+import type { ZodType } from '@kbn/zod/v4';
+import type { CaseError, HTTPError } from '../../common/error';
+import { isCaseError, isHTTPError } from '../../common/error';
+import { getTypedApiErrorAttributes } from '../../common/api_errors';
+import { decodeWithExcessOrThrowZod } from '../../common/runtime_types';
+import type { AttachmentRequestV2 } from '../../../common/types/api';
+import { CASE_FILES_URL, FILE_ATTACHMENT_TYPE } from '../../../common/constants';
+import {
+  isCommentRequestTypeExternalReference,
+  isCommentRequestTypePersistableState,
+} from '../../../common/utils/attachments';
+
+/**
+ * Transforms an error into the correct format for a kibana response.
+ */
+
+export function wrapError(
+  error: CaseError | Boom | HTTPError | Error
+): CustomHttpResponseOptions<ResponseError> {
+  let boom: Boom;
+
+  if (isCaseError(error)) {
+    boom = error.boomify();
+  } else {
+    const options = { statusCode: isHTTPError(error) ? error.statusCode : 500 };
+    boom = isBoom(error) ? error : boomify(error, options);
+  }
+
+  // Kibana's response adapter only serializes `payload.attributes` — a Boom's
+  // `data` is silently dropped. Lift typed attributes (created via
+  // createTypedApiError) into a ResponseError object so machine-readable codes
+  // like `field_identity_immutable` reach API clients.
+  const attributes = getTypedApiErrorAttributes(boom);
+
+  return {
+    body: attributes ? { message: boom.message, attributes } : boom,
+    headers: boom.output.headers as { [key: string]: string },
+    statusCode: boom.output.statusCode,
+  };
+}
+
+export const escapeHatch = schema.object({}, { unknowns: 'allow' });
+
+/** Same zod decode as the client, run as Core `validate.body` / `validate.query`. */
+export const createZodRouteValidation =
+  <A>(schemaType: ZodType<A>): RouteValidationFunction<A> =>
+  (inputValue, { ok, badRequest }) => {
+    try {
+      return ok(decodeWithExcessOrThrowZod(schemaType)(inputValue));
+    } catch (error) {
+      return badRequest(isBoom(error) || error instanceof Error ? error.message : error);
+    }
+  };
+
+/**
+ * Creates a warning header with a message formatted according to RFC7234.
+ * We follow the same formatting as Elasticsearch
+ * https://github.com/elastic/elasticsearch/blob/5baabff6670a8ed49297488ca8cac8ec12a2078d/server/src/main/java/org/elasticsearch/common/logging/HeaderWarning.java#L55
+ */
+export const getWarningHeader = (
+  kibanaVersion: string,
+  msg: string | undefined = 'Deprecated endpoint'
+): { warning: string } => ({
+  warning: `299 Kibana-${kibanaVersion} "${msg}"`,
+});
+
+export const logDeprecatedEndpoint = (logger: Logger, isKibanaRequest: Boolean, msg: string) => {
+  if (!isKibanaRequest) {
+    logger.warn(msg);
+  }
+};
+
+/**
+ * Extracts the warning value a warning header that is formatted according to RFC 7234.
+ * For example for the string 299 Kibana-8.1.0 "Deprecation endpoint", the return value is Deprecation endpoint.
+ *
+ */
+export const extractWarningValueFromWarningHeader = (warningHeader: string) => {
+  const firstQuote = warningHeader.indexOf('"');
+  const lastQuote = warningHeader.length - 1;
+  const warningValue = warningHeader.substring(firstQuote + 1, lastQuote);
+  return warningValue;
+};
+
+/**
+ * Returns the attachment type as sent by the caller. Legacy external reference and persistable
+ * state attachments include their subtype id, for example `persistableState:.lens`.
+ */
+export const getAttachmentRequestType = (attachment: AttachmentRequestV2): string => {
+  if (isCommentRequestTypeExternalReference(attachment)) {
+    return `${attachment.type}:${attachment.externalReferenceAttachmentTypeId}`;
+  }
+
+  if (isCommentRequestTypePersistableState(attachment)) {
+    return `${attachment.type}:${attachment.persistableStateAttachmentTypeId}`;
+  }
+
+  return attachment.type;
+};
+
+/**
+ * Throws a 400 for file attachments, which must be uploaded through the case files route.
+ */
+export const throwIfFileAttachment = ({ type }: { type: string }): void => {
+  if (type === FILE_ATTACHMENT_TYPE) {
+    throw boomBadRequest(
+      `This API doesn't support file attachments. To attach a file, use POST ${CASE_FILES_URL}.`
+    );
+  }
+};

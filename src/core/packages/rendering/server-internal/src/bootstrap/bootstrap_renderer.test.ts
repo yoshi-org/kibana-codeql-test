@@ -1,0 +1,552 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+import {
+  renderTemplateMock,
+  getPluginsBundlePathsMock,
+  getRspackDependencyPathsMock,
+} from './bootstrap_renderer.test.mocks';
+
+import Fs from 'fs';
+import Path from 'path';
+import { fromRoot } from '@kbn/repo-info';
+import { BehaviorSubject } from 'rxjs';
+import type { PackageInfo } from '@kbn/config';
+import type { AuthStatus } from '@kbn/core-http-server';
+import type { UiPlugins } from '@kbn/core-plugins-base-server-internal';
+import { httpServiceMock, httpServerMock } from '@kbn/core-http-server-mocks';
+import { uiSettingsServiceMock } from '@kbn/core-ui-settings-server-mocks';
+import type { BootstrapRenderer } from './bootstrap_renderer';
+import { bootstrapRendererFactory } from './bootstrap_renderer';
+import { userSettingsServiceMock } from '@kbn/core-user-settings-server-mocks';
+import type { ThemeName } from '@kbn/core-ui-settings-common';
+import { DEFAULT_THEME_NAME } from '@kbn/core-ui-settings-common';
+
+const createPackageInfo = (parts: Partial<PackageInfo> = {}): PackageInfo => ({
+  branch: 'master',
+  buildNum: 42,
+  buildSha: 'buildSha',
+  buildShaShort: 'buildShaShort',
+  buildDate: new Date('2023-05-15T23:12:09.000Z'),
+  dist: false,
+  version: '8.0.0',
+  buildFlavor: 'traditional',
+  ...parts,
+});
+
+const getClientGetMockImplementation =
+  ({ darkMode, name }: { darkMode?: boolean | string; name?: string } = {}) =>
+  (key: string) => {
+    if (key === 'theme:darkMode') {
+      return Promise.resolve(darkMode ?? false);
+    }
+
+    return Promise.resolve();
+  };
+
+const createUiPlugins = (): UiPlugins => ({
+  public: new Map(),
+  internal: new Map(),
+  browserConfigs: new Map(),
+});
+
+describe('bootstrapRenderer', () => {
+  let auth: ReturnType<typeof httpServiceMock.createAuth>;
+  let uiSettingsClient: ReturnType<typeof uiSettingsServiceMock.createClient>;
+  let renderer: BootstrapRenderer;
+  let uiPlugins: UiPlugins;
+  let packageInfo: PackageInfo;
+  let userSettingsService: ReturnType<typeof userSettingsServiceMock.createSetupContract>;
+  let themeName$: BehaviorSubject<ThemeName>;
+
+  beforeEach(() => {
+    themeName$ = new BehaviorSubject<ThemeName>(DEFAULT_THEME_NAME);
+    auth = httpServiceMock.createAuth();
+    uiSettingsClient = uiSettingsServiceMock.createClient();
+    uiPlugins = createUiPlugins();
+    packageInfo = createPackageInfo();
+    userSettingsService = userSettingsServiceMock.createSetupContract();
+
+    getPluginsBundlePathsMock.mockReturnValue(new Map());
+    renderTemplateMock.mockReturnValue('__rendered__');
+    getRspackDependencyPathsMock.mockReturnValue([]);
+    uiSettingsClient.get.mockImplementation(getClientGetMockImplementation());
+
+    renderer = bootstrapRendererFactory({
+      auth,
+      packageInfo,
+      uiPlugins,
+      baseHref: `/base-path/${packageInfo.buildShaShort}`, // the base href as provided by static assets module
+      themeName$,
+    });
+  });
+
+  afterEach(() => {
+    getPluginsBundlePathsMock.mockReset();
+    renderTemplateMock.mockReset();
+    getRspackDependencyPathsMock.mockReset();
+    themeName$.complete();
+  });
+
+  describe('when the auth status is `authenticated`', () => {
+    beforeEach(() => {
+      auth.get.mockReturnValue({
+        status: 'authenticated' as AuthStatus,
+        state: {},
+      });
+    });
+
+    it('calls uiSettingsClient.get with the correct parameters', async () => {
+      const request = httpServerMock.createKibanaRequest();
+
+      await renderer({
+        request,
+        uiSettingsClient,
+      });
+
+      expect(uiSettingsClient.get).toHaveBeenCalledTimes(1);
+      expect(uiSettingsClient.get).toHaveBeenCalledWith('theme:darkMode');
+    });
+
+    it('calls renderTemplate with the values from the UiSettingsClient (true/dark) when the UserSettingsService is not provided', async () => {
+      uiSettingsClient.get.mockImplementation(
+        getClientGetMockImplementation({
+          darkMode: true,
+        })
+      );
+      const request = httpServerMock.createKibanaRequest();
+
+      await renderer({
+        request,
+        uiSettingsClient,
+      });
+
+      expect(renderTemplateMock).toHaveBeenCalledTimes(1);
+      expect(renderTemplateMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          themeTagName: 'borealis',
+          colorMode: 'dark',
+        })
+      );
+    });
+
+    it('calls renderTemplate with the values from the UiSettingsClient (false/light) when the UserSettingsService is not provided', async () => {
+      uiSettingsClient.get.mockImplementation(getClientGetMockImplementation({}));
+
+      const request = httpServerMock.createKibanaRequest();
+
+      await renderer({
+        request,
+        uiSettingsClient,
+      });
+
+      expect(renderTemplateMock).toHaveBeenCalledTimes(1);
+      expect(renderTemplateMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          themeTagName: 'borealis',
+          colorMode: 'light',
+        })
+      );
+    });
+
+    it('calls renderTemplate with values (true/dark) from the UserSettingsService when provided', async () => {
+      userSettingsService.getUserSettingDarkMode.mockResolvedValueOnce(true);
+
+      renderer = bootstrapRendererFactory({
+        auth,
+        packageInfo,
+        uiPlugins,
+        baseHref: '/base-path',
+        userSettingsService,
+        themeName$,
+      });
+
+      uiSettingsClient.get.mockResolvedValue(false);
+      const request = httpServerMock.createKibanaRequest();
+
+      await renderer({
+        request,
+        uiSettingsClient,
+      });
+
+      expect(renderTemplateMock).toHaveBeenCalledTimes(1);
+      expect(renderTemplateMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          themeTagName: 'borealis',
+          colorMode: 'dark',
+        })
+      );
+    });
+
+    it('calls renderTemplate with values (false/light) from the UserSettingsService when provided', async () => {
+      userSettingsService.getUserSettingDarkMode.mockResolvedValueOnce(false);
+
+      renderer = bootstrapRendererFactory({
+        auth,
+        packageInfo,
+        uiPlugins,
+        baseHref: '/base-path',
+        userSettingsService,
+        themeName$,
+      });
+
+      const request = httpServerMock.createKibanaRequest();
+
+      await renderer({
+        request,
+        uiSettingsClient,
+      });
+
+      expect(renderTemplateMock).toHaveBeenCalledTimes(1);
+      expect(renderTemplateMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          themeTagName: 'borealis',
+          colorMode: 'light',
+        })
+      );
+    });
+
+    it('calls renderTemplate with values from the UiSettingsClient when values (false/light) from UserSettingsService are `undefined`', async () => {
+      userSettingsService.getUserSettingDarkMode.mockResolvedValueOnce(undefined);
+
+      renderer = bootstrapRendererFactory({
+        auth,
+        packageInfo,
+        uiPlugins,
+        baseHref: '/base-path',
+        userSettingsService,
+        themeName$,
+      });
+
+      const request = httpServerMock.createKibanaRequest();
+
+      await renderer({
+        request,
+        uiSettingsClient,
+      });
+
+      expect(renderTemplateMock).toHaveBeenCalledTimes(1);
+      expect(renderTemplateMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          themeTagName: 'borealis',
+          colorMode: 'light',
+        })
+      );
+    });
+
+    it('calls renderTemplate with values from the UiSettingsClient when values (true/dark) from UserSettingsService are `undefined`', async () => {
+      userSettingsService.getUserSettingDarkMode.mockResolvedValueOnce(undefined);
+
+      renderer = bootstrapRendererFactory({
+        auth,
+        packageInfo,
+        uiPlugins,
+        baseHref: '/base-path',
+        userSettingsService,
+        themeName$,
+      });
+
+      uiSettingsClient.get.mockImplementation(
+        getClientGetMockImplementation({
+          darkMode: true,
+        })
+      );
+      const request = httpServerMock.createKibanaRequest();
+
+      await renderer({
+        request,
+        uiSettingsClient,
+      });
+
+      expect(renderTemplateMock).toHaveBeenCalledTimes(1);
+      expect(renderTemplateMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          themeTagName: 'borealis',
+          colorMode: 'dark',
+        })
+      );
+    });
+  });
+
+  describe('when the auth status is `unknown`', () => {
+    beforeEach(() => {
+      auth.get.mockReturnValue({
+        status: 'unknown' as AuthStatus,
+        state: {},
+      });
+    });
+
+    it('calls uiSettingsClient.get with the correct parameters', async () => {
+      const request = httpServerMock.createKibanaRequest();
+
+      await renderer({
+        request,
+        uiSettingsClient,
+      });
+
+      expect(uiSettingsClient.get).toHaveBeenCalledTimes(1);
+      expect(uiSettingsClient.get).toHaveBeenCalledWith('theme:darkMode');
+    });
+
+    it('calls renderTemplate with the correct parameters', async () => {
+      uiSettingsClient.get.mockImplementation(
+        getClientGetMockImplementation({
+          darkMode: true,
+        })
+      );
+
+      const request = httpServerMock.createKibanaRequest();
+
+      await renderer({
+        request,
+        uiSettingsClient,
+      });
+
+      expect(renderTemplateMock).toHaveBeenCalledTimes(1);
+      expect(renderTemplateMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          themeTagName: 'borealis',
+          colorMode: 'dark',
+        })
+      );
+    });
+
+    it('calls renderTemplate with the correct parameters when darkMode is `system`', async () => {
+      uiSettingsClient.get.mockImplementation(
+        getClientGetMockImplementation({
+          darkMode: 'system',
+        })
+      );
+
+      const request = httpServerMock.createKibanaRequest();
+
+      await renderer({
+        request,
+        uiSettingsClient,
+      });
+
+      expect(renderTemplateMock).toHaveBeenCalledTimes(1);
+      expect(renderTemplateMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          themeTagName: 'borealis',
+          colorMode: 'system',
+        })
+      );
+    });
+  });
+
+  describe('when the auth status is `unauthenticated`', () => {
+    beforeEach(() => {
+      auth.get.mockReturnValue({
+        status: 'unauthenticated' as AuthStatus,
+        state: {},
+      });
+    });
+
+    it('does not call uiSettingsClient.get with `theme:darkMode`', async () => {
+      const request = httpServerMock.createKibanaRequest();
+
+      await renderer({
+        request,
+        uiSettingsClient,
+      });
+
+      expect(uiSettingsClient.get).not.toHaveBeenCalledWith('theme:darkMode');
+    });
+
+    it('calls renderTemplate with the default parameters', async () => {
+      const request = httpServerMock.createKibanaRequest();
+
+      await renderer({
+        request,
+        uiSettingsClient,
+      });
+
+      expect(renderTemplateMock).toHaveBeenCalledTimes(1);
+      expect(renderTemplateMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          themeTagName: 'borealis',
+          colorMode: 'light',
+        })
+      );
+    });
+  });
+
+  it('calls renderTemplate with the correct theme name', async () => {
+    uiSettingsClient.get.mockImplementation(
+      getClientGetMockImplementation({
+        darkMode: true,
+      })
+    );
+    const request = httpServerMock.createKibanaRequest();
+
+    await renderer({
+      request,
+      uiSettingsClient,
+    });
+
+    expect(renderTemplateMock).toHaveBeenCalledTimes(1);
+    expect(renderTemplateMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        themeTagName: themeName$.getValue(),
+      })
+    );
+
+    themeName$.next('borealis');
+    await renderer({
+      request,
+      uiSettingsClient,
+    });
+
+    expect(renderTemplateMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        themeTagName: 'borealis',
+      })
+    );
+  });
+
+  [false, true].forEach((isAnonymousPage) => {
+    it(`calls getPluginsBundlePaths with the correct parameters when isAnonymousPage=${isAnonymousPage}`, async () => {
+      const request = httpServerMock.createKibanaRequest();
+
+      await renderer({
+        request,
+        uiSettingsClient,
+        isAnonymousPage,
+      });
+
+      expect(getPluginsBundlePathsMock).toHaveBeenCalledTimes(1);
+      expect(getPluginsBundlePathsMock).toHaveBeenCalledWith({
+        isAnonymousPage,
+        uiPlugins,
+        bundlesHref: '/base-path/buildShaShort/bundles',
+      });
+    });
+  });
+
+  it('calls getRspackDependencyPaths with the correct parameters', async () => {
+    const request = httpServerMock.createKibanaRequest();
+
+    await renderer({
+      request,
+      uiSettingsClient,
+    });
+
+    expect(getRspackDependencyPathsMock).toHaveBeenCalledTimes(1);
+    expect(getRspackDependencyPathsMock).toHaveBeenCalledWith(
+      '/base-path/buildShaShort/bundles',
+      [],
+      expect.any(Array)
+    );
+  });
+
+  describe('external plugins', () => {
+    const bundlesHref = '/base-path/buildShaShort/bundles';
+
+    const bundlePathInfo = (pluginId: string) => ({
+      publicPath: `${bundlesHref}/plugin/${pluginId}/1.0.0/`,
+      bundlePath: `${bundlesHref}/plugin/${pluginId}/1.0.0/${pluginId}.plugin.js`,
+    });
+
+    beforeEach(() => {
+      const externalPluginsDir = fromRoot('plugins');
+      for (const pluginId of ['extFirst', 'extSecond']) {
+        uiPlugins.internal.set(pluginId, {
+          requiredBundles: [],
+          version: '1.0.0',
+          publicTargetDir: Path.join(externalPluginsDir, pluginId, 'target', 'public'),
+          publicAssetsDir: Path.join(externalPluginsDir, pluginId, 'public', 'assets'),
+        });
+      }
+      const realExistsSync = Fs.existsSync;
+      jest
+        .spyOn(Fs, 'existsSync')
+        .mockImplementation((path) =>
+          String(path).startsWith(externalPluginsDir + Path.sep) ? true : realExistsSync(path)
+        );
+      // External plugins are detected when the factory runs, so recreate the renderer.
+      renderer = bootstrapRendererFactory({
+        auth,
+        packageInfo,
+        uiPlugins,
+        baseHref: `/base-path/${packageInfo.buildShaShort}`,
+        themeName$,
+      });
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it('only loads external plugin bundles that are part of the page bundle paths', async () => {
+      getPluginsBundlePathsMock.mockReturnValue(
+        new Map([
+          ['internalPlugin', bundlePathInfo('internalPlugin')],
+          ['extSecond', bundlePathInfo('extSecond')],
+        ])
+      );
+
+      await renderer({ request: httpServerMock.createKibanaRequest(), uiSettingsClient });
+
+      expect(getRspackDependencyPathsMock).toHaveBeenCalledWith(
+        bundlesHref,
+        [`${bundlesHref}/plugin/extSecond/1.0.0/extSecond.plugin.js`],
+        expect.any(Array)
+      );
+      const publicPathMap = JSON.parse(renderTemplateMock.mock.calls[0][0].publicPathMap);
+      expect(publicPathMap).toEqual(
+        expect.objectContaining({
+          internalPlugin: `${bundlesHref}/`,
+          extSecond: `${bundlesHref}/plugin/extSecond/1.0.0/`,
+        })
+      );
+      expect(publicPathMap).not.toHaveProperty('extFirst');
+    });
+
+    it('keeps the detection order of external plugins regardless of bundle path order', async () => {
+      getPluginsBundlePathsMock.mockReturnValue(
+        new Map([
+          ['extSecond', bundlePathInfo('extSecond')],
+          ['extFirst', bundlePathInfo('extFirst')],
+        ])
+      );
+
+      await renderer({ request: httpServerMock.createKibanaRequest(), uiSettingsClient });
+
+      expect(getRspackDependencyPathsMock).toHaveBeenCalledWith(
+        bundlesHref,
+        [
+          `${bundlesHref}/plugin/extFirst/1.0.0/extFirst.plugin.js`,
+          `${bundlesHref}/plugin/extSecond/1.0.0/extSecond.plugin.js`,
+        ],
+        expect.any(Array)
+      );
+    });
+  });
+
+  it('calls renderTemplate with the correct parameters', async () => {
+    getRspackDependencyPathsMock.mockReturnValue(['path-1', 'path-2']);
+
+    const request = httpServerMock.createKibanaRequest();
+
+    await renderer({
+      request,
+      uiSettingsClient,
+    });
+
+    expect(renderTemplateMock).toHaveBeenCalledTimes(1);
+    expect(renderTemplateMock).toHaveBeenCalledWith({
+      themeTagName: 'borealis',
+      colorMode: 'light',
+      jsDependencyPaths: ['path-1', 'path-2'],
+      publicPathMap: expect.any(String),
+      useHMR: expect.any(Boolean),
+    });
+  });
+});

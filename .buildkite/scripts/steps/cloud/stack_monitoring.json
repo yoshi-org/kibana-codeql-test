@@ -1,0 +1,18 @@
+{
+  "settings": {
+    "observability": {
+      "metrics": {
+        "destination": {
+          "deployment_id": "self",
+          "ref_id": "main-elasticsearch"
+        }
+      },
+      "logging": {
+        "destination": {
+          "deployment_id": "self",
+          "ref_id": "main-elasticsearch"
+        }
+      }
+    }
+  }
+}

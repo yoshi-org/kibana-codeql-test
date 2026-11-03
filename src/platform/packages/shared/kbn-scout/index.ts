@@ -1,0 +1,129 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+// CLI tools
+export * as cli from './src/cli';
+
+// Test framework
+export {
+  test,
+  spaceTest,
+  lighthouseTest,
+  apiTest,
+  globalSetupHook,
+  globalTeardownHook,
+  getPlaywrightTagsFor,
+  tags,
+} from './src/playwright';
+
+// Fixtures & configuration
+export {
+  browserAuthFixture,
+  apiServicesFixture,
+  apiClientFixture,
+  coreWorkerFixtures,
+  defaultRolesFixture,
+  esArchiverFixture,
+  networkFixture,
+  requestAuthFixture,
+  createPlaywrightConfig,
+  createLazyPageObject,
+  extendPlaywrightPage,
+} from './src/playwright';
+
+// Playwright integration
+export { mergeTests, test as playwrightTest } from 'playwright/test';
+
+// Performance monitoring
+export { measurePerformance, measurePerformanceAsync } from './src/common';
+
+// EUI components
+export * from './src/playwright/eui_components';
+
+// Kibana-wide components
+export * from './src/playwright/ui_components';
+
+// Page-object wrappers and helpers for shared Kibana surfaces.
+export {
+  AppMenu,
+  ContentListWrapper,
+  Controls,
+  DataGrid,
+  DiscoverApp,
+  FilterBar,
+  LensApp,
+  QueryBar,
+  UnifiedTabs,
+  ListingTable,
+  EmbeddableAlertsTablePage,
+} from './src/playwright/page_objects';
+
+// Scout core types
+export type {
+  ScoutPlaywrightOptions,
+  ScoutTestOptions,
+  GotoAppOptions,
+  ScoutPage,
+  PageObjects,
+  ScoutTestFixtures,
+  ScoutWorkerFixtures,
+  ScoutParallelTestFixtures,
+  ScoutParallelWorkerFixtures,
+} from './src/playwright';
+
+// Fixture types
+export type {
+  ApiServicesFixture,
+  ApiClientFixture,
+  ApiClientOptions,
+  ApiClientResponse,
+  BrowserAuthFixture,
+  DefaultRolesFixture,
+  NetworkFixture,
+  RequestAuthFixture,
+  SamlAuth,
+  ScoutSpaceParallelFixture,
+  SpaceSolutionView,
+} from './src/playwright';
+
+// Service & configuration types
+export type {
+  EsClient,
+  KbnClient,
+  KibanaUrl,
+  ScoutLogger,
+  ScoutServerConfig,
+  ScoutTestConfig,
+  ServerlessProductTier,
+  KibanaRole,
+  ElasticsearchRoleDescriptor,
+} from './src/types';
+
+// Authentication types
+export type { RoleApiCredentials } from './src/playwright/fixtures/scope/worker/api_key';
+export type {
+  RoleSessionCredentials,
+  CookieHeader,
+} from './src/playwright/fixtures/scope/worker/core_fixtures';
+
+// Re-exported Playwright types
+export type { Locator, CDPSession } from 'playwright/test';
+
+// Locator helpers used by plugin page objects
+export { resolveSelector } from './src/playwright/utils';
+export type { SelectorInput } from './src/playwright/utils';
+
+// Config-set constants — exported so test files can import instead of redeclaring.
+export { AUDIT_LOG_PATH } from './src/servers/configs/config_sets/security_audit/shared';
+export { ELASTICSEARCH_MAX_RESPONSE_SIZE_BYTES } from './src/servers/configs/config_sets/es_max_response_size/shared';
+export {
+  OTEL_RECEIVER_PORT,
+  OTEL_TEST_PROJECT_ID,
+} from './src/servers/configs/config_sets/security_audit_otel/shared';
+export { KIBANA_TLS_ORIGIN } from './src/servers/configs/config_sets/shared/tls_origin';

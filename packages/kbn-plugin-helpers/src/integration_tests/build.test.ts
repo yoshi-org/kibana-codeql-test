@@ -1,0 +1,126 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+import Path from 'path';
+import Fs from 'fs';
+import Zlib from 'zlib';
+import { loadJsonFile } from '@kbn/utils';
+
+import execa from 'execa';
+import { REPO_ROOT } from '@kbn/repo-info';
+import AdmZip from 'adm-zip';
+import del from 'del';
+import { globby } from 'globby';
+
+const PLUGIN_DIR = Path.resolve(REPO_ROOT, 'plugins/foo_test_plugin');
+const PLUGIN_BUILD_DIR = Path.resolve(PLUGIN_DIR, 'build');
+const PLUGIN_ARCHIVE = Path.resolve(PLUGIN_BUILD_DIR, `fooTestPlugin-7.5.0.zip`);
+const TMP_DIR = Path.resolve(__dirname, '__tmp__');
+
+describe('scripts/generate_plugin', () => {
+  beforeEach(async () => {
+    await del([PLUGIN_DIR, TMP_DIR]);
+    Fs.mkdirSync(TMP_DIR);
+  });
+  afterEach(async () => await del([PLUGIN_DIR, TMP_DIR]));
+
+  const generatePlugin = async () => {
+    await execa(process.execPath, ['scripts/generate_plugin', '-y', '--name', 'fooTestPlugin'], {
+      cwd: REPO_ROOT,
+      all: true,
+    });
+  };
+
+  const filterLogs = (logs: string | undefined) => {
+    return logs
+      ?.split('\n')
+      .filter((l) => !l.includes('failed to reach ci-stats service'))
+      .join('\n');
+  };
+
+  it('builds a generated plugin into a viable archive', async () => {
+    await generatePlugin();
+
+    // Third-party plugins commonly ship stylesheets. Every plugin .scss pulls in
+    // Kibana's theme globals, which must resolve when built from the plugin dir.
+    Fs.writeFileSync(
+      Path.resolve(PLUGIN_DIR, 'public/styles.scss'),
+      '.fooTestPlugin { color: $euiColorPrimary; }\n'
+    );
+    const entryPath = Path.resolve(PLUGIN_DIR, 'public/index.ts');
+    Fs.writeFileSync(entryPath, `import './styles.scss';\n${Fs.readFileSync(entryPath, 'utf8')}`);
+
+    const buildProc = await execa(
+      process.execPath,
+      ['../../scripts/plugin_helpers', 'build', '--kibana-version', '7.5.0'],
+      {
+        cwd: PLUGIN_DIR,
+        all: true,
+      }
+    );
+
+    const logs = filterLogs(buildProc.all) ?? '';
+    expect(logs).toContain('browser bundle created');
+    expect(logs).toContain('plugin archive created');
+
+    const zip = new AdmZip(PLUGIN_ARCHIVE);
+    await zip.extractAllToAsync(TMP_DIR);
+
+    const files = await globby(['**/*'], { cwd: TMP_DIR, dot: true });
+
+    const publicFiles = files.filter((f) => f.includes('target/public/'));
+    expect(publicFiles.length).toBeGreaterThanOrEqual(1);
+
+    const mainBundle = publicFiles.find((f) => f.endsWith('fooTestPlugin.plugin.js'));
+    expect(mainBundle).toBeDefined();
+    expect(Fs.readFileSync(Path.resolve(TMP_DIR, mainBundle!), 'utf8')).toContain('.fooTestPlugin');
+
+    // Legacy kibana.json plugins register both `public` and `common` with __kbnBundles__
+    const bundleContent = Fs.readFileSync(Path.resolve(TMP_DIR, mainBundle!), 'utf-8');
+    expect(bundleContent).toContain('plugin/fooTestPlugin/public');
+    expect(bundleContent).toContain('plugin/fooTestPlugin/common');
+
+    const compressedBundle = Fs.readFileSync(Path.resolve(TMP_DIR, `${mainBundle!}.br`));
+    expect(Zlib.brotliDecompressSync(compressedBundle).toString('utf-8')).toBe(bundleContent);
+
+    const serverFiles = files.filter((f) => f.includes('server/'));
+    expect(serverFiles.length).toBeGreaterThan(0);
+
+    expect(
+      loadJsonFile(Path.resolve(TMP_DIR, 'kibana', 'fooTestPlugin', 'kibana.json'))
+    ).toMatchObject({
+      id: 'fooTestPlugin',
+      kibanaVersion: '7.5.0',
+      server: true,
+      ui: true,
+    });
+  });
+
+  it('fails the build when browser code imports a plugin not declared in kibana.json', async () => {
+    await generatePlugin();
+
+    const entryPath = Path.resolve(PLUGIN_DIR, 'public/index.ts');
+    Fs.writeFileSync(
+      entryPath,
+      `import '@kbn/navigation-plugin/public';\n${Fs.readFileSync(entryPath, 'utf-8')}`
+    );
+
+    const buildProc = await execa(
+      process.execPath,
+      ['../../scripts/plugin_helpers', 'build', '--kibana-version', '7.5.0'],
+      { cwd: PLUGIN_DIR, all: true, reject: false }
+    );
+
+    expect(buildProc.exitCode).not.toBe(0);
+    expect(filterLogs(buildProc.all)).toContain(
+      'import [@kbn/navigation-plugin/public] references a public export of the [navigation] bundle, ' +
+        'but that bundle is not in the "requiredPlugins" or "requiredBundles" list in the plugin manifest'
+    );
+  });
+});

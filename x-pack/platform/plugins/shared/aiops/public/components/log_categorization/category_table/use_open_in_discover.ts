@@ -1,0 +1,154 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import { useCallback } from 'react';
+
+import moment from 'moment';
+
+import type { QueryMode } from '@kbn/aiops-log-pattern-analysis/get_category_query';
+import {
+  isOfAggregateQueryType,
+  type AggregateQuery,
+  type Filter,
+  type Query,
+} from '@kbn/es-query';
+import type { Category } from '@kbn/aiops-log-pattern-analysis/types';
+import type { DataViewField } from '@kbn/data-views-plugin/common';
+import type { QueryStringContract, TimefilterContract } from '@kbn/data-plugin/public';
+import type { CategorizationAdditionalFilter } from '@kbn/aiops-log-pattern-analysis/create_category_request';
+import { useAiopsAppContext } from '../../../hooks/use_aiops_app_context';
+import { useDiscoverLinks, createFilter } from '../use_discover_links';
+import type { LogCategorizationAppState } from '../../../application/url_state/log_pattern_analysis';
+import {
+  addWhereToEsqlQuery,
+  buildCategoriesMatchExpression,
+  buildMatchFilterExpression,
+} from '../reverse_categorization/build_esql_analysis_queries';
+import { getLabels } from './labels';
+
+export interface OpenInDiscover {
+  openFunction: (mode: QueryMode, navigateToDiscover: boolean, category?: Category) => void;
+  getLabels: (navigateToDiscover: boolean) => ReturnType<typeof getLabels>;
+  count: number;
+}
+
+export function onPopulateWhereClause(
+  queryString: QueryStringContract,
+  field: DataViewField,
+  value: string,
+  mode: QueryMode
+) {
+  const query = queryString.getQuery();
+  if (!isOfAggregateQueryType(query)) {
+    return;
+  }
+
+  const filterExpression = buildMatchFilterExpression(field.name, value, mode);
+  const updatedQuery = addWhereToEsqlQuery(query.esql, filterExpression);
+
+  queryString.setQuery({
+    esql: updatedQuery,
+  });
+}
+
+export function useOpenInDiscover(
+  dataViewId: string,
+  selectedField: DataViewField | string | undefined,
+  selectedCategories: Category[],
+  aiopsListState: LogCategorizationAppState,
+  timefilter: TimefilterContract,
+  onAddFilter?: (values: Filter, alias?: string) => void,
+  additionalFilter?: CategorizationAdditionalFilter,
+  onClose: () => void = () => {},
+  /** Query of the originating panel or tab. When ES|QL, Discover is opened in ES|QL mode. */
+  originatingQuery?: Query | AggregateQuery
+): OpenInDiscover {
+  const { openInDiscoverWithFilter } = useDiscoverLinks();
+  const { data } = useAiopsAppContext();
+
+  const openFunction = useCallback(
+    (mode: QueryMode, navigateToDiscover: boolean, category?: Category) => {
+      if (
+        onAddFilter !== undefined &&
+        selectedField !== undefined &&
+        typeof selectedField !== 'string' &&
+        navigateToDiscover === false
+      ) {
+        const isEsql = isOfAggregateQueryType(data.query.queryString.getQuery());
+
+        if (isEsql) {
+          onPopulateWhereClause(
+            data.query.queryString,
+            selectedField,
+            selectedCategories[0].key,
+            mode
+          );
+          onClose();
+          return;
+        }
+
+        onAddFilter(
+          createFilter('', selectedField.name, selectedCategories, mode, category),
+          `Patterns - ${selectedField.name}`
+        );
+        onClose();
+        return;
+      }
+
+      const timefilterActiveBounds =
+        additionalFilter !== undefined
+          ? {
+              min: moment(additionalFilter.from),
+              max: moment(additionalFilter.to),
+            }
+          : timefilter.getActiveBounds();
+
+      if (timefilterActiveBounds === undefined || selectedField === undefined) {
+        return;
+      }
+
+      const fieldName = typeof selectedField === 'string' ? selectedField : selectedField.name;
+      const newEsqlQuery = isOfAggregateQueryType(originatingQuery)
+        ? addWhereToEsqlQuery(
+            originatingQuery.esql,
+            buildCategoriesMatchExpression(
+              fieldName,
+              (category ? [category] : selectedCategories).map(({ key }) => key),
+              mode
+            )
+          )
+        : undefined;
+
+      openInDiscoverWithFilter(
+        dataViewId,
+        typeof selectedField === 'string' ? selectedField : selectedField.name,
+        selectedCategories,
+        aiopsListState,
+        timefilterActiveBounds,
+        mode,
+        category,
+        additionalFilter?.field,
+        newEsqlQuery
+      );
+    },
+    [
+      onAddFilter,
+      selectedField,
+      additionalFilter,
+      timefilter,
+      openInDiscoverWithFilter,
+      dataViewId,
+      selectedCategories,
+      aiopsListState,
+      data.query.queryString,
+      onClose,
+      originatingQuery,
+    ]
+  );
+
+  return { openFunction, getLabels, count: selectedCategories.length };
+}

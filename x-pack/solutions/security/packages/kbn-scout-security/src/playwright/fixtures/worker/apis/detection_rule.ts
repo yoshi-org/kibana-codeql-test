@@ -1,0 +1,91 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import type { KbnClient, ScoutLogger, ScoutParallelWorkerFixtures } from '@kbn/scout';
+import { measurePerformanceAsync } from '@kbn/scout';
+import type { CustomQueryRule, EqlRule, ThreatMatchRule } from '../../../constants/detection_rules';
+import { CUSTOM_QUERY_RULE, EQL_RULE } from '../../../constants/detection_rules';
+
+const DETECTION_ENGINE_RULES_URL = '/api/detection_engine/rules';
+const DETECTION_ENGINE_RULES_BULK_ACTION = '/api/detection_engine/rules/_bulk_action';
+
+export interface DetectionRuleApiService {
+  createCustomQueryRule: (body: CustomQueryRule) => Promise<{ id: string }>;
+  getById: (id: string) => Promise<CustomQueryRule>;
+  createThreatMatchRule: (body: ThreatMatchRule) => Promise<{ id: string }>;
+  disable: (id: string) => Promise<void>;
+  createEqlRule: (body: EqlRule) => Promise<{ id: string }>;
+  deleteAll: () => Promise<void>;
+}
+
+export const getDetectionRuleApiService = ({
+  kbnClient,
+  log,
+  scoutSpace,
+}: {
+  kbnClient: KbnClient;
+  log: ScoutLogger;
+  scoutSpace?: ScoutParallelWorkerFixtures['scoutSpace'];
+}): DetectionRuleApiService => {
+  const basePath = scoutSpace?.id ? `/s/${scoutSpace?.id}` : '';
+
+  const createRule = (operation: string, body: CustomQueryRule | EqlRule | ThreatMatchRule) =>
+    measurePerformanceAsync(log, `security.detectionRule.${operation}`, async () => {
+      const { data } = await kbnClient.request<{ id: string }>({
+        method: 'POST',
+        path: `${basePath}${DETECTION_ENGINE_RULES_URL}`,
+        body,
+        // Avoid duplicate rule creation if the request is retried
+        retries: 0,
+      });
+      return { id: data.id };
+    });
+
+  return {
+    createCustomQueryRule: async (body = CUSTOM_QUERY_RULE) =>
+      createRule('createCustomQueryRule', body),
+
+    createEqlRule: async (body = EQL_RULE) => createRule('createEqlRule', body),
+
+    getById: async (id: string) => {
+      const { data } = await kbnClient.request<CustomQueryRule>({
+        method: 'GET',
+        path: `${basePath}${DETECTION_ENGINE_RULES_URL}?id=${encodeURIComponent(id)}`,
+      });
+      return data;
+    },
+
+    createThreatMatchRule: async (body: ThreatMatchRule) =>
+      createRule('createThreatMatchRule', body),
+
+    disable: async (id: string) => {
+      await measurePerformanceAsync(log, 'security.detectionRule.disable', async () => {
+        await kbnClient.request({
+          method: 'POST',
+          path: `${basePath}${DETECTION_ENGINE_RULES_BULK_ACTION}`,
+          body: {
+            action: 'disable',
+            ids: [id],
+          },
+        });
+      });
+    },
+
+    deleteAll: async () => {
+      await measurePerformanceAsync(log, 'security.detectionRule.deleteAll', async () => {
+        await kbnClient.request({
+          method: 'POST',
+          path: `${basePath}${DETECTION_ENGINE_RULES_BULK_ACTION}`,
+          body: {
+            query: '',
+            action: 'delete',
+          },
+        });
+      });
+    },
+  };
+};

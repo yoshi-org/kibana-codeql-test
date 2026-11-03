@@ -1,0 +1,169 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import type { EuiComboBoxOptionOption } from '@elastic/eui';
+import { EuiComboBox } from '@elastic/eui';
+import React, { useCallback, useMemo, useState } from 'react';
+import { i18n } from '@kbn/i18n';
+
+import type {
+  ActionConnector,
+  ActionTypeIndex,
+  ActionTypeModel,
+  RuleUiAction,
+} from '../../../types';
+import { getValidConnectors } from '../common/connectors';
+
+interface ConnectorOption {
+  title: string;
+  id: string;
+  prependComponent?: JSX.Element;
+}
+
+interface SelectionProps {
+  allowGroupConnector?: string[];
+  /**
+   * Both are supplied by the wrapping `EuiFormRow`, which controls the `id` of
+   * its child to associate it with the label it renders. Either one makes the
+   * combo box announce the visible label; without them it falls back to a
+   * static `aria-label`.
+   */
+  'aria-labelledby'?: string;
+  id?: string;
+  actionItem: RuleUiAction;
+  accordionIndex: number;
+  actionTypesIndex: ActionTypeIndex;
+  actionTypeRegistered: ActionTypeModel;
+  connectors: ActionConnector[];
+  onConnectorSelected: (id: string) => void;
+}
+
+export const ConnectorsSelection = React.memo(ConnectorsSelectionComponent);
+
+function ConnectorsSelectionComponent({
+  'aria-labelledby': ariaLabelledBy,
+  allowGroupConnector,
+  id,
+  actionItem,
+  accordionIndex,
+  actionTypesIndex,
+  actionTypeRegistered,
+  connectors,
+  onConnectorSelected,
+}: SelectionProps) {
+  const validConnectors = useMemo(
+    () => getValidConnectors(connectors, actionItem, actionTypesIndex, allowGroupConnector),
+    [actionItem, actionTypesIndex, allowGroupConnector, connectors]
+  );
+
+  const selectedConnectors = useMemo(
+    () =>
+      getValueOfSelectedConnector(
+        actionItem.id,
+        validConnectors,
+        actionTypeRegistered,
+        allowGroupConnector
+      ),
+    [actionItem.id, validConnectors, actionTypeRegistered, allowGroupConnector]
+  );
+
+  const options = useMemo(
+    () => createConnectorOptions(validConnectors, actionTypeRegistered),
+    [validConnectors, actionTypeRegistered]
+  );
+
+  const [selectedOption, setSelectedOption] = useState<
+    EuiComboBoxOptionOption<ConnectorOption> | undefined
+  >(selectedConnectors.length > 0 ? selectedConnectors[0] : undefined);
+
+  const onChange = useCallback(
+    (connectorOptions: Array<EuiComboBoxOptionOption<ConnectorOption>>) => {
+      setSelectedOption(connectorOptions[0]);
+      onConnectorSelected(connectorOptions[0].value?.id ?? '');
+    },
+    [onConnectorSelected]
+  );
+
+  const hasVisibleLabel = Boolean(ariaLabelledBy || id);
+
+  return (
+    <EuiComboBox
+      aria-label={hasVisibleLabel ? undefined : incidentManagemSystem}
+      aria-labelledby={ariaLabelledBy}
+      data-test-subj={`selectActionConnector-${actionItem.actionTypeId}-${accordionIndex}`}
+      fullWidth
+      singleSelection={{ asPlainText: true }}
+      id={id ?? `selectActionConnector-${actionItem.id}`}
+      isClearable={false}
+      onChange={onChange}
+      options={options}
+      selectedOptions={selectedConnectors}
+      prepend={selectedOption?.value?.prependComponent}
+    />
+  );
+}
+
+const getValueOfSelectedConnector = (
+  actionItemId: string,
+  connectors: ActionConnector[],
+  actionTypeRegistered: ActionTypeModel,
+  allowGroupConnector: string[] = []
+): Array<EuiComboBoxOptionOption<ConnectorOption>> => {
+  const selectedConnector = connectors.find((connector) => connector.id === actionItemId);
+
+  if (!selectedConnector) {
+    return [];
+  }
+
+  return [createOption(selectedConnector, actionTypeRegistered)];
+};
+
+const createConnectorOptions = (
+  connectors: ActionConnector[],
+  actionTypeRegistered: ActionTypeModel
+): Array<EuiComboBoxOptionOption<ConnectorOption>> =>
+  connectors.map((connector) => createOption(connector, actionTypeRegistered));
+
+const createOption = (connector: ActionConnector, actionTypeRegistered: ActionTypeModel) => {
+  const title = getTitle(connector, actionTypeRegistered);
+
+  let prependComponent: JSX.Element | undefined;
+
+  if (actionTypeRegistered.customConnectorSelectItem != null) {
+    const CustomPrependComponent =
+      actionTypeRegistered.customConnectorSelectItem.getComponent(connector);
+    if (CustomPrependComponent) {
+      prependComponent = <CustomPrependComponent actionConnector={connector} />;
+    }
+  }
+
+  return {
+    label: title,
+    value: {
+      title,
+      id: connector.id,
+      prependComponent,
+    },
+    key: connector.id,
+    'data-test-subj': `dropdown-connector-${connector.id}`,
+  };
+};
+
+const getTitle = (connector: ActionConnector, actionTypeRegistered: ActionTypeModel) => {
+  if (actionTypeRegistered.customConnectorSelectItem != null) {
+    return actionTypeRegistered.customConnectorSelectItem.getText(connector);
+  }
+
+  return connector.name;
+};
+
+const incidentManagemSystem = i18n.translate(
+  'xpack.triggersActionsUI.sections.actionForm.incidentManagementSystemLabel',
+  {
+    defaultMessage: 'Incident management system',
+  }
+);

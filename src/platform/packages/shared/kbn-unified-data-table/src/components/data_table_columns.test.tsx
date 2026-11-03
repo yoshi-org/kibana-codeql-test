@@ -1,0 +1,639 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+import React from 'react';
+import { getVisibleColumns } from '@kbn/discover-utils';
+import { buildDataViewMock, deepMockedFields } from '@kbn/discover-utils/src/__mocks__';
+import { deserializeHeaderRowHeight, getEuiGridColumns } from './data_table_columns';
+import { dataViewWithTimefieldMock } from '../../__mocks__/data_view_with_timefield';
+import { dataTableContextMock } from '../../__mocks__/table_context';
+import { servicesMock } from '../../__mocks__/services';
+import { ROWS_HEIGHT_OPTIONS, kibanaJSON } from '../constants';
+import type { UnifiedDataTableSettingsColumn } from '../types';
+import { createMockEsqlSource } from '@kbn/data-source/src/__mocks__/esql_source.mock';
+
+const columns = ['extension', 'message'];
+const columnsWithTimeCol = getVisibleColumns(
+  ['extension', 'message'],
+  dataViewWithTimefieldMock,
+  true
+) as string[];
+
+describe('Data table columns', function () {
+  describe('getEuiGridColumns', () => {
+    it('returns eui grid columns showing default columns', async () => {
+      const actual = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns,
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: true,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+      expect(actual).toMatchSnapshot();
+    });
+
+    it('returns eui grid columns with time column', async () => {
+      const actual = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns: columnsWithTimeCol,
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+      expect(actual).toMatchSnapshot();
+    });
+
+    it('treats the time field column as a regular column when it does not match any field', async () => {
+      const dataViewWithMissingTimeField = buildDataViewMock({
+        name: 'the-data-view-with-missing-time-field',
+        fields: deepMockedFields,
+        timeFieldName: 'missing_time_field',
+      });
+      const [missingTimeFieldColumn] = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns: ['missing_time_field', 'extension'],
+        settings: {},
+        dataView: dataViewWithMissingTimeField,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+      expect(missingTimeFieldColumn.actions).toMatchObject({
+        showHide: { label: 'Remove column' },
+      });
+      expect(missingTimeFieldColumn.initialWidth).toBeUndefined();
+    });
+
+    it('returns eui grid with in memory sorting', async () => {
+      const actual = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns: columnsWithTimeCol,
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        dataSource: createMockEsqlSource([
+          { name: 'extension', type: 'string', source: 'index' },
+          { name: 'message', type: 'string', esType: 'keyword', source: 'index' },
+          { name: 'timestamp', type: 'date', esType: 'dateTime', source: 'index' },
+        ]),
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+      expect(actual).toMatchSnapshot();
+    });
+
+    describe('cell actions', () => {
+      it('should replace cell actions', async () => {
+        const cellAction = jest.fn();
+        const actual = getEuiGridColumns({
+          documentsDisplayMode: 'table',
+          columns: columnsWithTimeCol,
+          settings: {},
+          dataView: dataViewWithTimefieldMock,
+          isSummaryOnlyColumn: false,
+          isSortEnabled: true,
+          valueToStringConverter: dataTableContextMock.valueToStringConverter,
+          rowsCount: 100,
+          headerRowHeightLines: 5,
+          services: {
+            uiSettings: servicesMock.uiSettings,
+            toastNotifications: servicesMock.toastNotifications,
+            uiActions: servicesMock.uiActions,
+          },
+          hasEditDataViewPermission: () =>
+            servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+          onFilter: () => {},
+          dataSource: createMockEsqlSource([
+            { name: 'extension', type: 'string', source: 'index' },
+            { name: 'message', type: 'string', esType: 'keyword', source: 'index' },
+            { name: 'timestamp', type: 'date', esType: 'dateTime', source: 'index' },
+          ]),
+          onResize: () => {},
+          columnsCellActions: [[cellAction]],
+          cellActionsHandling: 'replace',
+        });
+        expect(actual[0].cellActions).toEqual([cellAction]);
+      });
+
+      it('should append cell actions', async () => {
+        const cellAction = jest.fn();
+        const actual = getEuiGridColumns({
+          documentsDisplayMode: 'table',
+          columns: columnsWithTimeCol,
+          settings: {},
+          dataView: dataViewWithTimefieldMock,
+          isSummaryOnlyColumn: false,
+          isSortEnabled: true,
+          valueToStringConverter: dataTableContextMock.valueToStringConverter,
+          rowsCount: 100,
+          headerRowHeightLines: 5,
+          services: {
+            uiSettings: servicesMock.uiSettings,
+            toastNotifications: servicesMock.toastNotifications,
+            uiActions: servicesMock.uiActions,
+          },
+          hasEditDataViewPermission: () =>
+            servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+          onFilter: () => {},
+          dataSource: createMockEsqlSource([
+            { name: 'extension', type: 'string', source: 'index' },
+            { name: 'message', type: 'string', esType: 'keyword', source: 'index' },
+            { name: 'timestamp', type: 'date', esType: 'dateTime', source: 'index' },
+          ]),
+          onResize: () => {},
+          columnsCellActions: [[cellAction]],
+          cellActionsHandling: 'append',
+          hideFilteringOnComputedColumns: false,
+        });
+        expect(actual[0].cellActions).toEqual([
+          expect.any(Function),
+          expect.any(Function),
+          expect.any(Function),
+          cellAction,
+        ]);
+      });
+    });
+  });
+
+  describe('column tokens', () => {
+    it('returns eui grid columns with tokens', async () => {
+      const actual = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        showColumnTokens: true,
+        columns: columnsWithTimeCol,
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+      expect(actual).toMatchSnapshot();
+    });
+
+    it('returns eui grid columns with tokens for custom column types', async () => {
+      const actual = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        showColumnTokens: true,
+        dataSource: createMockEsqlSource([
+          { name: 'extension', type: 'string', source: 'index' },
+          { name: 'message', type: 'string', esType: 'keyword', source: 'index' },
+        ]),
+        columns,
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+      expect(actual).toMatchSnapshot();
+    });
+  });
+
+  describe('Textbased languages grid columns', () => {
+    it('returns eui grid with in memory sorting for text based languages and columns on the dataview', async () => {
+      const columnsNotInDataview = getVisibleColumns(
+        ['extension'],
+        dataViewWithTimefieldMock,
+        true
+      ) as string[];
+      const gridColumns = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns: columnsNotInDataview,
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        dataSource: createMockEsqlSource([{ name: 'extension', type: 'string', source: 'index' }]),
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+      expect(gridColumns[1].schema).toBe('string');
+      expect(gridColumns[1].isSortable).toBe(true);
+    });
+
+    it('should not allow sorting on json columns', async () => {
+      const gridColumns = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns: ['geo.coordinates'],
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        dataSource: createMockEsqlSource([
+          { name: 'geo.coordinates', type: 'geo_point', source: 'index' },
+        ]),
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+      expect(gridColumns[0].schema).toBe(kibanaJSON);
+      expect(gridColumns[0].isSortable).toBe(false);
+    });
+
+    it('should allow sorting on version columns', async () => {
+      const gridColumns = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns: ['stack_version'],
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        dataSource: createMockEsqlSource([
+          { name: 'stack_version', type: 'version', source: 'index' },
+        ]),
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+      expect(gridColumns[0].schema).toBe(kibanaJSON);
+      expect(gridColumns[0].isSortable).toBe(true);
+    });
+
+    it('should allow sorting on ip columns', async () => {
+      const gridColumns = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns: ['ip_address'],
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        dataSource: createMockEsqlSource([{ name: 'ip_address', type: 'ip', source: 'index' }]),
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+      expect(gridColumns[0].schema).toBe('numeric');
+      expect(gridColumns[0].isSortable).toBe(true);
+    });
+
+    it('returns eui grid with in memory sorting for text based languages and columns not in the ES|QL columns', async () => {
+      const columnsNotInDataview = getVisibleColumns(
+        ['var_test'],
+        dataViewWithTimefieldMock,
+        true
+      ) as string[];
+      const gridColumns = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns: columnsNotInDataview,
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        dataSource: createMockEsqlSource([{ name: 'var_test', type: 'number', source: 'index' }]),
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+      expect(gridColumns[1].schema).toBe('numeric');
+      expect(gridColumns[1].isSortable).toBe(true);
+    });
+
+    it('returns columns in correct format when column customisation is provided', async () => {
+      const gridColumns = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns,
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        dataSource: createMockEsqlSource([
+          { name: 'extension', type: 'string', source: 'index' },
+          { name: 'message', type: 'string', esType: 'keyword', source: 'index' },
+        ]),
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+
+      const extensionGridColumn = gridColumns[0];
+      extensionGridColumn.display = <span>test</span>;
+      const customGridColumnsConfiguration = {
+        extension: () => extensionGridColumn,
+      };
+
+      const customizedGridColumns = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns,
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        customGridColumnsConfiguration,
+        dataSource: createMockEsqlSource([
+          { name: 'extension', type: 'string', source: 'index' },
+          { name: 'message', type: 'string', esType: 'keyword', source: 'index' },
+        ]),
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+
+      expect(customizedGridColumns).toMatchSnapshot();
+    });
+  });
+
+  describe('Summary column', () => {
+    it('returns eui grid columns with summary column', async () => {
+      const actual = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns: ['_source'],
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: false,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+      expect(actual).toMatchSnapshot();
+      expect(actual.find((column) => column.id === '_source')?.initialWidth).toBeUndefined();
+    });
+  });
+
+  describe('Summary column without a data view field', () => {
+    it('still has cell actions when the data view has no _source field, as in ES|QL', () => {
+      const getByName = dataViewWithTimefieldMock.fields.getByName.bind(
+        dataViewWithTimefieldMock.fields
+      );
+      const getByNameSpy = jest
+        .spyOn(dataViewWithTimefieldMock.fields, 'getByName')
+        .mockImplementation((name: string) => (name === '_source' ? undefined : getByName(name)));
+
+      const actual = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns: ['_source'],
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: false,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        dataSource: createMockEsqlSource([]),
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+
+      getByNameSpy.mockRestore();
+
+      expect(actual.find((column) => column.id === '_source')?.cellActions?.length).toBeGreaterThan(
+        0
+      );
+    });
+  });
+
+  describe('JSON column', () => {
+    it('does not apply custom grid column configuration to the _source column in JSON mode', () => {
+      const customizeSourceColumn = jest.fn(({ column }) => ({
+        ...column,
+        displayAsText: 'Custom Summary',
+        isExpandable: true,
+      }));
+
+      const actual = getEuiGridColumns({
+        documentsDisplayMode: 'json',
+        columns: ['_source'],
+        settings: {},
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: false,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onFilter: () => {},
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+        customGridColumnsConfiguration: {
+          _source: customizeSourceColumn,
+        },
+      });
+
+      expect(customizeSourceColumn).not.toHaveBeenCalled();
+      expect(actual[0].id).toBe('_source');
+      expect(actual[0].displayAsText).toBe('JSON');
+      expect(actual[0].isExpandable).toBe(false);
+      expect(actual[0].cellActions).toEqual([]);
+    });
+  });
+
+  describe('deserializeHeaderRowHeight', () => {
+    it('returns undefined for auto', () => {
+      expect(deserializeHeaderRowHeight(ROWS_HEIGHT_OPTIONS.auto)).toBe(undefined);
+    });
+
+    it('returns the value for other values', () => {
+      expect(deserializeHeaderRowHeight(2)).toBe(2);
+    });
+  });
+
+  describe('Column label display', () => {
+    it('Column Name should display provided label from display otherwise it defaults to columns name', () => {
+      const mockColumnHeaders: Record<string, UnifiedDataTableSettingsColumn> = {
+        test_column_1: { display: 'test_column_one' },
+        test_column_2: { display: 'test_column_two' },
+        test_column_3: { display: 'test_column_three' },
+      } as const;
+      const customizedGridColumns = getEuiGridColumns({
+        documentsDisplayMode: 'table',
+        columns: ['test_column_1', 'test_column_2', 'test_column_4'],
+        settings: { columns: mockColumnHeaders },
+        dataView: dataViewWithTimefieldMock,
+        isSummaryOnlyColumn: false,
+        isSortEnabled: true,
+        valueToStringConverter: dataTableContextMock.valueToStringConverter,
+        rowsCount: 100,
+        headerRowHeightLines: 5,
+        services: {
+          uiSettings: servicesMock.uiSettings,
+          toastNotifications: servicesMock.toastNotifications,
+          uiActions: servicesMock.uiActions,
+        },
+        hasEditDataViewPermission: () =>
+          servicesMock.dataViewFieldEditor.userPermissions.editIndexPattern(),
+        onResize: () => {},
+        cellActionsHandling: 'replace',
+      });
+      const columnDisplayNames = customizedGridColumns.map((column) => column.displayAsText);
+      expect(columnDisplayNames.includes('test_column_one')).toBeTruthy();
+      expect(columnDisplayNames.includes('test_column_two')).toBeTruthy();
+      expect(columnDisplayNames.includes('test_column_three')).toBeFalsy();
+      expect(columnDisplayNames.includes('test_column_4')).toBeTruthy();
+    });
+  });
+});

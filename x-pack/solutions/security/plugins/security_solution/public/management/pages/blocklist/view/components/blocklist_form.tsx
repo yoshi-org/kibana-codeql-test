@@ -1,0 +1,816 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import React, { useMemo, useState, useCallback, memo, useRef } from 'react';
+import type { EuiSuperSelectOption, EuiComboBoxOptionOption } from '@elastic/eui';
+import {
+  EuiForm,
+  EuiFormRow,
+  EuiFieldText,
+  EuiTextArea,
+  EuiHorizontalRule,
+  EuiText,
+  EuiSpacer,
+  EuiSuperSelect,
+  EuiComboBox,
+  EuiTitle,
+  EuiFlexGroup,
+  EuiFlexItem,
+  EuiIconTip,
+} from '@elastic/eui';
+import type { BlocklistConditionEntryField } from '@kbn/securitysolution-utils';
+import { OperatingSystem, isPathValid, validateWildcardInput } from '@kbn/securitysolution-utils';
+import {
+  isOneOfOperator,
+  isOperator,
+  matchesOperator,
+  hasEntryEscaping,
+} from '@kbn/securitysolution-list-utils';
+import { uniq } from 'lodash';
+import { ListOperatorEnum, ListOperatorTypeEnum } from '@kbn/securitysolution-io-ts-list-types';
+import { useCanAssignArtifactPerPolicy } from '../../../../hooks/artifacts/use_can_assign_artifact_per_policy';
+import { FormattedError } from '../../../../components/formatted_error';
+import { OS_TITLES } from '../../../../common/translations';
+import type {
+  ArtifactFormComponentOnChangeCallbackProps,
+  ArtifactFormComponentProps,
+} from '../../../../components/artifact_list_page';
+import {
+  CONDITIONS_HEADER,
+  CONDITIONS_HEADER_DESCRIPTION,
+  CONDITION_FIELD_DESCRIPTION,
+  CONDITION_FIELD_TITLE,
+  DESCRIPTION_LABEL,
+  DETAILS_HEADER,
+  DETAILS_HEADER_DESCRIPTION,
+  FIELD_LABEL,
+  MATCHES_OPERATOR_LABEL,
+  NAME_LABEL,
+  OPERATOR_LABEL,
+  POLICY_SELECT_DESCRIPTION,
+  SELECT_OS_LABEL,
+  VALUE_LABEL,
+  ERRORS,
+  VALUE_LABEL_HELPER,
+  SINGLE_VALUE_LABEL_HELPER,
+} from '../../translations';
+import type { EffectedPolicySelectProps } from '../../../../components/effected_policy_select';
+import { EffectedPolicySelect } from '../../../../components/effected_policy_select';
+import { isValidHash } from '../../../../../../common/endpoint/service/artifacts/validations';
+import { useTestIdGenerator } from '../../../../hooks/use_test_id_generator';
+
+const testIdPrefix = 'blocklist-form';
+
+interface BlocklistEntryMatch {
+  field: BlocklistConditionEntryField;
+  operator: ListOperatorEnum.INCLUDED;
+  type: ListOperatorTypeEnum.MATCH;
+  value: string;
+}
+
+interface BlocklistEntryMatchAny {
+  field: BlocklistConditionEntryField;
+  operator: ListOperatorEnum.INCLUDED;
+  type: ListOperatorTypeEnum.MATCH_ANY;
+  value: string[];
+}
+
+interface BlocklistEntryWildcard {
+  field: BlocklistConditionEntryField;
+  operator: ListOperatorEnum.INCLUDED;
+  type: ListOperatorTypeEnum.WILDCARD;
+  value: string;
+}
+
+export type BlocklistEntry = BlocklistEntryMatch | BlocklistEntryMatchAny | BlocklistEntryWildcard;
+
+// Fields that support the `Match` (wildcard) operator, in addition to `is one of`
+const WILDCARD_ELIGIBLE_FIELDS: ReadonlySet<BlocklistConditionEntryField> = new Set([
+  'file.path',
+  'file.path.caseless',
+  'file.name',
+  'file.name.caseless',
+]);
+
+// The two wire values for the File Name field. `is one of` always uses the cased `file.name`;
+// `Match` (wildcard) uses whichever variant matches the target OS's filesystem case-sensitivity.
+const FILE_NAME_FIELDS: ReadonlySet<BlocklistConditionEntryField> = new Set([
+  'file.name',
+  'file.name.caseless',
+]);
+
+// Windows and macOS have case-insensitive filesystems; Linux does not.
+function resolveFileNameFieldForOs(os: OperatingSystem): BlocklistConditionEntryField {
+  return os === OperatingSystem.LINUX ? 'file.name' : 'file.name.caseless';
+}
+
+// Resolves the wire `field` value for the given operator/OS combination. Only the File Name
+// field has more than one wire value (see `resolveFileNameFieldForOs`); every other field is
+// left untouched here.
+function resolveFieldForOperator(
+  field: BlocklistConditionEntryField,
+  operator: ListOperatorTypeEnum,
+  os: OperatingSystem
+): BlocklistConditionEntryField {
+  if (!FILE_NAME_FIELDS.has(field)) {
+    return field;
+  }
+
+  return operator === ListOperatorTypeEnum.WILDCARD ? resolveFileNameFieldForOs(os) : 'file.name';
+}
+
+// The field dropdown only ever registers the canonical (cased) field value for a given
+// conceptual field, so the currently selected wire value must be normalized to match.
+function toDisplayField(field: BlocklistConditionEntryField): BlocklistConditionEntryField {
+  return field === 'file.name.caseless' ? 'file.name' : field;
+}
+
+type ERROR_KEYS = keyof typeof ERRORS;
+
+type ItemValidationNodes = {
+  [K in ERROR_KEYS]?: React.ReactNode;
+};
+
+interface ItemValidation {
+  name: ItemValidationNodes;
+  value: ItemValidationNodes;
+}
+
+function createValidationMessage(message: string): React.ReactNode {
+  return <div>{message}</div>;
+}
+
+function getDropdownDisplay(field: BlocklistConditionEntryField): React.ReactNode {
+  return (
+    <>
+      {CONDITION_FIELD_TITLE[field]}
+      <EuiText size="xs" color="subdued">
+        {CONDITION_FIELD_DESCRIPTION[field]}
+      </EuiText>
+    </>
+  );
+}
+
+function isValid(itemValidation: ItemValidation): boolean {
+  return !Object.values(itemValidation).some((errors) => Object.keys(errors).length);
+}
+
+// eslint-disable-next-line react/display-name
+export const BlockListForm = memo<ArtifactFormComponentProps>(
+  ({ item, onChange, mode, error: submitError }) => {
+    const [nameVisited, setNameVisited] = useState(false);
+    const [valueVisited, setValueVisited] = useState({ value: false }); // Use object to trigger re-render
+    const warningsRef = useRef<ItemValidation>({ name: {}, value: {} });
+    const errorsRef = useRef<ItemValidation>({ name: {}, value: {} });
+    const [hasFormChanged, setHasFormChanged] = useState(false);
+    const showAssignmentSection = useCanAssignArtifactPerPolicy(item, mode, hasFormChanged);
+    const getTestId = useTestIdGenerator(testIdPrefix);
+
+    const blocklistEntry = useMemo((): BlocklistEntry => {
+      if (!item.entries.length) {
+        return {
+          field: 'file.hash.*',
+          operator: ListOperatorEnum.INCLUDED,
+          type: ListOperatorTypeEnum.MATCH_ANY,
+          value: [],
+        };
+      }
+      return item.entries[0] as BlocklistEntry;
+    }, [item.entries]);
+
+    const windowsSignatureField = 'file.Ext.code_signature';
+    const isWindowsSignatureEntry = blocklistEntry.field === windowsSignatureField;
+    const isWildcardEligibleField = WILDCARD_ELIGIBLE_FIELDS.has(blocklistEntry.field);
+    const displaySingleValueInput =
+      (isWindowsSignatureEntry && blocklistEntry.type === ListOperatorTypeEnum.MATCH) ||
+      blocklistEntry.type === ListOperatorTypeEnum.WILDCARD;
+
+    const selectedOs = useMemo((): OperatingSystem => {
+      if (!item?.os_types?.length) {
+        return OperatingSystem.WINDOWS;
+      }
+
+      return item.os_types[0] as OperatingSystem;
+    }, [item?.os_types]);
+
+    const selectedValues = useMemo(() => {
+      if (Array.isArray(blocklistEntry.value)) {
+        return blocklistEntry.value.map((label) => ({
+          label,
+          'data-test-subj': getTestId(`values-input-${label}`),
+        }));
+      } else {
+        return [
+          {
+            label: blocklistEntry.value,
+            'data-test-subj': getTestId(`values-input-${blocklistEntry.value}`),
+          },
+        ];
+      }
+    }, [blocklistEntry.value, getTestId]);
+
+    const osOptions: Array<EuiSuperSelectOption<OperatingSystem>> = useMemo(
+      () =>
+        [OperatingSystem.LINUX, OperatingSystem.MAC, OperatingSystem.WINDOWS].map((os) => ({
+          value: os,
+          inputDisplay: OS_TITLES[os],
+        })),
+      []
+    );
+
+    const fieldOptions: Array<EuiSuperSelectOption<BlocklistConditionEntryField>> = useMemo(() => {
+      const selectableFields: Array<EuiSuperSelectOption<BlocklistConditionEntryField>> = [];
+
+      selectableFields.push({
+        value: 'file.hash.*',
+        inputDisplay: CONDITION_FIELD_TITLE['file.hash.*'],
+        dropdownDisplay: getDropdownDisplay('file.hash.*'),
+        'data-test-subj': getTestId('file.hash.*'),
+      });
+
+      if (selectedOs === OperatingSystem.LINUX) {
+        selectableFields.push({
+          value: 'file.name',
+          inputDisplay: CONDITION_FIELD_TITLE['file.name'],
+          dropdownDisplay: getDropdownDisplay('file.name'),
+          'data-test-subj': getTestId('file.name'),
+        });
+
+        selectableFields.push({
+          value: 'file.path',
+          inputDisplay: CONDITION_FIELD_TITLE['file.path'],
+          dropdownDisplay: getDropdownDisplay('file.path'),
+          'data-test-subj': getTestId('file.path'),
+        });
+      } else {
+        selectableFields.push({
+          value: 'file.name',
+          inputDisplay: CONDITION_FIELD_TITLE['file.name.caseless'],
+          dropdownDisplay: getDropdownDisplay('file.name.caseless'),
+          'data-test-subj': getTestId('file.name.caseless'),
+        });
+
+        selectableFields.push({
+          value: 'file.path.caseless',
+          inputDisplay: CONDITION_FIELD_TITLE['file.path.caseless'],
+          dropdownDisplay: getDropdownDisplay('file.path.caseless'),
+          'data-test-subj': getTestId('file.path.caseless'),
+        });
+      }
+
+      if (selectedOs === OperatingSystem.WINDOWS) {
+        selectableFields.push({
+          value: windowsSignatureField,
+          inputDisplay: CONDITION_FIELD_TITLE[windowsSignatureField],
+          dropdownDisplay: getDropdownDisplay(windowsSignatureField),
+          'data-test-subj': getTestId(windowsSignatureField),
+        });
+      }
+
+      return selectableFields;
+    }, [selectedOs, getTestId]);
+
+    const operatorOptions: Array<EuiSuperSelectOption<ListOperatorTypeEnum>> = useMemo(() => {
+      const isOneOfOption = {
+        value: isOneOfOperator.type,
+        inputDisplay: isOneOfOperator.message,
+        dropdownDisplay: isOneOfOperator.message,
+      };
+
+      // Path and File Name support `is one of` + the new `Match` (wildcard) operator.
+      // Signer (the only other field with a selectable operator) keeps `is one of` + `is`.
+      if (isWildcardEligibleField) {
+        return [
+          isOneOfOption,
+          {
+            value: matchesOperator.type,
+            inputDisplay: MATCHES_OPERATOR_LABEL,
+            dropdownDisplay: MATCHES_OPERATOR_LABEL,
+          },
+        ];
+      }
+
+      return [
+        isOneOfOption,
+        {
+          value: isOperator.type,
+          inputDisplay: isOperator.message,
+          dropdownDisplay: isOperator.message,
+        },
+      ];
+    }, [isWildcardEligibleField]);
+
+    const valueLabel = useMemo(() => {
+      return (
+        <div>
+          {VALUE_LABEL}&nbsp;
+          <EuiIconTip
+            color="subdued"
+            type="info"
+            className="eui-alignTop"
+            iconProps={{
+              className: 'eui-alignTop',
+            }}
+            content={displaySingleValueInput ? SINGLE_VALUE_LABEL_HELPER : VALUE_LABEL_HELPER}
+          />
+        </div>
+      );
+    }, [displaySingleValueInput]);
+
+    const validateValues = useCallback(
+      (nextItem: ArtifactFormComponentProps['item'], cleanState = false) => {
+        const os = ((nextItem.os_types ?? [])[0] as OperatingSystem) ?? OperatingSystem.WINDOWS;
+        const {
+          field = 'file.hash.*',
+          type = ListOperatorTypeEnum.MATCH_ANY,
+          value = [],
+        } = (nextItem.entries[0] ?? {}) as BlocklistEntry;
+
+        // value can be a string when isOperator is selected
+        const values = Array.isArray(value) ? value : [value].filter(Boolean);
+
+        const newValueWarnings: ItemValidationNodes = cleanState
+          ? {}
+          : { ...warningsRef.current.value };
+        const newNameErrors: ItemValidationNodes = cleanState ? {} : { ...errorsRef.current.name };
+        const newValueErrors: ItemValidationNodes = cleanState
+          ? {}
+          : { ...errorsRef.current.value };
+
+        // error if name empty
+        if (!nextItem.name.trim()) {
+          newNameErrors.NAME_REQUIRED = createValidationMessage(ERRORS.NAME_REQUIRED);
+        } else {
+          delete newNameErrors.NAME_REQUIRED;
+        }
+
+        // error if no values
+        if (!values.length) {
+          newValueErrors.VALUE_REQUIRED = createValidationMessage(ERRORS.VALUE_REQUIRED);
+        } else {
+          delete newValueErrors.VALUE_REQUIRED;
+        }
+
+        // error if invalid hash
+        if (field === 'file.hash.*' && values.some((v) => !isValidHash(v))) {
+          newValueErrors.INVALID_HASH = createValidationMessage(ERRORS.INVALID_HASH);
+        } else {
+          delete newValueErrors.INVALID_HASH;
+        }
+
+        const isInvalidPath = values.some((v) => !isPathValid({ os, field, type, value: v }));
+        // warn if invalid path
+        if (field !== 'file.hash.*' && isInvalidPath) {
+          newValueWarnings.INVALID_PATH = createValidationMessage(ERRORS.INVALID_PATH);
+        } else {
+          delete newValueWarnings.INVALID_PATH;
+        }
+
+        const hasWildcardCharacter = values.some((v) => !!validateWildcardInput(v));
+
+        // warn if a wildcard character is used without the Match operator, making the entry ineffective
+        if (
+          type !== ListOperatorTypeEnum.WILDCARD &&
+          hasWildcardCharacter &&
+          WILDCARD_ELIGIBLE_FIELDS.has(field)
+        ) {
+          newValueWarnings.WILDCARD_WRONG_OPERATOR = createValidationMessage(
+            ERRORS.WILDCARD_WRONG_OPERATOR
+          );
+        } else {
+          delete newValueWarnings.WILDCARD_WRONG_OPERATOR;
+        }
+
+        // warn about the performance impact of using a wildcard value with the Match operator
+        if (type === ListOperatorTypeEnum.WILDCARD && hasWildcardCharacter) {
+          newValueWarnings.WILDCARD_PRESENT = createValidationMessage(ERRORS.WILDCARD_PRESENT);
+        } else {
+          delete newValueWarnings.WILDCARD_PRESENT;
+        }
+
+        // warn if the wildcard value is unnecessarily escaped (Endpoint matching doesn't require it)
+        if (
+          type === ListOperatorTypeEnum.WILDCARD &&
+          hasEntryEscaping(nextItem.entries[0], nextItem.os_types)
+        ) {
+          newValueWarnings.UNNECESSARY_ESCAPING = createValidationMessage(
+            ERRORS.UNNECESSARY_ESCAPING
+          );
+        } else {
+          delete newValueWarnings.UNNECESSARY_ESCAPING;
+        }
+
+        // warn if duplicates
+        if (values.length !== uniq(values).length) {
+          newValueWarnings.DUPLICATE_VALUES = createValidationMessage(ERRORS.DUPLICATE_VALUES);
+        } else {
+          delete newValueWarnings.DUPLICATE_VALUES;
+        }
+
+        warningsRef.current = { ...warningsRef.current, value: newValueWarnings };
+        errorsRef.current = { name: newNameErrors, value: newValueErrors };
+      },
+      []
+    );
+
+    const handleOnNameBlur = useCallback(() => {
+      validateValues(item);
+      setNameVisited(true);
+    }, [item, validateValues]);
+
+    const handleOnValueBlur = useCallback(() => {
+      validateValues(item);
+      setValueVisited({ value: true });
+    }, [item, validateValues]);
+
+    const handleOnNameChange = useCallback(
+      (event: React.ChangeEvent<HTMLInputElement>) => {
+        const nextItem = {
+          ...item,
+          name: event.target.value,
+        };
+
+        validateValues(nextItem);
+        onChange({
+          isValid: isValid(errorsRef.current),
+          item: nextItem,
+        });
+        setHasFormChanged(true);
+      },
+      [validateValues, onChange, item]
+    );
+
+    const handleOnDescriptionChange = useCallback(
+      (event: React.ChangeEvent<HTMLTextAreaElement>) => {
+        const nextItem = {
+          ...item,
+          description: event.target.value,
+        };
+        validateValues(nextItem);
+
+        onChange({
+          isValid: isValid(errorsRef.current),
+          item: nextItem,
+        });
+        setHasFormChanged(true);
+      },
+      [onChange, item, validateValues]
+    );
+
+    const handleOnOsChange = useCallback(
+      (os: OperatingSystem) => {
+        const nextField =
+          os !== OperatingSystem.WINDOWS && isWindowsSignatureEntry
+            ? 'file.hash.*'
+            : blocklistEntry.field;
+
+        const nextItem = {
+          ...item,
+          os_types: [os],
+          entries: [
+            {
+              ...blocklistEntry,
+              // OS changes always reset the operator to `is one of`, so the field must be
+              // re-resolved for the new OS too (relevant for the File Name field only).
+              field: resolveFieldForOperator(nextField, ListOperatorTypeEnum.MATCH_ANY, os),
+              type: ListOperatorTypeEnum.MATCH_ANY,
+              ...(typeof blocklistEntry.value === 'string'
+                ? { value: blocklistEntry.value.length ? blocklistEntry.value.split(',') : [] }
+                : {}),
+            },
+          ],
+        } as ArtifactFormComponentProps['item'];
+
+        validateValues(nextItem);
+        onChange({
+          isValid: isValid(errorsRef.current),
+          item: nextItem,
+        });
+        setHasFormChanged(true);
+      },
+      [item, blocklistEntry, isWindowsSignatureEntry, validateValues, onChange]
+    );
+
+    const handleOnFieldChange = useCallback(
+      (field: BlocklistConditionEntryField) => {
+        const nextItem = {
+          ...item,
+          entries: [
+            {
+              ...blocklistEntry,
+              field,
+              type: ListOperatorTypeEnum.MATCH_ANY,
+              ...(typeof blocklistEntry.value === 'string'
+                ? { value: blocklistEntry.value.length ? blocklistEntry.value.split(',') : [] }
+                : {}),
+            },
+          ],
+        } as ArtifactFormComponentProps['item'];
+
+        validateValues(nextItem);
+        onChange({
+          isValid: isValid(errorsRef.current),
+          item: nextItem,
+        });
+        setHasFormChanged(true);
+      },
+      [validateValues, onChange, item, blocklistEntry]
+    );
+
+    const generateBlocklistEntryValue = useCallback(
+      (value: string | string[], newOperator: ListOperatorTypeEnum) => {
+        if (
+          newOperator === ListOperatorTypeEnum.MATCH ||
+          newOperator === ListOperatorTypeEnum.WILDCARD
+        ) {
+          return { value: Array.isArray(value) ? value.join(',') : value };
+        } else {
+          return {
+            value: (typeof value === 'string' ? value.split(',') : value).filter(Boolean),
+          };
+        }
+      },
+      []
+    );
+
+    const handleOperatorUpdate = useCallback(
+      (newOperator: ListOperatorTypeEnum) => {
+        const nextItem = {
+          ...item,
+          entries: [
+            {
+              ...blocklistEntry,
+              field: resolveFieldForOperator(blocklistEntry.field, newOperator, selectedOs),
+              type: newOperator,
+              ...generateBlocklistEntryValue(blocklistEntry.value, newOperator),
+            },
+          ],
+        } as ArtifactFormComponentProps['item'];
+
+        validateValues(nextItem);
+
+        onChange({
+          isValid: isValid(errorsRef.current),
+          // Type ListOperatorTypeEnum is not assignable to type "wildcard"
+          item: nextItem as ArtifactFormComponentOnChangeCallbackProps['item'],
+        });
+      },
+      [item, blocklistEntry, selectedOs, generateBlocklistEntryValue, validateValues, onChange]
+    );
+
+    const handleOnValueTextChange = useCallback(
+      (value: string) => {
+        const nextWarnings = { ...warningsRef.current.value };
+
+        if (blocklistEntry.value.includes(value)) {
+          nextWarnings.DUPLICATE_VALUE = createValidationMessage(ERRORS.DUPLICATE_VALUE);
+        } else {
+          delete nextWarnings.DUPLICATE_VALUE;
+        }
+
+        warningsRef.current = {
+          ...warningsRef.current,
+          value: nextWarnings,
+        };
+
+        // trigger re-render without modifying item
+        setValueVisited((prevState) => ({ ...prevState }));
+      },
+      [blocklistEntry]
+    );
+
+    const handleSingleValueUpdate = useCallback(
+      (event: React.ChangeEvent<HTMLInputElement>) => {
+        const nextItem = {
+          ...item,
+          entries: [{ ...blocklistEntry, value: event.target.value }],
+        } as ArtifactFormComponentProps['item'];
+
+        validateValues(nextItem);
+
+        onChange({
+          isValid: isValid(errorsRef.current),
+          item: nextItem,
+        });
+        setHasFormChanged(true);
+      },
+      [item, blocklistEntry, validateValues, onChange]
+    );
+
+    // only triggered on remove / clear
+    const handleOnValueChange = useCallback(
+      (change: Array<EuiComboBoxOptionOption<string>>) => {
+        const value = change.map((option) => option.label);
+        const nextItem = {
+          ...item,
+          entries: [{ ...blocklistEntry, value }],
+        } as ArtifactFormComponentProps['item'];
+
+        validateValues(nextItem, true);
+        onChange({
+          isValid: isValid(errorsRef.current),
+          item: nextItem,
+        });
+        setHasFormChanged(true);
+      },
+      [validateValues, onChange, item, blocklistEntry]
+    );
+
+    const handleOnValueAdd = useCallback(
+      (option: string) => {
+        const splitValues = option.split(',').filter((value) => value.trim());
+        const value = [...blocklistEntry.value, ...splitValues];
+
+        const nextItem = {
+          ...item,
+          entries: [{ ...blocklistEntry, value }],
+        };
+
+        validateValues(nextItem as ArtifactFormComponentProps['item']);
+        nextItem.entries[0].value = uniq(nextItem.entries[0].value);
+
+        setValueVisited({ value: true });
+        onChange({
+          isValid: isValid(errorsRef.current),
+          item: nextItem as ArtifactFormComponentProps['item'],
+        });
+        setHasFormChanged(true);
+      },
+      [validateValues, onChange, item, blocklistEntry]
+    );
+
+    const handleEffectedPolicyOnChange: EffectedPolicySelectProps['onChange'] = useCallback(
+      (updatedItem) => {
+        validateValues(updatedItem);
+        onChange({
+          isValid: isValid(errorsRef.current),
+          item: updatedItem,
+        });
+        setHasFormChanged(true);
+      },
+      [onChange, validateValues]
+    );
+
+    return (
+      <EuiForm
+        component="div"
+        error={
+          submitError ? (
+            <FormattedError error={submitError} data-test-subj={getTestId('submitError')} />
+          ) : undefined
+        }
+        isInvalid={!!submitError}
+      >
+        <EuiTitle size="xs">
+          <h3>{DETAILS_HEADER}</h3>
+        </EuiTitle>
+        <EuiSpacer size="xs" />
+        {mode === 'create' && (
+          <EuiText size="s" data-test-subj={getTestId('header-description')}>
+            <p>{DETAILS_HEADER_DESCRIPTION}</p>
+          </EuiText>
+        )}
+        <EuiSpacer size="m" />
+
+        <EuiFormRow
+          label={NAME_LABEL}
+          isInvalid={nameVisited && !!Object.keys(errorsRef.current.name).length}
+          error={Object.values(errorsRef.current.name)}
+          fullWidth
+        >
+          <EuiFieldText
+            isInvalid={nameVisited && !!Object.keys(errorsRef.current.name).length}
+            name="name"
+            value={item.name}
+            onChange={handleOnNameChange}
+            onBlur={handleOnNameBlur}
+            required={nameVisited}
+            maxLength={256}
+            data-test-subj={getTestId('name-input')}
+            fullWidth
+          />
+        </EuiFormRow>
+        <EuiFormRow label={DESCRIPTION_LABEL} fullWidth>
+          <EuiTextArea
+            name="description"
+            value={item.description}
+            onChange={handleOnDescriptionChange}
+            data-test-subj={getTestId('description-input')}
+            fullWidth
+            compressed
+            maxLength={256}
+          />
+        </EuiFormRow>
+        <EuiHorizontalRule />
+        <EuiTitle size="xs">
+          <h3>{CONDITIONS_HEADER}</h3>
+        </EuiTitle>
+        <EuiSpacer size="xs" />
+        <EuiText size="s">
+          <p>{CONDITIONS_HEADER_DESCRIPTION}</p>
+        </EuiText>
+        <EuiSpacer size="m" />
+
+        <EuiFormRow label={SELECT_OS_LABEL} fullWidth>
+          <EuiSuperSelect
+            name="os"
+            options={osOptions}
+            valueOfSelected={selectedOs}
+            onChange={handleOnOsChange}
+            data-test-subj={getTestId('os-select')}
+            fullWidth
+          />
+        </EuiFormRow>
+        <EuiSpacer size="m" />
+
+        <EuiFormRow fullWidth>
+          <EuiFlexGroup gutterSize="s">
+            <EuiFlexItem grow={1}>
+              <EuiFormRow label={FIELD_LABEL} fullWidth>
+                <EuiSuperSelect
+                  name="field"
+                  options={fieldOptions}
+                  valueOfSelected={toDisplayField(blocklistEntry.field)}
+                  onChange={handleOnFieldChange}
+                  data-test-subj={getTestId('field-select')}
+                  fullWidth
+                />
+              </EuiFormRow>
+            </EuiFlexItem>
+            <EuiFlexItem grow={1}>
+              <EuiFormRow label={OPERATOR_LABEL} fullWidth>
+                {isWindowsSignatureEntry || isWildcardEligibleField ? (
+                  <EuiSuperSelect
+                    name="operator"
+                    options={operatorOptions}
+                    valueOfSelected={blocklistEntry.type}
+                    onChange={handleOperatorUpdate}
+                    data-test-subj={getTestId('operator-select-multi')}
+                    fullWidth
+                  />
+                ) : (
+                  <EuiFieldText
+                    name="operator"
+                    value={isOneOfOperator.message}
+                    data-test-subj={getTestId('operator-select-single')}
+                    readOnly
+                  />
+                )}
+              </EuiFormRow>
+            </EuiFlexItem>
+            <EuiFlexItem grow={2} />
+          </EuiFlexGroup>
+        </EuiFormRow>
+        <EuiFormRow
+          label={valueLabel}
+          isInvalid={valueVisited.value && !!Object.keys(errorsRef.current.value).length}
+          helpText={Object.values(warningsRef.current.value)}
+          error={Object.values(errorsRef.current.value)}
+          fullWidth
+        >
+          {displaySingleValueInput ? (
+            <EuiFieldText
+              name="value"
+              value={blocklistEntry.value as string}
+              fullWidth
+              isInvalid={valueVisited.value && !!Object.keys(errorsRef.current.value).length}
+              onChange={handleSingleValueUpdate}
+              onBlur={handleOnValueBlur}
+              data-test-subj={getTestId('value-input')}
+            />
+          ) : (
+            <EuiComboBox
+              selectedOptions={selectedValues}
+              isInvalid={valueVisited.value && !!Object.keys(errorsRef.current.value).length}
+              onBlur={handleOnValueBlur}
+              onSearchChange={handleOnValueTextChange}
+              onChange={handleOnValueChange}
+              onCreateOption={handleOnValueAdd}
+              data-test-subj={getTestId('values-input')}
+              fullWidth
+              noSuggestions
+            />
+          )}
+        </EuiFormRow>
+
+        {showAssignmentSection && (
+          <>
+            <EuiHorizontalRule />
+            <EuiFormRow fullWidth>
+              <EffectedPolicySelect
+                item={item}
+                onChange={handleEffectedPolicyOnChange}
+                description={POLICY_SELECT_DESCRIPTION}
+                data-test-subj={getTestId('effectedPolicies')}
+              />
+            </EuiFormRow>
+          </>
+        )}
+      </EuiForm>
+    );
+  }
+);

@@ -1,0 +1,9 @@
+{
+  "type": "shared-common",
+  "id": "@kbn/deeplinks-fleet",
+  "owner": [
+    "@elastic/streams-ui"
+  ],
+  "group": "platform",
+  "visibility": "shared"
+}

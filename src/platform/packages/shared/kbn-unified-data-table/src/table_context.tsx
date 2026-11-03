@@ -1,0 +1,43 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+import React from 'react';
+import type { DataView } from '@kbn/data-views-plugin/public';
+import type { DataTableRecord } from '@kbn/discover-utils/types';
+import type { DocViewFilterFn } from '@kbn/unified-doc-viewer/types';
+import type { DataSource } from '@kbn/data-source';
+import type {
+  DocumentsDisplayMode,
+  UnifiedDataTableOpenInNewTab,
+  UnifiedDataTableQueryContext,
+  ValueToStringConverter,
+} from './types';
+import type { UseSelectedDocsState } from './hooks/use_selected_docs';
+
+export interface DataTableContext {
+  expanded?: DataTableRecord | undefined;
+  setExpanded?: (hit?: DataTableRecord) => void;
+  getRowByIndex: (index: number) => DataTableRecord | undefined;
+  onFilter?: DocViewFilterFn;
+  onOpenInNewTab?: UnifiedDataTableOpenInNewTab;
+  queryContext?: UnifiedDataTableQueryContext;
+  hideFilteringOnComputedColumns?: boolean;
+  dataView: DataView;
+  selectedDocsState: UseSelectedDocsState;
+  valueToStringConverter: ValueToStringConverter;
+  componentsTourSteps?: Record<string, string>;
+  dataSource?: DataSource;
+  documentsDisplayMode?: DocumentsDisplayMode;
+  pageIndex: number | undefined; // undefined when the pagination is disabled
+  pageSize: number | undefined;
+}
+
+const defaultContext = {} as unknown as DataTableContext;
+
+export const UnifiedDataTableContext = React.createContext<DataTableContext>(defaultContext);

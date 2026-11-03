@@ -1,0 +1,133 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+import Url from 'url';
+import expect from '@kbn/expect';
+import type { AppUpdatableFields } from '@kbn/core-application-browser';
+import { AppStatus } from '@kbn/core-application-browser';
+import type { PluginFunctionalProviderContext } from '../../services';
+import '@kbn/core-app-status-plugin/public/types';
+
+export default function ({ getService, getPageObjects }: PluginFunctionalProviderContext) {
+  const PageObjects = getPageObjects(['common']);
+  const browser = getService('browser');
+  const appsMenu = getService('appsMenu');
+  const retry = getService('retry');
+  const testSubjects = getService('testSubjects');
+  const config = getService('config');
+
+  const getKibanaUrl = (pathname?: string, search?: string) =>
+    Url.format({
+      protocol: config.get('servers.kibana.protocol'),
+      hostname: config.get('servers.kibana.hostname'),
+      port: config.get('servers.kibana.port'),
+      pathname,
+      search,
+    });
+
+  const setAppStatus = async (s: Partial<AppUpdatableFields>) => {
+    return browser.executeAsync(async (status, cb) => {
+      window._coreAppStatus.setAppStatus(status);
+      cb();
+    }, s);
+  };
+
+  const navigateToApp = async (id: string) => {
+    return await browser.executeAsync(async (appId, cb) => {
+      await window._coreAppStatus.navigateToApp(appId);
+      cb();
+    }, id);
+  };
+
+  describe('application status management', () => {
+    beforeEach(async () => {
+      await PageObjects.common.navigateToApp('app_status_start');
+    });
+
+    it('can change the visibleIn array at runtime', async () => {
+      await setAppStatus({
+        visibleIn: ['classicSideNav', 'projectSideNav'],
+      });
+      let link = await appsMenu.getLink('App Status');
+      expect(link).not.to.eql(undefined);
+
+      await setAppStatus({
+        visibleIn: [],
+      });
+      link = await appsMenu.getLink('App Status');
+      expect(link).to.eql(undefined);
+    });
+
+    it('shows an error when navigating to an inaccessible app', async () => {
+      await setAppStatus({
+        status: AppStatus.inaccessible,
+      });
+
+      await navigateToApp('app_status');
+
+      await testSubjects.existOrFail('appNotFoundPageContent', { timeout: 5000 });
+      expect(await testSubjects.exists('appStatusApp')).to.eql(false);
+    });
+
+    it('allows to navigate to an accessible app', async () => {
+      await setAppStatus({
+        status: AppStatus.accessible,
+      });
+
+      await navigateToApp('app_status');
+
+      await testSubjects.existOrFail('appStatusApp', { timeout: 5000 });
+      expect(await testSubjects.exists('appNotFoundPageContent')).to.eql(false);
+    });
+
+    it('allows to change the defaultPath of an application', async () => {
+      const link = await appsMenu.getLink('App Status');
+      expect(link!.href).to.eql(getKibanaUrl('/app/app_status'));
+
+      await setAppStatus({
+        defaultPath: '/arbitrary/path',
+      });
+
+      await retry.waitFor('link url updated with "defaultPath"', async () => {
+        const updatedLink = await appsMenu.getLink('App Status');
+        return updatedLink?.href === getKibanaUrl('/app/app_status/arbitrary/path');
+      });
+
+      await navigateToApp('app_status');
+      await testSubjects.existOrFail('appStatusApp', { timeout: 5000 });
+      const currentUrl = await browser.getCurrentUrl();
+      expect(Url.parse(currentUrl).pathname).to.eql('/app/app_status/arbitrary/path');
+    });
+
+    it('can change the state of the currently mounted app', async () => {
+      await setAppStatus({
+        status: AppStatus.accessible,
+      });
+
+      await navigateToApp('app_status');
+
+      await testSubjects.existOrFail('appStatusApp', { timeout: 5000 });
+      expect(await testSubjects.exists('appNotFoundPageContent')).to.eql(false);
+
+      await setAppStatus({
+        status: AppStatus.inaccessible,
+      });
+
+      await testSubjects.existOrFail('appNotFoundPageContent', { timeout: 5000 });
+      expect(await testSubjects.exists('appStatusApp')).to.eql(false);
+
+      await setAppStatus({
+        status: AppStatus.accessible,
+      });
+
+      await testSubjects.existOrFail('appStatusApp', { timeout: 5000 });
+      expect(await testSubjects.exists('appNotFoundPageContent')).to.eql(false);
+    });
+  });
+}

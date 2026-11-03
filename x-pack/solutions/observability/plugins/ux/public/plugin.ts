@@ -1,0 +1,272 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import type { ComponentType } from 'react';
+import { BehaviorSubject, combineLatest, from, map } from 'rxjs';
+import { i18n } from '@kbn/i18n';
+import type {
+  FetchDataParams,
+  HasDataParams,
+  ObservabilityPublicSetup,
+  ObservabilityPublicStart,
+} from '@kbn/observability-plugin/public';
+import type {
+  AppMountParameters,
+  AppUpdater,
+  CoreSetup,
+  CoreStart,
+  Plugin,
+  PluginInitializerContext,
+} from '@kbn/core/public';
+import { DEFAULT_APP_CATEGORIES } from '@kbn/core/public';
+import type { DataPublicPluginSetup, DataPublicPluginStart } from '@kbn/data-plugin/public';
+import type { HomePublicPluginSetup } from '@kbn/home-plugin/public';
+
+import type { FeaturesPluginSetup } from '@kbn/features-plugin/public';
+import type { LicensingPluginSetup } from '@kbn/licensing-plugin/public';
+import type { EmbeddableStart } from '@kbn/embeddable-plugin/public';
+import type {
+  ExploratoryViewPublicSetup,
+  ExploratoryViewPublicStart,
+} from '@kbn/exploratory-view-plugin/public';
+import type { MapsStartApi } from '@kbn/maps-plugin/public';
+import type { Start as InspectorPluginStart } from '@kbn/inspector-plugin/public';
+import type { DataViewsPublicPluginStart } from '@kbn/data-views-plugin/public';
+import type { LensPublicStart } from '@kbn/lens-plugin/public';
+import type {
+  ObservabilitySharedPluginSetup,
+  ObservabilitySharedPluginStart,
+} from '@kbn/observability-shared-plugin/public';
+import type {
+  ObservabilityAIAssistantPublicSetup,
+  ObservabilityAIAssistantPublicStart,
+} from '@kbn/observability-ai-assistant-plugin/public';
+import { OBLT_UX_APP_ID } from '@kbn/deeplinks-observability';
+import type { SpacesPluginStart } from '@kbn/spaces-plugin/public';
+import type { ClassicRumDashboardProps } from './components/classic_rum_dashboard/types';
+
+export type UxPluginSetup = void;
+
+export interface UxPluginStart {
+  /** Loads the Classic RUM dashboard, which renders one service inside another app. */
+  getClassicRumDashboard(): Promise<ComponentType<ClassicRumDashboardProps>>;
+  /** Names of the services with RUM data in the range, in epoch milliseconds. */
+  fetchClassicRumApplications(params: {
+    start: number;
+    end: number;
+    signal?: AbortSignal;
+  }): Promise<string[]>;
+  /** Hides User Experience from the navigation; the app stays reachable by URL. */
+  hideLegacyNavigation(): void;
+}
+
+export interface ApmPluginSetupDeps {
+  data: DataPublicPluginSetup;
+  exploratoryView: ExploratoryViewPublicSetup;
+  features: FeaturesPluginSetup;
+  home?: HomePublicPluginSetup;
+  licensing: LicensingPluginSetup;
+  observability: ObservabilityPublicSetup;
+  observabilityShared: ObservabilitySharedPluginSetup;
+  observabilityAIAssistant?: ObservabilityAIAssistantPublicSetup;
+}
+
+export interface ApmPluginStartDeps {
+  data: DataPublicPluginStart;
+  home: void;
+  licensing: void;
+  embeddable: EmbeddableStart;
+  maps?: MapsStartApi;
+  inspector: InspectorPluginStart;
+  observability: ObservabilityPublicStart;
+  observabilityShared: ObservabilitySharedPluginStart;
+  observabilityAIAssistant?: ObservabilityAIAssistantPublicStart;
+  exploratoryView: ExploratoryViewPublicStart;
+  dataViews: DataViewsPublicPluginStart;
+  lens: LensPublicStart;
+  spaces?: SpacesPluginStart;
+}
+
+async function getDataStartPlugin(core: CoreSetup) {
+  const [_, startPlugins] = await core.getStartServices();
+  return (startPlugins as ApmPluginStartDeps).data;
+}
+
+export class UxPlugin implements Plugin<UxPluginSetup, UxPluginStart> {
+  private readonly legacyNavigationHidden$ = new BehaviorSubject(false);
+  private readonly appUpdater$ = new BehaviorSubject<AppUpdater>(() => ({}));
+
+  constructor(private readonly initContext: PluginInitializerContext) {}
+
+  public setup(core: CoreSetup, plugins: ApmPluginSetupDeps) {
+    const pluginSetupDeps = plugins;
+    if (plugins.observability) {
+      const getUxDataHelper = async () => {
+        const { fetchUxOverviewDate, hasRumData, createCallApmApi } = await import(
+          './components/app/rum_dashboard/ux_overview_fetchers'
+        );
+        // have to do this here as well in case app isn't mounted yet
+        createCallApmApi(core);
+
+        return { fetchUxOverviewDate, hasRumData };
+      };
+
+      plugins.observability.dashboard.register({
+        appName: OBLT_UX_APP_ID,
+        hasData: async (params?: HasDataParams) => {
+          const dataHelper = await getUxDataHelper();
+          const dataStartPlugin = await getDataStartPlugin(core);
+          return dataHelper.hasRumData({
+            ...params!,
+            dataStartPlugin,
+          });
+        },
+        fetchData: async (params: FetchDataParams) => {
+          const dataStartPlugin = await getDataStartPlugin(core);
+          const dataHelper = await getUxDataHelper();
+          return dataHelper.fetchUxOverviewDate({
+            ...params,
+            dataStartPlugin,
+          });
+        },
+      });
+
+      plugins.exploratoryView.register({
+        appName: OBLT_UX_APP_ID,
+        hasData: async (params?: HasDataParams) => {
+          const dataHelper = await getUxDataHelper();
+          const dataStartPlugin = await getDataStartPlugin(core);
+          return dataHelper.hasRumData({
+            ...params!,
+            dataStartPlugin,
+          });
+        },
+        fetchData: async (params: FetchDataParams) => {
+          const dataStartPlugin = await getDataStartPlugin(core);
+          const dataHelper = await getUxDataHelper();
+          return dataHelper.fetchUxOverviewDate({
+            ...params,
+            dataStartPlugin,
+          });
+        },
+      });
+    }
+
+    // register observability nav if user has access to plugin
+    plugins.observabilityShared.navigation.registerSections(
+      combineLatest([from(core.getStartServices()), this.legacyNavigationHidden$]).pipe(
+        map(([[coreStart], legacyNavigationHidden]) => {
+          // checking apm capability, since ux for now doesn't have it's
+          // own capability
+          if (!legacyNavigationHidden && coreStart.application.capabilities.apm.show) {
+            return [
+              // UX navigation
+              {
+                label: 'User Experience',
+                sortKey: 600,
+                entries: [
+                  {
+                    label: i18n.translate('xpack.ux.overview.heading', {
+                      defaultMessage: 'Dashboard',
+                    }),
+                    app: OBLT_UX_APP_ID,
+                    path: '/',
+                    matchFullPath: true,
+                    ignoreTrailingSlash: true,
+                  },
+                ],
+              },
+            ];
+          }
+
+          return [];
+        })
+      )
+    );
+
+    const isDev = this.initContext.env.mode.dev;
+
+    core.application.register({
+      id: OBLT_UX_APP_ID,
+      title: 'User Experience',
+      order: 8500,
+      euiIconType: 'logoObservability',
+      updater$: this.appUpdater$,
+      category: DEFAULT_APP_CATEGORIES.observability,
+      keywords: [
+        'RUM',
+        'Real User Monitoring',
+        'DEM',
+        'Digital Experience Monitoring',
+        'EUM',
+        'End User Monitoring',
+        'UX',
+        'Javascript',
+        'APM',
+        'Mobile',
+        'digital',
+        'performance',
+        'web performance',
+        'web perf',
+      ],
+      async mount(appMountParameters: AppMountParameters<unknown>) {
+        // Load application bundle and Get start service
+        const [{ renderApp }, [coreStart, corePlugins]] = await Promise.all([
+          import('./application/ux_app'),
+          core.getStartServices(),
+        ]);
+
+        const activeSpace = await (corePlugins as ApmPluginStartDeps).spaces?.getActiveSpace();
+
+        return renderApp({
+          isDev,
+          core: coreStart,
+          deps: pluginSetupDeps,
+          appMountParameters,
+          corePlugins: corePlugins as ApmPluginStartDeps,
+          spaceId: activeSpace?.id || 'default',
+        });
+      },
+    });
+  }
+
+  public start(core: CoreStart, plugins: ApmPluginStartDeps): UxPluginStart {
+    // Loaded on first use and cached, so the dashboard code stays out of the page-load bundle.
+    let classicRumDashboard: Promise<ComponentType<ClassicRumDashboardProps>> | undefined;
+
+    return {
+      getClassicRumDashboard: () => {
+        classicRumDashboard ??= Promise.all([
+          import('./components/classic_rum_dashboard/classic_rum_dashboard'),
+          plugins.spaces?.getActiveSpace(),
+        ]).then(([{ createClassicRumDashboard }, activeSpace]) =>
+          createClassicRumDashboard({
+            core,
+            startDeps: plugins,
+            isDev: this.initContext.env.mode.dev,
+            spaceId: activeSpace?.id ?? 'default',
+          })
+        );
+        // A failed download is not cached, so the next visit retries it.
+        classicRumDashboard.catch(() => {
+          classicRumDashboard = undefined;
+        });
+        return classicRumDashboard;
+      },
+      fetchClassicRumApplications: async (params) => {
+        const { fetchClassicRumApplications } = await import(
+          './services/rest/fetch_classic_rum_applications'
+        );
+        return fetchClassicRumApplications({ ...params, core, data: plugins.data });
+      },
+      hideLegacyNavigation: () => {
+        this.legacyNavigationHidden$.next(true);
+        this.appUpdater$.next(() => ({ visibleIn: [] }));
+      },
+    };
+  }
+}

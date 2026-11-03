@@ -1,0 +1,113 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import type {
+  ActionConnector as RawActionConnector,
+  ActionType,
+} from '@kbn/triggers-actions-ui-plugin/public';
+import { apiService } from '../../../../utils/api_service';
+import type {
+  DynamicSettings,
+  DynamicSettingsSaveResponse,
+  HashiCorpVaultConfig,
+  HashiCorpVaultSecrets,
+  LocationMonitorsResponse,
+  AffectedMonitorsResult,
+  SecretConnectionAffectedMonitors,
+  SecretConnectionTestResult,
+  SecretProviderType,
+} from '../../../../../common/runtime_types';
+import { SYNTHETICS_API_URLS } from '../../../../../common/constants';
+import type { LocationMonitor } from '.';
+
+interface SaveApiRequest {
+  settings: DynamicSettings;
+}
+
+export const getDynamicSettings = async (): Promise<DynamicSettings> => {
+  return await apiService.get(SYNTHETICS_API_URLS.DYNAMIC_SETTINGS, { version: '2023-10-31' });
+};
+
+export const setDynamicSettings = async ({
+  settings,
+}: SaveApiRequest): Promise<DynamicSettingsSaveResponse> => {
+  const newSettings: DynamicSettings = {
+    certAgeThreshold: settings.certAgeThreshold,
+    certExpirationThreshold: settings.certExpirationThreshold,
+    defaultConnectors: settings.defaultConnectors,
+    defaultEmail: settings.defaultEmail,
+    defaultTLSRuleEnabled: settings.defaultTLSRuleEnabled,
+    defaultStatusRuleEnabled: settings.defaultStatusRuleEnabled,
+    rebalancePrivateLocationShardsEnabled: settings.rebalancePrivateLocationShardsEnabled,
+  };
+  return await apiService.put(SYNTHETICS_API_URLS.DYNAMIC_SETTINGS, newSettings, {
+    version: '2023-10-31',
+  });
+};
+
+export const triggerMwSync = async (): Promise<void> => {
+  const url = SYNTHETICS_API_URLS.TRIGGER_TASK_RUN.replace(
+    '{taskType}',
+    'syncPrivateLocationMonitors'
+  );
+  await apiService.post(url);
+};
+
+export const fetchLocationMonitors = async (): Promise<LocationMonitor[]> => {
+  return await apiService.get<LocationMonitorsResponse>(
+    SYNTHETICS_API_URLS.PRIVATE_LOCATIONS_MONITORS
+  );
+};
+
+interface TestSecretConnectionRequest {
+  // Set when editing, so the server can fall back to the stored secret.
+  name?: string;
+  type: SecretProviderType;
+  config: HashiCorpVaultConfig;
+  secrets: HashiCorpVaultSecrets;
+}
+
+export const testSecretConnection = async (
+  request: TestSecretConnectionRequest
+): Promise<SecretConnectionTestResult> => {
+  return await apiService.post<SecretConnectionTestResult>(
+    `${SYNTHETICS_API_URLS.SECRET_CONNECTION}/_test`,
+    request
+  );
+};
+
+export const getAffectedMonitors = async (): Promise<SecretConnectionAffectedMonitors> => {
+  return await apiService.get<SecretConnectionAffectedMonitors>(
+    `${SYNTHETICS_API_URLS.SECRET_CONNECTION}/_affected_monitors`
+  );
+};
+
+export interface PreviewAffectedMonitorsRequest {
+  name: string;
+  allowedMonitorHosts: string[];
+}
+
+export const previewAffectedMonitors = async (
+  request: PreviewAffectedMonitorsRequest
+): Promise<AffectedMonitorsResult> => {
+  return await apiService.post<AffectedMonitorsResult>(
+    `${SYNTHETICS_API_URLS.SECRET_CONNECTION}/_affected_monitors`,
+    request
+  );
+};
+
+export type ActionConnector = Omit<RawActionConnector, 'secrets'>;
+
+export const fetchConnectors = async (): Promise<ActionConnector[]> => {
+  return await apiService.get(SYNTHETICS_API_URLS.GET_ACTIONS_CONNECTORS);
+};
+
+export const fetchActionTypes = async (): Promise<ActionType[]> => {
+  return await apiService.get(SYNTHETICS_API_URLS.GET_CONNECTOR_TYPES, {
+    feature_id: 'uptime',
+  });
+};

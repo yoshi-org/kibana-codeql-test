@@ -1,0 +1,48 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+import type { DataView } from '@kbn/data-views-plugin/common';
+import type { DataSource } from '@kbn/data-source';
+
+export function canPrependTimeFieldColumn(
+  columns: string[] | undefined,
+  dataView: DataView,
+  dataSource: DataSource | undefined,
+  showTimeCol: boolean // based on Advanced Settings `doc_table:hideTimeColumn`
+) {
+  const { timeFieldName } = dataView;
+
+  if (!showTimeCol || !timeFieldName) {
+    return false;
+  }
+
+  if (dataSource?.kind === 'esql') {
+    return !!columns && Boolean(dataSource.getColumn(timeFieldName));
+  }
+
+  return !dataView.fields || Boolean(dataView.getFieldByName(timeFieldName));
+}
+
+export function getVisibleColumns(
+  columns: string[],
+  dataView: DataView,
+  shouldPrependTimeFieldColumn: boolean
+) {
+  const timeFieldName = dataView.timeFieldName;
+
+  if (
+    shouldPrependTimeFieldColumn &&
+    timeFieldName &&
+    !columns.find((col) => col === timeFieldName)
+  ) {
+    return [timeFieldName, ...columns];
+  }
+
+  return columns;
+}

@@ -1,0 +1,40 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import type { UnknownAction } from 'redux';
+import type { Action, ActionCreator, AnyAction } from 'typescript-fsa';
+
+/**
+ * Infers the type of an action out of a given action type.
+ * This makes it easier to distribute the action types because they come
+ * along with the creators: `type MyAction = InferActionType<typeof myActionCreator>`.
+ *
+ * This isn't expected to be used in a lot of places - if it is, naming the individual
+ * action types might make more sense.
+ */
+export type InferActionType<X> = X extends ActionCreator<infer T> ? T : never;
+
+/**
+ * Helper to create a matcher that matches all passed in action creators.
+ *
+ * This is helpful to create a listener that matches multiple actions:
+ * `predicate: matchesOne(actionCreator1, actionCreator2)`
+ *
+ * @param actionCreators The action creators to create a unified matcher for
+ */
+export const matchesOne =
+  (...actionCreators: Array<ActionCreator<any>>) =>
+  (action: AnyAction) =>
+    actionCreators.some((actionCreator) => actionCreator.match(action));
+
+export type MatchedAction<Payload> = Action<Payload> & UnknownAction;
+
+/** Adapts a TypeScript-FSA action creator to an RTK listener type predicate. */
+export const matchesAction =
+  <Payload>(actionCreator: ActionCreator<Payload>) =>
+  (action: UnknownAction): action is MatchedAction<Payload> =>
+    actionCreator.match(action);

@@ -1,0 +1,67 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+import { z } from '@kbn/zod';
+import { queryNumber, routeId } from '../../zod_query';
+import { syntheticsMonitorSavedObjectType } from '../../../../common/types/saved_objects';
+import type { SyntheticsRestApiRouteFactory } from '../../types';
+import type { EncryptedSyntheticsMonitorAttributes } from '../../../../common/runtime_types';
+import { ConfigKey } from '../../../../common/runtime_types';
+import { SYNTHETICS_API_URLS } from '../../../../common/constants';
+import { MONITOR_SEARCH_FIELDS } from '../../common';
+
+const querySchema = z.strictObject({
+  search_after: z.string().max(4096).optional(),
+  per_page: queryNumber.optional(),
+});
+
+export const getSyntheticsProjectMonitorsRoute: SyntheticsRestApiRouteFactory = () => ({
+  method: 'GET',
+  path: SYNTHETICS_API_URLS.SYNTHETICS_MONITORS_PROJECT,
+  validate: {
+    params: z.strictObject({
+      projectName: routeId,
+    }),
+    query: querySchema,
+  },
+  handler: async (routeContext): Promise<any> => {
+    const {
+      request,
+      server: { logger },
+      monitorConfigRepository,
+    } = routeContext;
+
+    const { projectName } = request.params;
+    const { per_page: perPage = 1000, search_after: searchAfter } = request.query;
+    const decodedProjectName = decodeURI(projectName);
+    const decodedSearchAfter = searchAfter ? decodeURI(searchAfter) : undefined;
+
+    try {
+      const { saved_objects: monitors, total } =
+        await monitorConfigRepository.find<EncryptedSyntheticsMonitorAttributes>({
+          perPage,
+          searchFields: MONITOR_SEARCH_FIELDS,
+          fields: [ConfigKey.JOURNEY_ID, ConfigKey.CONFIG_HASH],
+          filter: `${syntheticsMonitorSavedObjectType}.attributes.${ConfigKey.PROJECT_ID}: "${decodedProjectName}"`,
+          sortField: ConfigKey.JOURNEY_ID,
+          sortOrder: 'asc',
+          searchAfter: decodedSearchAfter ? decodedSearchAfter.split(',') : undefined,
+        });
+      const projectMonitors = monitors.map((monitor) => ({
+        journey_id: monitor.attributes[ConfigKey.JOURNEY_ID],
+        hash: monitor.attributes[ConfigKey.CONFIG_HASH] || '',
+      }));
+
+      return {
+        total,
+        after_key: monitors.length ? monitors[monitors.length - 1].sort?.join(',') : null,
+        monitors: projectMonitors,
+      };
+    } catch (error) {
+      logger.error(`Error getting Synthetics monitors, Error: ${error.message}`, { error });
+    }
+  },
+});

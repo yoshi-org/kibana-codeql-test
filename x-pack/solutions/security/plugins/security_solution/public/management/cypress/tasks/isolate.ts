@@ -1,0 +1,128 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+/* eslint-disable cypress/no-unnecessary-waiting */
+
+import { API_VERSIONS } from '@kbn/fleet-plugin/common';
+import type { ActionDetails } from '../../../../common/endpoint/types';
+import { UNISOLATE_HOST_ROUTE_V2 } from '../../../../common/endpoint/constants';
+import { loadPage } from './common';
+import { waitForActionToSucceed } from './response_actions';
+import { goToAlertsTab } from './alerts';
+
+const API_ENDPOINT_ACTION_PATH = '/api/endpoint/action/*';
+export const interceptActionRequests = (
+  cb: (responseBody: ActionDetails) => void,
+  alias: string
+): void => {
+  cy.intercept('POST', API_ENDPOINT_ACTION_PATH, (req) => {
+    req.continue((res) => {
+      const {
+        body: { action, data },
+      } = res;
+
+      cb({ action, ...data });
+    });
+  }).as(alias);
+};
+
+export const sendActionResponse = (
+  action: ActionDetails,
+  options?: { responseCode?: string }
+): void => {
+  cy.task('sendHostActionResponse', {
+    action,
+    state: { state: 'success' },
+    responseCode: options?.responseCode,
+  });
+};
+
+export const visitRuleAlerts = (ruleName: string) => {
+  loadPage('/app/security/rules');
+  cy.contains(ruleName).click();
+  goToAlertsTab();
+};
+
+export const toggleRuleOffAndOn = (ruleName: string): void => {
+  loadPage('/app/security/rules');
+  cy.wait(2000);
+  cy.contains(ruleName)
+    .parents('tr')
+    .within(() => {
+      cy.getByTestSubj('ruleSwitch').should('have.attr', 'aria-checked', 'true');
+      cy.getByTestSubj('ruleSwitch').click();
+      cy.getByTestSubj('ruleSwitch').should('have.attr', 'aria-checked', 'false');
+      cy.getByTestSubj('ruleSwitch').click();
+      cy.getByTestSubj('ruleSwitch').should('have.attr', 'aria-checked', 'true');
+    });
+};
+
+const checkEndpointListForIsolationStatus = (expectIsolated: boolean): void => {
+  const chainer = expectIsolated ? 'contain' : 'not.contain';
+  cy.getByTestSubj('endpointListTable').within(() => {
+    cy.get('tbody tr')
+      .eq(0)
+      .within(() => {
+        cy.get('td', { timeout: 120000 }).eq(1).should(chainer, 'Isolated');
+      });
+  });
+};
+
+export const checkEndpointListForOnlyUnIsolatedHosts = (): void =>
+  checkEndpointListForIsolationStatus(false);
+
+export const isolateHostActionViaAPI = (agentId: string): void => {
+  cy.request({
+    headers: {
+      'kbn-xsrf': 'cypress-creds',
+      'elastic-api-version': API_VERSIONS.public.v1,
+    },
+    method: 'POST',
+    url: 'api/endpoint/action/isolate',
+    body: {
+      endpoint_ids: [agentId],
+    },
+  })
+    // verify action was successful
+    .then((response) => waitForActionToSucceed(response.body.data.id))
+    .then((actionResponse) => {
+      expect(actionResponse.status).to.equal('successful');
+    });
+};
+
+export const releaseHostActionViaAPI = (agentId: string): void => {
+  cy.request({
+    headers: {
+      'kbn-xsrf': 'cypress-creds',
+      'elastic-api-version': API_VERSIONS.public.v1,
+    },
+    method: 'POST',
+    url: UNISOLATE_HOST_ROUTE_V2,
+    body: {
+      endpoint_ids: [agentId],
+    },
+  })
+    // verify action was successful
+    .then((response) => waitForActionToSucceed(response.body.data.id))
+    .then((actionResponse) => {
+      expect(actionResponse.status).to.equal('successful');
+    });
+};
+
+export const checkEndpointIsolationStatus = (
+  endpointHostname: string,
+  expectIsolated: boolean
+): void => {
+  const chainer = expectIsolated ? 'contain' : 'not.contain';
+  cy.contains(endpointHostname).parents('td').siblings('td').eq(0).should(chainer, 'Isolated');
+};
+
+export const checkEndpointIsIsolated = (endpointHostname: string): void =>
+  checkEndpointIsolationStatus(endpointHostname, true);
+
+export const checkEndpointIsNotIsolated = (endpointHostname: string): void =>
+  checkEndpointIsolationStatus(endpointHostname, false);

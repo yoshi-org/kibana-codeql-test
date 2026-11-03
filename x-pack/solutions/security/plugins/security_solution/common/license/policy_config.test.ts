@@ -1,0 +1,1387 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import {
+  isEndpointPolicyValidForLicense,
+  unsetPolicyFeaturesAccordingToLicenseLevel,
+} from './policy_config';
+import {
+  DefaultPolicyNotificationMessage,
+  DefaultPolicyRuleNotificationMessage,
+  DefaultPolicyDeviceNotificationMessage,
+  policyFactory,
+  policyFactoryWithoutPaidEnterpriseFeatures,
+  policyFactoryWithoutPaidFeatures,
+  policyFactoryWithSupportedFeatures,
+} from '../endpoint/models/policy_config';
+import { licenseMock } from '@kbn/licensing-plugin/common/licensing.mock';
+import type { PolicyConfig } from '../endpoint/types';
+import { ProtectionModes } from '../endpoint/types';
+
+describe('policy_config and licenses', () => {
+  const Platinum = licenseMock.createLicense({ license: { type: 'platinum', mode: 'platinum' } });
+  const Enterprise = licenseMock.createLicense({ license: { type: 'enterprise' } });
+  const Gold = licenseMock.createLicense({ license: { type: 'gold', mode: 'gold' } });
+  const Basic = licenseMock.createLicense({ license: { type: 'basic', mode: 'basic' } });
+
+  const disableEnterpriseFeatures = (policy: PolicyConfig) => {
+    if (policy.windows.device_control) policy.windows.device_control.enabled = false;
+    if (policy.mac.device_control) policy.mac.device_control.enabled = false;
+    if (policy.windows.popup.device_control) policy.windows.popup.device_control.enabled = false;
+    if (policy.mac.popup.device_control) policy.mac.popup.device_control.enabled = false;
+    policy.windows.memory_protection.custom_yara_signatures = false;
+    policy.mac.memory_protection.custom_yara_signatures = false;
+    policy.linux.memory_protection.custom_yara_signatures = false;
+    if (policy.windows.attack_surface_reduction.registry_credential_hardening) {
+      policy.windows.attack_surface_reduction.registry_credential_hardening.enabled = false;
+    }
+  };
+
+  const omitCustomYaraSignatures = (policy: PolicyConfig) => {
+    for (const os of ['windows', 'mac', 'linux'] as const) {
+      const memoryProtection: { custom_yara_signatures?: boolean } = policy[os].memory_protection;
+      delete memoryProtection.custom_yara_signatures;
+    }
+  };
+
+  const omitRegistryCredentialHardening = (policy: PolicyConfig) => {
+    delete policy.windows.attack_surface_reduction.registry_credential_hardening;
+  };
+
+  describe('isEndpointPolicyValidForLicense', () => {
+    it('allows malware notification to be disabled with a Platinum license', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      policy.windows.popup.malware.enabled = false; // make policy change
+      const valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeTruthy();
+    });
+    it('blocks windows malware notification changes below Platinum licenses', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      policy.windows.popup.malware.enabled = false; // make policy change
+      let valid = isEndpointPolicyValidForLicense(policy, Gold);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Basic);
+      expect(valid).toBeFalsy();
+    });
+
+    it('blocks mac malware notification changes below Platinum licenses', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      policy.mac.popup.malware.enabled = false; // make policy change
+      let valid = isEndpointPolicyValidForLicense(policy, Gold);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Basic);
+      expect(valid).toBeFalsy();
+    });
+
+    it('allows malware notification message changes with a Platinum license', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      policy.windows.popup.malware.message = 'BOOM'; // make policy change
+      const valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeTruthy();
+    });
+    it('blocks windows malware notification message changes below Platinum licenses', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      policy.windows.popup.malware.message = 'BOOM'; // make policy change
+      let valid = isEndpointPolicyValidForLicense(policy, Gold);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Basic);
+      expect(valid).toBeFalsy();
+    });
+    it('blocks mac malware notification message changes below Platinum licenses', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      policy.mac.popup.malware.message = 'BOOM'; // make policy change
+      let valid = isEndpointPolicyValidForLicense(policy, Gold);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Basic);
+      expect(valid).toBeFalsy();
+    });
+
+    it('allows ransomware, memory and behavior to be turned on for Platinum licenses', () => {
+      const policy = policyFactoryWithoutPaidFeatures();
+      // ransomware protection
+      policy.windows.ransomware.mode = ProtectionModes.prevent;
+      policy.windows.ransomware.supported = true;
+      policy.mac.ransomware.mode = ProtectionModes.prevent;
+      policy.mac.ransomware.supported = true;
+      policy.linux.ransomware = { mode: ProtectionModes.prevent, supported: true };
+      // memory protection
+      policy.windows.memory_protection.mode = ProtectionModes.prevent;
+      policy.windows.memory_protection.supported = true;
+      policy.mac.memory_protection.mode = ProtectionModes.prevent;
+      policy.mac.memory_protection.supported = true;
+      policy.linux.memory_protection.mode = ProtectionModes.prevent;
+      policy.linux.memory_protection.supported = true;
+      // behavior protection
+      policy.windows.behavior_protection.mode = ProtectionModes.prevent;
+      policy.windows.behavior_protection.supported = true;
+      policy.mac.behavior_protection.mode = ProtectionModes.prevent;
+      policy.mac.behavior_protection.supported = true;
+      policy.linux.behavior_protection.mode = ProtectionModes.prevent;
+      policy.linux.behavior_protection.supported = true;
+
+      const valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeTruthy();
+    });
+
+    it('allows ransomware, memory  and behavior protection notification to be turned on with a Platinum license', () => {
+      const policy = policyFactoryWithoutPaidFeatures();
+      // ransomware protection
+      policy.windows.popup.ransomware.enabled = true;
+      policy.windows.ransomware.supported = true;
+      policy.mac.popup.ransomware.enabled = true;
+      policy.mac.ransomware.supported = true;
+      policy.linux.ransomware = { mode: ProtectionModes.off, supported: true };
+      // memory protection
+      policy.windows.popup.memory_protection.enabled = true;
+      policy.windows.memory_protection.supported = true;
+      policy.mac.popup.memory_protection.enabled = true;
+      policy.mac.memory_protection.supported = true;
+      policy.linux.popup.memory_protection.enabled = true;
+      policy.linux.memory_protection.supported = true;
+      // behavior protection
+      policy.windows.popup.behavior_protection.enabled = true;
+      policy.windows.behavior_protection.supported = true;
+      policy.mac.popup.behavior_protection.enabled = true;
+      policy.mac.behavior_protection.supported = true;
+      policy.linux.popup.behavior_protection.enabled = true;
+      policy.linux.behavior_protection.supported = true;
+      const valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeTruthy();
+    });
+
+    it('allows advanced rollback option when Platinum', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      policy.windows.advanced = { alerts: { rollback: { self_healing: { enabled: true } } } }; // make policy change
+      const valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeTruthy();
+    });
+
+    it('blocks advanced rollback option when below Platinum', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      policy.windows.advanced = { alerts: { rollback: { self_healing: { enabled: true } } } }; // make policy change
+      let valid = isEndpointPolicyValidForLicense(policy, Gold);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Basic);
+      expect(valid).toBeFalsy();
+    });
+
+    it('allows credential hardening option when Platinum', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      policy.windows.attack_surface_reduction.credential_hardening.enabled = true; // make policy change
+      const valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeTruthy();
+    });
+
+    it('blocks credential hardening option when below Platinum', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      policy.windows.attack_surface_reduction.credential_hardening.enabled = true; // make policy change
+      let valid = isEndpointPolicyValidForLicense(policy, Gold);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Basic);
+      expect(valid).toBeFalsy();
+    });
+
+    it('allows protection updates custom date with an Enterprise license', () => {
+      const policy = policyFactoryWithSupportedFeatures();
+      policy.global_manifest_version = '2022-01-10';
+      const valid = isEndpointPolicyValidForLicense(policy, Enterprise);
+      expect(valid).toBeTruthy();
+    });
+
+    it('blocks protection updates custom date for Platinum and below license', () => {
+      const policy = policyFactoryWithSupportedFeatures();
+      disableEnterpriseFeatures(policy);
+      policy.global_manifest_version = '2022-01-10';
+      [Platinum, Gold, Basic].forEach((license) => {
+        const valid = isEndpointPolicyValidForLicense(policy, license);
+        expect(valid).toBeFalsy();
+      });
+    });
+
+    describe('ransomware protection checks', () => {
+      it('blocks ransomware to be turned on for Gold and below licenses', () => {
+        const policy = policyFactoryWithoutPaidFeatures();
+        policy.windows.ransomware.mode = ProtectionModes.prevent;
+        policy.mac.ransomware.mode = ProtectionModes.prevent;
+
+        let valid = isEndpointPolicyValidForLicense(policy, Gold);
+        expect(valid).toBeFalsy();
+        valid = isEndpointPolicyValidForLicense(policy, Basic);
+        expect(valid).toBeFalsy();
+      });
+
+      it('blocks ransomware notification to be turned on for Gold and below licenses', () => {
+        const policy = policyFactoryWithoutPaidFeatures();
+        policy.windows.popup.ransomware.enabled = true;
+        policy.mac.popup.ransomware.enabled = true;
+        let valid = isEndpointPolicyValidForLicense(policy, Gold);
+        expect(valid).toBeFalsy();
+
+        valid = isEndpointPolicyValidForLicense(policy, Basic);
+        expect(valid).toBeFalsy();
+      });
+
+      it('blocks the Linux ransomware notification to be turned on for Gold and below licenses', () => {
+        const policy = policyFactoryWithoutPaidFeatures();
+        policy.linux.popup.ransomware = { message: '', enabled: true };
+
+        expect(isEndpointPolicyValidForLicense(policy, Gold)).toBeFalsy();
+        expect(isEndpointPolicyValidForLicense(policy, Basic)).toBeFalsy();
+      });
+
+      it('allows a policy without a Linux ransomware notification for Gold and below licenses', () => {
+        const policy = policyFactoryWithoutPaidFeatures();
+        delete policy.linux.popup.ransomware;
+
+        expect(isEndpointPolicyValidForLicense(policy, Gold)).toBeTruthy();
+      });
+
+      it('allows ransomware notification message changes with a Platinum license', () => {
+        const policy = policyFactory();
+        disableEnterpriseFeatures(policy);
+        policy.windows.popup.ransomware.message = 'BOOM';
+        policy.mac.popup.ransomware.message = 'BOOM';
+        const valid = isEndpointPolicyValidForLicense(policy, Platinum);
+        expect(valid).toBeTruthy();
+      });
+      it('blocks ransomware notification message changes for Gold and below licenses', () => {
+        const policy = policyFactory();
+        disableEnterpriseFeatures(policy);
+        policy.windows.popup.ransomware.message = 'BOOM';
+        policy.mac.popup.ransomware.message = 'BOOM';
+        let valid = isEndpointPolicyValidForLicense(policy, Gold);
+        expect(valid).toBeFalsy();
+
+        valid = isEndpointPolicyValidForLicense(policy, Basic);
+        expect(valid).toBeFalsy();
+      });
+
+      it('blocks Linux ransomware notification message changes for Gold and below licenses', () => {
+        const policy = policyFactoryWithoutPaidFeatures();
+        policy.linux.popup.ransomware = { message: 'BOOM', enabled: false };
+
+        expect(isEndpointPolicyValidForLicense(policy, Gold)).toBeFalsy();
+        expect(isEndpointPolicyValidForLicense(policy, Basic)).toBeFalsy();
+      });
+    });
+
+    describe('memory protection checks', () => {
+      it('blocks memory_protection to be turned on for Gold and below licenses', () => {
+        const policy = policyFactoryWithoutPaidFeatures();
+        policy.windows.memory_protection.mode = ProtectionModes.prevent;
+        policy.mac.memory_protection.mode = ProtectionModes.prevent;
+        policy.linux.memory_protection.mode = ProtectionModes.prevent;
+
+        let valid = isEndpointPolicyValidForLicense(policy, Gold);
+        expect(valid).toBeFalsy();
+        valid = isEndpointPolicyValidForLicense(policy, Basic);
+        expect(valid).toBeFalsy();
+      });
+
+      it('blocks memory_protection notification to be turned on for Gold and below licenses', () => {
+        const policy = policyFactoryWithoutPaidFeatures();
+        policy.windows.popup.memory_protection.enabled = true;
+        policy.mac.popup.memory_protection.enabled = true;
+        policy.linux.popup.memory_protection.enabled = true;
+
+        let valid = isEndpointPolicyValidForLicense(policy, Gold);
+        expect(valid).toBeFalsy();
+
+        valid = isEndpointPolicyValidForLicense(policy, Basic);
+        expect(valid).toBeFalsy();
+      });
+
+      it('allows memory_protection notification message changes with a Platinum license', () => {
+        const policy = policyFactory();
+        disableEnterpriseFeatures(policy);
+        policy.windows.popup.memory_protection.message = 'BOOM';
+        policy.mac.popup.memory_protection.message = 'BOOM';
+        policy.linux.popup.memory_protection.message = 'BOOM';
+        const valid = isEndpointPolicyValidForLicense(policy, Platinum);
+        expect(valid).toBeTruthy();
+      });
+
+      it('blocks memory_protection notification message changes for Gold and below licenses', () => {
+        const policy = policyFactory();
+        disableEnterpriseFeatures(policy);
+        policy.windows.popup.memory_protection.message = 'BOOM';
+        policy.mac.popup.memory_protection.message = 'BOOM';
+        policy.linux.popup.memory_protection.message = 'BOOM';
+        let valid = isEndpointPolicyValidForLicense(policy, Gold);
+        expect(valid).toBeFalsy();
+
+        valid = isEndpointPolicyValidForLicense(policy, Basic);
+        expect(valid).toBeFalsy();
+      });
+    });
+
+    describe('behavior protection checks', () => {
+      it('blocks behavior_protection to be turned on for Gold and below licenses', () => {
+        const policy = policyFactoryWithoutPaidFeatures();
+        policy.windows.behavior_protection.mode = ProtectionModes.prevent;
+        policy.mac.behavior_protection.mode = ProtectionModes.prevent;
+        policy.linux.behavior_protection.mode = ProtectionModes.prevent;
+
+        let valid = isEndpointPolicyValidForLicense(policy, Gold);
+        expect(valid).toBeFalsy();
+        valid = isEndpointPolicyValidForLicense(policy, Basic);
+        expect(valid).toBeFalsy();
+      });
+
+      it('blocks behavior_protection notification to be turned on for Gold and below licenses', () => {
+        const policy = policyFactoryWithoutPaidFeatures();
+        policy.windows.popup.behavior_protection.enabled = true;
+        policy.mac.popup.behavior_protection.enabled = true;
+        policy.linux.popup.behavior_protection.enabled = true;
+        let valid = isEndpointPolicyValidForLicense(policy, Gold);
+        expect(valid).toBeFalsy();
+
+        valid = isEndpointPolicyValidForLicense(policy, Basic);
+        expect(valid).toBeFalsy();
+      });
+
+      it('allows behavior_protection notification message changes with a Platinum license', () => {
+        const policy = policyFactory();
+        disableEnterpriseFeatures(policy);
+        policy.windows.popup.behavior_protection.message = 'BOOM';
+        policy.mac.popup.behavior_protection.message = 'BOOM';
+        policy.linux.popup.behavior_protection.message = 'BOOM';
+        const valid = isEndpointPolicyValidForLicense(policy, Platinum);
+        expect(valid).toBeTruthy();
+      });
+
+      it('blocks behavior_protection notification message changes for Gold and below licenses', () => {
+        const policy = policyFactory();
+        disableEnterpriseFeatures(policy);
+        policy.windows.popup.behavior_protection.message = 'BOOM';
+        policy.mac.popup.behavior_protection.message = 'BOOM';
+        policy.linux.popup.behavior_protection.message = 'BOOM';
+        let valid = isEndpointPolicyValidForLicense(policy, Gold);
+        expect(valid).toBeFalsy();
+
+        valid = isEndpointPolicyValidForLicense(policy, Basic);
+        expect(valid).toBeFalsy();
+      });
+    });
+
+    it('allows default policyConfig with Basic', () => {
+      const policy = policyFactoryWithoutPaidFeatures();
+      const valid = isEndpointPolicyValidForLicense(policy, Basic);
+      expect(valid).toBeTruthy();
+    });
+  });
+
+  describe('unsetPolicyFeaturesAccordingToLicenseLevel', () => {
+    it('does not change any malware fields with a Platinum license', () => {
+      const policy = policyFactory();
+      const popupMessage = 'WOOP WOOP';
+      policy.windows.popup.malware.message = popupMessage;
+      policy.mac.popup.malware.message = popupMessage;
+      policy.windows.popup.malware.enabled = false;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Platinum);
+      expect(retPolicy.windows.popup.malware.enabled).toBeFalsy();
+      expect(retPolicy.windows.popup.malware.message).toEqual(popupMessage);
+      expect(retPolicy.mac.popup.malware.message).toEqual(popupMessage);
+    });
+
+    it('does not change any ransomware fields with a Platinum license', () => {
+      const policy = policyFactory();
+      const popupMessage = 'WOOP WOOP';
+      policy.windows.ransomware.mode = ProtectionModes.detect;
+      policy.windows.popup.ransomware.enabled = false;
+      policy.windows.popup.ransomware.message = popupMessage;
+      policy.mac.ransomware.mode = ProtectionModes.detect;
+      policy.mac.popup.ransomware.enabled = false;
+      policy.mac.popup.ransomware.message = popupMessage;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Platinum);
+      expect(retPolicy.windows.ransomware.mode).toEqual(ProtectionModes.detect);
+      expect(retPolicy.windows.popup.ransomware.enabled).toBeFalsy();
+      expect(retPolicy.windows.popup.ransomware.message).toEqual(popupMessage);
+      expect(retPolicy.mac.ransomware.mode).toEqual(ProtectionModes.detect);
+      expect(retPolicy.mac.popup.ransomware.enabled).toBeFalsy();
+      expect(retPolicy.mac.popup.ransomware.message).toEqual(popupMessage);
+    });
+
+    it('does not change any memory fields with a Platinum license', () => {
+      const policy = policyFactory();
+      const popupMessage = 'WOOP WOOP';
+      policy.windows.memory_protection.mode = ProtectionModes.detect;
+      policy.windows.popup.memory_protection.enabled = false;
+      policy.windows.popup.memory_protection.message = popupMessage;
+
+      policy.linux.memory_protection.mode = ProtectionModes.detect;
+      policy.linux.popup.memory_protection.enabled = false;
+      policy.linux.popup.memory_protection.message = popupMessage;
+
+      policy.mac.memory_protection.mode = ProtectionModes.detect;
+      policy.mac.popup.memory_protection.enabled = false;
+      policy.mac.popup.memory_protection.message = popupMessage;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Platinum);
+      expect(retPolicy.windows.memory_protection.mode).toEqual(ProtectionModes.detect);
+      expect(retPolicy.windows.popup.memory_protection.enabled).toBeFalsy();
+      expect(retPolicy.windows.popup.memory_protection.message).toEqual(popupMessage);
+
+      expect(retPolicy.linux.memory_protection.mode).toEqual(ProtectionModes.detect);
+      expect(retPolicy.linux.popup.memory_protection.enabled).toBeFalsy();
+      expect(retPolicy.linux.popup.memory_protection.message).toEqual(popupMessage);
+
+      expect(retPolicy.mac.memory_protection.mode).toEqual(ProtectionModes.detect);
+      expect(retPolicy.mac.popup.memory_protection.enabled).toBeFalsy();
+      expect(retPolicy.mac.popup.memory_protection.message).toEqual(popupMessage);
+    });
+
+    it('does not change any behavior fields with a Platinum license', () => {
+      const policy = policyFactory();
+      const popupMessage = 'WOOP WOOP';
+      policy.windows.behavior_protection.mode = ProtectionModes.detect;
+      policy.windows.popup.behavior_protection.enabled = false;
+      policy.windows.popup.behavior_protection.message = popupMessage;
+      policy.mac.behavior_protection.mode = ProtectionModes.detect;
+      policy.mac.popup.behavior_protection.enabled = false;
+      policy.mac.popup.behavior_protection.message = popupMessage;
+      policy.linux.behavior_protection.mode = ProtectionModes.detect;
+      policy.linux.popup.behavior_protection.enabled = false;
+      policy.linux.popup.behavior_protection.message = popupMessage;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Platinum);
+      expect(retPolicy.windows.behavior_protection.mode).toEqual(ProtectionModes.detect);
+      expect(retPolicy.windows.popup.behavior_protection.enabled).toBeFalsy();
+      expect(retPolicy.windows.popup.behavior_protection.message).toEqual(popupMessage);
+      expect(retPolicy.mac.behavior_protection.mode).toEqual(ProtectionModes.detect);
+      expect(retPolicy.mac.popup.behavior_protection.enabled).toBeFalsy();
+      expect(retPolicy.mac.popup.behavior_protection.message).toEqual(popupMessage);
+      expect(retPolicy.linux.behavior_protection.mode).toEqual(ProtectionModes.detect);
+      expect(retPolicy.linux.popup.behavior_protection.enabled).toBeFalsy();
+      expect(retPolicy.linux.popup.behavior_protection.message).toEqual(popupMessage);
+    });
+
+    it('does not change protection updates fields with an Enterprise license', () => {
+      const policy = policyFactory();
+      const date = '2022-10-01';
+      policy.global_manifest_version = date;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Enterprise);
+      expect(retPolicy.global_manifest_version).toEqual(date);
+    });
+
+    it('resets Enterprise-paid fields for lower license tiers', () => {
+      const defaults = policyFactory(); // reference
+      const policy = policyFactory(); // what we will modify, and should be reset
+      policy.global_manifest_version = '2022-10-01';
+      [Platinum, Gold, Basic].forEach((license) => {
+        const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, license);
+        expect(retPolicy.global_manifest_version).toEqual(defaults.global_manifest_version);
+      });
+    });
+
+    it('resets Platinum-paid fields for lower license tiers', () => {
+      const defaults = policyFactory(); // reference
+      const policy = policyFactory(); // what we will modify, and should be reset
+      const popupMessage = 'WOOP WOOP';
+      policy.windows.popup.malware.message = popupMessage;
+      policy.mac.popup.malware.message = popupMessage;
+      policy.windows.popup.malware.enabled = false;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Gold);
+      expect(retPolicy.windows.popup.malware.enabled).toEqual(
+        defaults.windows.popup.malware.enabled
+      );
+      expect(retPolicy.windows.popup.malware.message).not.toEqual(popupMessage);
+
+      // need to invert the test, since it could be either value
+      expect(['', DefaultPolicyNotificationMessage]).toContain(
+        retPolicy.windows.popup.malware.message
+      );
+    });
+
+    it('resets Platinum-paid ransomware fields for lower license tiers', () => {
+      const defaults = policyFactoryWithoutPaidFeatures(); // reference
+      const policy = policyFactory(); // what we will modify, and should be reset
+      const popupMessage = 'WOOP WOOP';
+      policy.windows.popup.ransomware.message = popupMessage;
+      policy.mac.popup.ransomware.message = popupMessage;
+      policy.linux.popup.ransomware = { message: popupMessage, enabled: true };
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Gold);
+
+      expect(retPolicy.windows.ransomware.mode).toEqual(defaults.windows.ransomware.mode);
+      expect(retPolicy.windows.popup.ransomware.enabled).toEqual(
+        defaults.windows.popup.ransomware.enabled
+      );
+      expect(retPolicy.windows.popup.ransomware.message).not.toEqual(popupMessage);
+      expect(retPolicy.mac.ransomware.mode).toEqual(defaults.mac.ransomware.mode);
+      expect(retPolicy.mac.popup.ransomware.enabled).toEqual(defaults.mac.popup.ransomware.enabled);
+      expect(retPolicy.mac.popup.ransomware.message).not.toEqual(popupMessage);
+      expect(retPolicy.linux.popup.ransomware).toEqual(defaults.linux.popup.ransomware);
+
+      // need to invert the test, since it could be either value
+      expect(['', DefaultPolicyNotificationMessage]).toContain(
+        retPolicy.windows.popup.ransomware.message
+      );
+      expect(['', DefaultPolicyNotificationMessage]).toContain(
+        retPolicy.mac.popup.ransomware.message
+      );
+    });
+
+    it('resets Platinum-paid memory_protection fields for lower license tiers', () => {
+      const defaults = policyFactoryWithoutPaidFeatures(); // reference
+      const policy = policyFactory(); // what we will modify, and should be reset
+      const popupMessage = 'WOOP WOOP';
+      policy.windows.popup.memory_protection.message = popupMessage;
+      policy.mac.popup.memory_protection.message = popupMessage;
+      policy.linux.popup.memory_protection.message = popupMessage;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Gold);
+
+      expect(retPolicy.windows.memory_protection.mode).toEqual(
+        defaults.windows.memory_protection.mode
+      );
+      expect(retPolicy.windows.popup.memory_protection.enabled).toEqual(
+        defaults.windows.popup.memory_protection.enabled
+      );
+      expect(retPolicy.windows.popup.memory_protection.message).not.toEqual(popupMessage);
+
+      expect(retPolicy.mac.memory_protection.mode).toEqual(defaults.mac.memory_protection.mode);
+      expect(retPolicy.mac.popup.memory_protection.enabled).toEqual(
+        defaults.mac.popup.memory_protection.enabled
+      );
+      expect(retPolicy.mac.popup.memory_protection.message).not.toEqual(popupMessage);
+
+      expect(retPolicy.linux.memory_protection.mode).toEqual(defaults.linux.memory_protection.mode);
+      expect(retPolicy.linux.popup.memory_protection.enabled).toEqual(
+        defaults.linux.popup.memory_protection.enabled
+      );
+      expect(retPolicy.linux.popup.memory_protection.message).not.toEqual(popupMessage);
+
+      // need to invert the test, since it could be either value
+      expect(['', DefaultPolicyRuleNotificationMessage]).toContain(
+        retPolicy.windows.popup.memory_protection.message
+      );
+      expect(['', DefaultPolicyRuleNotificationMessage]).toContain(
+        retPolicy.mac.popup.memory_protection.message
+      );
+      expect(['', DefaultPolicyRuleNotificationMessage]).toContain(
+        retPolicy.linux.popup.memory_protection.message
+      );
+    });
+
+    it('resets Platinum-paid behavior_protection fields for lower license tiers', () => {
+      const defaults = policyFactoryWithoutPaidFeatures(); // reference
+      const policy = policyFactory(); // what we will modify, and should be reset
+      const popupMessage = 'WOOP WOOP';
+      policy.windows.popup.behavior_protection.message = popupMessage;
+      policy.mac.popup.behavior_protection.message = popupMessage;
+      policy.linux.popup.behavior_protection.message = popupMessage;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Gold);
+
+      expect(retPolicy.windows.behavior_protection.mode).toEqual(
+        defaults.windows.behavior_protection.mode
+      );
+      expect(retPolicy.windows.popup.behavior_protection.enabled).toEqual(
+        defaults.windows.popup.behavior_protection.enabled
+      );
+      expect(retPolicy.windows.popup.behavior_protection.message).not.toEqual(popupMessage);
+
+      // need to invert the test, since it could be either value
+      expect(['', DefaultPolicyRuleNotificationMessage]).toContain(
+        retPolicy.windows.popup.behavior_protection.message
+      );
+
+      expect(retPolicy.mac.behavior_protection.mode).toEqual(defaults.mac.behavior_protection.mode);
+      expect(retPolicy.mac.popup.behavior_protection.enabled).toEqual(
+        defaults.mac.popup.behavior_protection.enabled
+      );
+      expect(retPolicy.mac.popup.behavior_protection.message).not.toEqual(popupMessage);
+
+      // need to invert the test, since it could be either value
+      expect(['', DefaultPolicyRuleNotificationMessage]).toContain(
+        retPolicy.mac.popup.behavior_protection.message
+      );
+
+      expect(retPolicy.linux.behavior_protection.mode).toEqual(
+        defaults.linux.behavior_protection.mode
+      );
+      expect(retPolicy.linux.popup.behavior_protection.enabled).toEqual(
+        defaults.linux.popup.behavior_protection.enabled
+      );
+      expect(retPolicy.linux.popup.behavior_protection.message).not.toEqual(popupMessage);
+
+      // need to invert the test, since it could be either value
+      expect(['', DefaultPolicyRuleNotificationMessage]).toContain(
+        retPolicy.linux.popup.behavior_protection.message
+      );
+    });
+
+    it('resets Platinum-paid advanced fields for lower license tiers', () => {
+      const defaults = policyFactoryWithoutPaidFeatures(); // reference
+      const policy = policyFactory(); // what we will modify, and should be reset
+
+      policy.windows.advanced = {
+        alerts: {
+          rollback: {
+            self_healing: {
+              enabled: true,
+            },
+          },
+          cloud_lookup: false,
+        },
+        another_advanced: true,
+      };
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Gold);
+
+      expect(retPolicy.windows.advanced?.rollback).toEqual(defaults.windows.advanced?.rollback);
+
+      // Preserves non-license gated advanced settings.
+      expect(retPolicy.windows.advanced?.another_advanced).toEqual(true);
+      expect(retPolicy.windows.advanced?.alerts?.cloud_lookup).toEqual(false);
+    });
+
+    it('sets ransomware supported field to false when license is below Platinum', () => {
+      const defaults = policyFactoryWithoutPaidFeatures(); // reference
+      const policy = policyFactory(); // what we will modify, and should be reset
+      policy.windows.ransomware.supported = true;
+      policy.mac.ransomware.supported = true;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Gold);
+
+      expect(retPolicy.windows.ransomware.supported).toEqual(defaults.windows.ransomware.supported);
+      expect(retPolicy.mac.ransomware.supported).toEqual(defaults.mac.ransomware.supported);
+    });
+
+    it('sets ransomware supported field to true when license is at Platinum', () => {
+      const defaults = policyFactoryWithSupportedFeatures(); // reference
+      const policy = policyFactory(); // what we will modify, and should be reset
+      policy.windows.ransomware.supported = false;
+      policy.mac.ransomware.supported = false;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Platinum);
+
+      expect(retPolicy.windows.ransomware.supported).toEqual(defaults.windows.ransomware.supported);
+      expect(retPolicy.mac.ransomware.supported).toEqual(defaults.mac.ransomware.supported);
+    });
+
+    it('sets memory_protection supported field to false when license is below Platinum', () => {
+      const defaults = policyFactoryWithoutPaidFeatures(); // reference
+      const policy = policyFactory(); // what we will modify, and should be reset
+      policy.windows.memory_protection.supported = true;
+      policy.mac.memory_protection.supported = true;
+      policy.linux.memory_protection.supported = true;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Gold);
+
+      expect(retPolicy.windows.memory_protection.supported).toEqual(
+        defaults.windows.memory_protection.supported
+      );
+      expect(retPolicy.mac.memory_protection.supported).toEqual(
+        defaults.mac.memory_protection.supported
+      );
+      expect(retPolicy.linux.memory_protection.supported).toEqual(
+        defaults.linux.memory_protection.supported
+      );
+    });
+
+    it('sets memory_protection supported field to true when license is at Platinum', () => {
+      const defaults = policyFactoryWithSupportedFeatures(); // reference
+      const policy = policyFactory(); // what we will modify, and should be reset
+      policy.windows.memory_protection.supported = false;
+      policy.mac.memory_protection.supported = false;
+      policy.linux.memory_protection.supported = false;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Platinum);
+
+      expect(retPolicy.windows.memory_protection.supported).toEqual(
+        defaults.windows.memory_protection.supported
+      );
+      expect(retPolicy.mac.memory_protection.supported).toEqual(
+        defaults.mac.memory_protection.supported
+      );
+      expect(retPolicy.linux.memory_protection.supported).toEqual(
+        defaults.linux.memory_protection.supported
+      );
+    });
+    it('sets behavior_protection supported field to false when license is below Platinum', () => {
+      const defaults = policyFactoryWithoutPaidFeatures(); // reference
+      const policy = policyFactory(); // what we will modify, and should be reset
+      policy.windows.behavior_protection.supported = true;
+      policy.mac.behavior_protection.supported = true;
+      policy.linux.behavior_protection.supported = true;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Gold);
+
+      expect(retPolicy.windows.behavior_protection.supported).toEqual(
+        defaults.windows.behavior_protection.supported
+      );
+      expect(retPolicy.mac.behavior_protection.supported).toEqual(
+        defaults.mac.behavior_protection.supported
+      );
+      expect(retPolicy.linux.behavior_protection.supported).toEqual(
+        defaults.linux.behavior_protection.supported
+      );
+    });
+
+    it('sets behavior_protection supported field to true when license is at Platinum', () => {
+      const defaults = policyFactoryWithSupportedFeatures(); // reference
+      const policy = policyFactory(); // what we will modify, and should be reset
+      policy.windows.behavior_protection.supported = false;
+      policy.mac.behavior_protection.supported = false;
+      policy.linux.behavior_protection.supported = false;
+
+      const retPolicy = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Platinum);
+
+      expect(retPolicy.windows.behavior_protection.supported).toEqual(
+        defaults.windows.behavior_protection.supported
+      );
+      expect(retPolicy.mac.behavior_protection.supported).toEqual(
+        defaults.mac.behavior_protection.supported
+      );
+      expect(retPolicy.linux.behavior_protection.supported).toEqual(
+        defaults.linux.behavior_protection.supported
+      );
+    });
+  });
+
+  describe('policyFactoryWithoutPaidFeatures for gold and below license', () => {
+    it('preserves non license-gated features', () => {
+      const policy = policyFactory(); // what we will modify, and should be reset
+      policy.windows.events.file = false;
+      const retPolicy = policyFactoryWithoutPaidFeatures(policy);
+      expect(retPolicy.windows.events.file).toBeFalsy();
+    });
+  });
+
+  describe('policyFactoryWithSupportedFeatures', () => {
+    it('preserves each OS behavior_protection values while marking supported true', () => {
+      const policy = policyFactory();
+      policy.windows.behavior_protection.mode = ProtectionModes.off;
+      policy.windows.behavior_protection.reputation_service = false;
+      policy.mac.behavior_protection.mode = ProtectionModes.detect;
+      policy.mac.behavior_protection.reputation_service = true;
+      policy.linux.behavior_protection.mode = ProtectionModes.prevent;
+      policy.linux.behavior_protection.reputation_service = false;
+
+      const supported = policyFactoryWithSupportedFeatures(policy);
+
+      expect(supported.mac.behavior_protection).toEqual({
+        mode: ProtectionModes.detect,
+        reputation_service: true,
+        supported: true,
+      });
+      expect(supported.linux.behavior_protection).toEqual({
+        mode: ProtectionModes.prevent,
+        reputation_service: false,
+        supported: true,
+      });
+    });
+
+    it('preserves custom_yara_signatures on memory_protection', () => {
+      const policy = policyFactory();
+      policy.windows.memory_protection.custom_yara_signatures = false;
+      policy.mac.memory_protection.custom_yara_signatures = true;
+      policy.linux.memory_protection.custom_yara_signatures = false;
+
+      const supported = policyFactoryWithSupportedFeatures(policy);
+
+      expect(supported.windows.memory_protection.custom_yara_signatures).toBe(false);
+      expect(supported.mac.memory_protection.custom_yara_signatures).toBe(true);
+      expect(supported.linux.memory_protection.custom_yara_signatures).toBe(false);
+    });
+  });
+
+  describe('isEndpointDeviceControlPolicyValidForLicense', () => {
+    it('allows any device control configuration with Enterprise license', () => {
+      const policy = policyFactory();
+      // Enable all device control features
+      if (policy.windows.device_control) {
+        policy.windows.device_control.enabled = true;
+      }
+      if (policy.mac.device_control) {
+        policy.mac.device_control.enabled = true;
+      }
+      if (policy.windows.popup.device_control) {
+        policy.windows.popup.device_control.enabled = true;
+        policy.windows.popup.device_control.message = 'Custom message';
+      }
+      if (policy.mac.popup.device_control) {
+        policy.mac.popup.device_control.enabled = true;
+        policy.mac.popup.device_control.message = 'Custom message';
+      }
+
+      const valid = isEndpointPolicyValidForLicense(policy, Enterprise);
+      expect(valid).toBeTruthy();
+    });
+
+    it('blocks Windows device control when enabled with non-Enterprise license', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      if (policy.windows.device_control) {
+        policy.windows.device_control.enabled = true;
+      }
+
+      let valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Gold);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Basic);
+      expect(valid).toBeFalsy();
+    });
+
+    it('blocks Mac device control when enabled with non-Enterprise license', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      if (policy.mac.device_control) {
+        policy.mac.device_control.enabled = true;
+      }
+
+      let valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Gold);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Basic);
+      expect(valid).toBeFalsy();
+    });
+
+    it('blocks Windows popup device control when enabled with non-Enterprise license', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      if (policy.windows.popup.device_control) {
+        policy.windows.popup.device_control.enabled = true;
+      }
+
+      let valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Gold);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Basic);
+      expect(valid).toBeFalsy();
+    });
+
+    it('blocks Mac popup device control when enabled with non-Enterprise license', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      if (policy.mac.popup.device_control) {
+        policy.mac.popup.device_control.enabled = true;
+      }
+
+      let valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Gold);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Basic);
+      expect(valid).toBeFalsy();
+    });
+
+    it('blocks Windows popup device control custom message with non-Enterprise license', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      if (policy.windows.popup.device_control) {
+        policy.windows.popup.device_control.enabled = false;
+        policy.windows.popup.device_control.message = 'Custom message';
+      }
+
+      let valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Gold);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Basic);
+      expect(valid).toBeFalsy();
+    });
+
+    it('blocks Mac popup device control custom message with non-Enterprise license', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      if (policy.mac.popup.device_control) {
+        policy.mac.popup.device_control.enabled = false;
+        policy.mac.popup.device_control.message = 'Custom message';
+      }
+
+      let valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Gold);
+      expect(valid).toBeFalsy();
+
+      valid = isEndpointPolicyValidForLicense(policy, Basic);
+      expect(valid).toBeFalsy();
+    });
+
+    it('allows Mac and Windows popup device control with empty message and disabled state for non-Enterprise license', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      if (policy.windows.device_control) {
+        policy.windows.device_control.enabled = false;
+      }
+      if (policy.windows.popup.device_control) {
+        policy.windows.popup.device_control.enabled = false;
+        policy.windows.popup.device_control.message = '';
+      }
+
+      if (policy.mac.device_control) {
+        policy.mac.device_control.enabled = false;
+      }
+      if (policy.mac.popup.device_control) {
+        policy.mac.popup.device_control.enabled = false;
+        policy.mac.popup.device_control.message = '';
+      }
+
+      const valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeTruthy();
+    });
+
+    it('allows Mac and Windows popup device control with default message and disabled state for non-Enterprise license', () => {
+      const policy = policyFactory();
+
+      disableEnterpriseFeatures(policy);
+      if (policy.windows.device_control) policy.windows.device_control.enabled = false;
+      if (policy.windows.popup.device_control) {
+        policy.windows.popup.device_control.enabled = false;
+        policy.windows.popup.device_control.message = DefaultPolicyDeviceNotificationMessage;
+      }
+      if (policy.mac.device_control) {
+        policy.mac.device_control.enabled = false;
+      }
+      if (policy.mac.popup.device_control) {
+        policy.mac.popup.device_control.enabled = false;
+        policy.mac.popup.device_control.message = DefaultPolicyDeviceNotificationMessage;
+      }
+
+      const valid = isEndpointPolicyValidForLicense(policy, Platinum);
+      expect(valid).toBeTruthy();
+    });
+
+    it('blocks device control with null license when features are enabled', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      if (policy.windows.device_control) {
+        policy.windows.device_control.enabled = true;
+      }
+
+      const valid = isEndpointPolicyValidForLicense(policy, null);
+      expect(valid).toBeFalsy();
+    });
+  });
+
+  describe('custom yara signatures license gating', () => {
+    it('allows custom_yara_signatures enabled with an Enterprise license', () => {
+      const policy = policyFactory();
+      expect(isEndpointPolicyValidForLicense(policy, Enterprise)).toBe(true);
+    });
+
+    it('allows a policy with custom_yara_signatures absent on all OSes below Enterprise', () => {
+      const platinumPolicy = policyFactory();
+      disableEnterpriseFeatures(platinumPolicy);
+      omitCustomYaraSignatures(platinumPolicy);
+      expect(isEndpointPolicyValidForLicense(platinumPolicy, Platinum)).toBe(true);
+
+      const unpaidPolicy = policyFactoryWithoutPaidFeatures();
+      omitCustomYaraSignatures(unpaidPolicy);
+      expect(isEndpointPolicyValidForLicense(unpaidPolicy, Gold)).toBe(true);
+      expect(isEndpointPolicyValidForLicense(unpaidPolicy, Basic)).toBe(true);
+    });
+
+    it.each(['windows', 'mac', 'linux'] as const)(
+      'is invalid below Enterprise when custom_yara_signatures is true on %s',
+      (os) => {
+        const platinumPolicy = policyFactory();
+        disableEnterpriseFeatures(platinumPolicy);
+        platinumPolicy[os].memory_protection.custom_yara_signatures = true;
+        expect(isEndpointPolicyValidForLicense(platinumPolicy, Platinum)).toBe(false);
+
+        const unpaidPolicy = policyFactoryWithoutPaidFeatures();
+        unpaidPolicy[os].memory_protection.custom_yara_signatures = true;
+        expect(isEndpointPolicyValidForLicense(unpaidPolicy, Gold)).toBe(false);
+        expect(isEndpointPolicyValidForLicense(unpaidPolicy, Basic)).toBe(false);
+      }
+    );
+
+    it('allows custom_yara_signatures disabled below Enterprise', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      expect(isEndpointPolicyValidForLicense(policy, Platinum)).toBe(true);
+    });
+
+    it('turns custom_yara_signatures off below Enterprise and keeps it for Enterprise', () => {
+      const enterprisePolicy = unsetPolicyFeaturesAccordingToLicenseLevel(
+        policyFactory(),
+        Enterprise
+      );
+      expect(enterprisePolicy.windows.memory_protection.custom_yara_signatures).toBe(true);
+      expect(enterprisePolicy.mac.memory_protection.custom_yara_signatures).toBe(true);
+      expect(enterprisePolicy.linux.memory_protection.custom_yara_signatures).toBe(true);
+      expect(isEndpointPolicyValidForLicense(enterprisePolicy, Enterprise)).toBe(true);
+
+      for (const license of [Platinum, Gold, Basic]) {
+        const stripped = unsetPolicyFeaturesAccordingToLicenseLevel(policyFactory(), license);
+        expect(stripped.windows.memory_protection.custom_yara_signatures).toBe(false);
+        expect(stripped.mac.memory_protection.custom_yara_signatures).toBe(false);
+        expect(stripped.linux.memory_protection.custom_yara_signatures).toBe(false);
+        expect(isEndpointPolicyValidForLicense(stripped, license)).toBe(true);
+      }
+    });
+
+    it('leaves an absent custom_yara_signatures absent on every downgrade', () => {
+      for (const license of [Platinum, Gold, Basic]) {
+        const policy = policyFactory();
+        omitCustomYaraSignatures(policy);
+
+        const stripped = unsetPolicyFeaturesAccordingToLicenseLevel(policy, license);
+
+        for (const os of ['windows', 'mac', 'linux'] as const) {
+          expect(stripped[os].memory_protection).not.toHaveProperty('custom_yara_signatures');
+        }
+        expect(isEndpointPolicyValidForLicense(stripped, license)).toBe(true);
+      }
+    });
+
+    describe('advanced rescan interval', () => {
+      const osList = ['windows', 'mac', 'linux'] as const;
+
+      const setRescanInterval = (policy: PolicyConfig, os: (typeof osList)[number]) => {
+        const advanced = (policy[os].advanced ?? {}) as Record<string, unknown>;
+        advanced.memory_protection = {
+          ...((advanced.memory_protection as Record<string, unknown>) ?? {}),
+          user_yara_rescan_interval_seconds: 3600,
+        };
+        (policy[os] as { advanced?: unknown }).advanced = advanced;
+      };
+
+      it.each(osList)('is invalid below Enterprise when the rescan interval is set on %s', (os) => {
+        const platinumPolicy = policyFactory();
+        disableEnterpriseFeatures(platinumPolicy);
+        // The policy is otherwise valid on Platinum, so the interval is the only thing under test.
+        expect(isEndpointPolicyValidForLicense(platinumPolicy, Platinum)).toBe(true);
+
+        setRescanInterval(platinumPolicy, os);
+        expect(isEndpointPolicyValidForLicense(platinumPolicy, Platinum)).toBe(false);
+      });
+
+      it('allows the rescan interval with an Enterprise license', () => {
+        const policy = policyFactory();
+        setRescanInterval(policy, 'windows');
+        expect(isEndpointPolicyValidForLicense(policy, Enterprise)).toBe(true);
+      });
+
+      const policyWithIntervalEverywhere = () => {
+        const policy = policyFactory();
+        for (const os of osList) {
+          setRescanInterval(policy, os);
+        }
+        return policy;
+      };
+
+      it('strips the rescan interval below Enterprise so license_watch can converge', () => {
+        const stripped = unsetPolicyFeaturesAccordingToLicenseLevel(
+          policyWithIntervalEverywhere(),
+          Platinum
+        );
+
+        for (const os of osList) {
+          expect(stripped[os].advanced).not.toHaveProperty('memory_protection');
+        }
+        expect(isEndpointPolicyValidForLicense(stripped, Platinum)).toBe(true);
+      });
+
+      it.each([
+        ['Gold', Gold],
+        ['Basic', Basic],
+      ])('strips the rescan interval for %s', (_licenseName, license) => {
+        // Only the removal is asserted here. Below Platinum, any policy carrying an `advanced`
+        // object already fails `isEndpointAdvancedPolicyValidForLicense`, which compares the
+        // rollback setting against defaults whose `advanced` is `undefined`. That predates
+        // custom YARA signatures and is unrelated to this field.
+        const stripped = unsetPolicyFeaturesAccordingToLicenseLevel(
+          policyWithIntervalEverywhere(),
+          license
+        );
+
+        for (const os of osList) {
+          expect(stripped[os].advanced).not.toHaveProperty('memory_protection');
+        }
+      });
+    });
+  });
+
+  describe('macOS ransomware', () => {
+    it.each([
+      ['Platinum', Platinum],
+      ['Enterprise', Enterprise],
+    ])('allows absent macOS ransomware settings with a %s license', (_, license) => {
+      const policy = policyFactoryWithoutPaidEnterpriseFeatures();
+      Reflect.deleteProperty(policy.mac, 'ransomware');
+      Reflect.deleteProperty(policy.mac.popup, 'ransomware');
+
+      expect(isEndpointPolicyValidForLicense(policy, license)).toBe(true);
+    });
+
+    it.each([
+      ['Gold', Gold],
+      ['Basic', Basic],
+    ])('allows absent macOS ransomware settings with a %s license', (_, license) => {
+      const policy = policyFactoryWithoutPaidFeatures();
+      Reflect.deleteProperty(policy.mac, 'ransomware');
+      Reflect.deleteProperty(policy.mac.popup, 'ransomware');
+
+      expect(isEndpointPolicyValidForLicense(policy, license)).toBe(true);
+    });
+
+    it.each([
+      ['Platinum', Platinum, policyFactoryWithoutPaidEnterpriseFeatures],
+      ['Gold', Gold, policyFactoryWithoutPaidFeatures],
+    ])('blocks null macOS ransomware with a %s license', (_, license, createPolicy) => {
+      const policy = createPolicy();
+      Reflect.set(policy.mac, 'ransomware', null);
+
+      expect(isEndpointPolicyValidForLicense(policy, license)).toBe(false);
+    });
+  });
+
+  describe('Linux ransomware', () => {
+    const omitLinuxRansomware = (policy: PolicyConfig) => {
+      delete policy.linux.ransomware;
+    };
+
+    it('blocks Linux ransomware turned on below Platinum', () => {
+      const policy = policyFactoryWithoutPaidFeatures();
+      policy.linux.ransomware = { mode: ProtectionModes.prevent, supported: false };
+
+      expect(isEndpointPolicyValidForLicense(policy, Gold)).toBe(false);
+      expect(isEndpointPolicyValidForLicense(policy, Basic)).toBe(false);
+    });
+
+    it('blocks Linux ransomware marked supported below Platinum', () => {
+      const policy = policyFactoryWithoutPaidFeatures();
+      policy.linux.ransomware = { mode: ProtectionModes.off, supported: true };
+
+      expect(isEndpointPolicyValidForLicense(policy, Gold)).toBe(false);
+    });
+
+    it('blocks Linux ransomware marked unsupported with a Platinum license', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      policy.linux.ransomware = { mode: ProtectionModes.prevent, supported: false };
+
+      expect(isEndpointPolicyValidForLicense(policy, Platinum)).toBe(false);
+    });
+
+    it('allows a policy without Linux ransomware at every license tier', () => {
+      const platinumPolicy = policyFactory();
+      disableEnterpriseFeatures(platinumPolicy);
+      omitLinuxRansomware(platinumPolicy);
+      const goldPolicy = policyFactoryWithoutPaidFeatures();
+      omitLinuxRansomware(goldPolicy);
+
+      expect(isEndpointPolicyValidForLicense(platinumPolicy, Platinum)).toBe(true);
+      expect(isEndpointPolicyValidForLicense(goldPolicy, Gold)).toBe(true);
+      expect(isEndpointPolicyValidForLicense(goldPolicy, Basic)).toBe(true);
+    });
+
+    it('turns Linux ransomware off and unsupported on downgrade so license_watch converges', () => {
+      for (const license of [Gold, Basic]) {
+        const stripped = unsetPolicyFeaturesAccordingToLicenseLevel(policyFactory(), license);
+
+        expect(stripped.linux.ransomware).toEqual({ mode: ProtectionModes.off, supported: false });
+        expect(isEndpointPolicyValidForLicense(stripped, license)).toBe(true);
+      }
+    });
+
+    it('marks Linux ransomware supported on upgrade to Platinum and keeps its mode', () => {
+      const policy = policyFactoryWithoutPaidFeatures();
+      policy.linux.ransomware = { mode: ProtectionModes.detect, supported: false };
+
+      const upgraded = unsetPolicyFeaturesAccordingToLicenseLevel(policy, Platinum);
+
+      expect(upgraded.linux.ransomware).toEqual({ mode: ProtectionModes.detect, supported: true });
+    });
+
+    it('leaves an absent Linux ransomware absent on every license change', () => {
+      for (const license of [Enterprise, Platinum, Gold, Basic]) {
+        const policy = policyFactory();
+        omitLinuxRansomware(policy);
+
+        const result = unsetPolicyFeaturesAccordingToLicenseLevel(policy, license);
+
+        expect(result.linux).not.toHaveProperty('ransomware');
+      }
+    });
+
+    describe('with a malformed or missing Linux branch', () => {
+      it.each([
+        ['Platinum', Platinum, policyFactoryWithoutPaidEnterpriseFeatures],
+        ['Gold', Gold, policyFactoryWithoutPaidFeatures],
+      ])('blocks a null Linux ransomware with a %s license', (_, license, createPolicy) => {
+        const policy = createPolicy();
+        Reflect.set(policy.linux, 'ransomware', null);
+
+        expect(isEndpointPolicyValidForLicense(policy, license)).toBe(false);
+      });
+
+      it.each([
+        ['Platinum', Platinum, policyFactoryWithoutPaidEnterpriseFeatures],
+        ['Gold', Gold, policyFactoryWithoutPaidFeatures],
+      ])(
+        'blocks a null Linux ransomware notification with a %s license',
+        (_, license, createPolicy) => {
+          const policy = createPolicy();
+          Reflect.set(policy.linux.popup, 'ransomware', null);
+
+          expect(isEndpointPolicyValidForLicense(policy, license)).toBe(false);
+        }
+      );
+
+      it('blocks memory protection for Gold when the Linux popup is missing', () => {
+        const policy = policyFactoryWithoutPaidFeatures();
+        policy.windows.memory_protection.mode = ProtectionModes.prevent;
+        policy.windows.memory_protection.supported = true;
+        Reflect.deleteProperty(policy.linux, 'popup');
+
+        expect(isEndpointPolicyValidForLicense(policy, Gold)).toBe(false);
+      });
+
+      it('allows a Platinum-valid policy without Linux ransomware or a Linux popup', () => {
+        const policy = policyFactoryWithoutPaidEnterpriseFeatures();
+        omitLinuxRansomware(policy);
+        Reflect.deleteProperty(policy.linux, 'popup');
+
+        expect(isEndpointPolicyValidForLicense(policy, Platinum)).toBe(true);
+      });
+
+      it('blocks a Linux ransomware without `supported` with a Platinum license', () => {
+        const policy = policyFactoryWithoutPaidEnterpriseFeatures();
+        Reflect.set(policy.linux, 'ransomware', { mode: ProtectionModes.prevent });
+
+        expect(isEndpointPolicyValidForLicense(policy, Platinum)).toBe(false);
+      });
+
+      it('blocks a Linux ransomware without `supported` with a Gold license', () => {
+        const policy = policyFactoryWithoutPaidFeatures();
+        Reflect.set(policy.linux, 'ransomware', { mode: ProtectionModes.off });
+
+        expect(isEndpointPolicyValidForLicense(policy, Gold)).toBe(false);
+      });
+
+      it('blocks a Linux ransomware notification without `message` with a Gold license', () => {
+        const policy = policyFactoryWithoutPaidFeatures();
+        Reflect.set(policy.linux.popup, 'ransomware', { enabled: false });
+
+        expect(isEndpointPolicyValidForLicense(policy, Gold)).toBe(false);
+      });
+
+      it.each([
+        ['Platinum', Platinum, policyFactoryWithoutPaidEnterpriseFeatures],
+        ['Gold', Gold, policyFactoryWithoutPaidFeatures],
+      ])(
+        'allows a legacy policy without Linux ransomware or its notification with a %s license',
+        (_, license, createPolicy) => {
+          const policy = createPolicy();
+          omitLinuxRansomware(policy);
+          delete policy.linux.popup.ransomware;
+
+          expect(isEndpointPolicyValidForLicense(policy, license)).toBe(true);
+        }
+      );
+    });
+  });
+
+  describe('registry credential hardening license gating', () => {
+    it('allows a policy with registry_credential_hardening absent below Enterprise', () => {
+      const platinumPolicy = policyFactory();
+      disableEnterpriseFeatures(platinumPolicy);
+      omitRegistryCredentialHardening(platinumPolicy);
+      expect(isEndpointPolicyValidForLicense(platinumPolicy, Platinum)).toBe(true);
+
+      const unpaidPolicy = policyFactoryWithoutPaidFeatures();
+      omitRegistryCredentialHardening(unpaidPolicy);
+      expect(isEndpointPolicyValidForLicense(unpaidPolicy, Gold)).toBe(true);
+      expect(isEndpointPolicyValidForLicense(unpaidPolicy, Basic)).toBe(true);
+    });
+
+    it('is invalid below Enterprise when registry_credential_hardening is enabled', () => {
+      const platinumPolicy = policyFactory();
+      disableEnterpriseFeatures(platinumPolicy);
+      platinumPolicy.windows.attack_surface_reduction.registry_credential_hardening = {
+        enabled: true,
+      };
+      expect(isEndpointPolicyValidForLicense(platinumPolicy, Platinum)).toBe(false);
+
+      const unpaidPolicy = policyFactoryWithoutPaidFeatures();
+      unpaidPolicy.windows.attack_surface_reduction.registry_credential_hardening = {
+        enabled: true,
+      };
+      expect(isEndpointPolicyValidForLicense(unpaidPolicy, Gold)).toBe(false);
+      expect(isEndpointPolicyValidForLicense(unpaidPolicy, Basic)).toBe(false);
+    });
+
+    it('allows registry_credential_hardening disabled below Enterprise', () => {
+      const policy = policyFactory();
+      disableEnterpriseFeatures(policy);
+      expect(isEndpointPolicyValidForLicense(policy, Platinum)).toBe(true);
+    });
+
+    it('turns registry_credential_hardening off below Enterprise and keeps it for Enterprise', () => {
+      const enterprisePolicy = unsetPolicyFeaturesAccordingToLicenseLevel(
+        policyFactory(),
+        Enterprise
+      );
+      expect(
+        enterprisePolicy.windows.attack_surface_reduction.registry_credential_hardening?.enabled
+      ).toBe(true);
+      expect(isEndpointPolicyValidForLicense(enterprisePolicy, Enterprise)).toBe(true);
+
+      for (const license of [Platinum, Gold, Basic]) {
+        const stripped = unsetPolicyFeaturesAccordingToLicenseLevel(policyFactory(), license);
+        expect(
+          stripped.windows.attack_surface_reduction.registry_credential_hardening?.enabled
+        ).toBe(false);
+        expect(isEndpointPolicyValidForLicense(stripped, license)).toBe(true);
+      }
+    });
+
+    it('leaves an absent registry_credential_hardening absent on every downgrade', () => {
+      for (const license of [Platinum, Gold, Basic]) {
+        const policy = policyFactory();
+        omitRegistryCredentialHardening(policy);
+
+        const stripped = unsetPolicyFeaturesAccordingToLicenseLevel(policy, license);
+
+        expect(stripped.windows.attack_surface_reduction).not.toHaveProperty(
+          'registry_credential_hardening'
+        );
+        expect(isEndpointPolicyValidForLicense(stripped, license)).toBe(true);
+      }
+    });
+  });
+});

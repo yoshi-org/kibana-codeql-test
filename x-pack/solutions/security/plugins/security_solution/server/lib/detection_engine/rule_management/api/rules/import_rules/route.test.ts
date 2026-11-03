@@ -1,0 +1,356 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import { getImportRulesSchemaMock } from '../../../../../../../common/api/detection_engine/rule_management/mocks';
+import { RULE_IMPORT_BATCH_SIZE } from '../../constants';
+import { SecurityRuleChangeTrackingAction } from '../../../../../../../common/detection_engine/rule_management/rule_change_tracking';
+import { validateRuleImportResponseActions } from '../../../../../../endpoint/services';
+import { configMock, requestContextMock, serverMock } from '../../../../routes/__mocks__';
+import {
+  getImportRulesRequest,
+  getImportRulesRequestOverwriteTrue,
+} from '../../../../routes/__mocks__/request_responses';
+import { buildHapiStream } from '../../../../routes/__mocks__/utils';
+import { createPrebuiltRuleAssetsClient } from '../../../../prebuilt_rules/logic/rule_assets/prebuilt_rule_assets_client';
+import { ensureLatestRulesPackageInstalled } from '../../../../prebuilt_rules/logic/integrations/ensure_latest_rules_package_installed';
+import { importRuleActionConnectors } from '../../../logic/import/action_connectors/import_rule_action_connectors';
+import { validateRuleActions } from '../../../logic/import/action_connectors/validate_rule_actions';
+import { createPromiseFromRuleImportStream } from '../../../logic/import/create_promise_from_rule_import_stream';
+import { importRuleExceptions } from '../../../logic/import/import_rule_exceptions';
+import { createRuleImportErrorObject } from '../../../logic/detection_rules_client/methods/import_rules/errors';
+import {
+  getTupleDuplicateErrorsAndUniqueRules,
+  migrateLegacyActionsIds,
+} from '../../../utils/utils';
+import { importRulesRoute } from './route';
+
+jest.mock('../../../../../../endpoint/services', () => ({
+  validateRuleImportResponseActions: jest.fn(),
+}));
+jest.mock('../../../../prebuilt_rules/logic/rule_assets/prebuilt_rule_assets_client', () => ({
+  createPrebuiltRuleAssetsClient: jest.fn(() => 'assets-client'),
+}));
+jest.mock('../../../../prebuilt_rules/logic/integrations/ensure_latest_rules_package_installed');
+jest.mock('../../../logic/import/action_connectors/import_rule_action_connectors');
+jest.mock('../../../logic/import/action_connectors/validate_rule_actions');
+jest.mock('../../../logic/import/create_promise_from_rule_import_stream');
+jest.mock('../../../logic/import/import_rule_exceptions');
+jest.mock('../../../utils/utils');
+
+const stream = createPromiseFromRuleImportStream as jest.MockedFunction<
+  typeof createPromiseFromRuleImportStream
+>;
+const exceptions = importRuleExceptions as jest.MockedFunction<typeof importRuleExceptions>;
+const connectors = importRuleActionConnectors as jest.MockedFunction<
+  typeof importRuleActionConnectors
+>;
+const dedupe = getTupleDuplicateErrorsAndUniqueRules as jest.MockedFunction<
+  typeof getTupleDuplicateErrorsAndUniqueRules
+>;
+const migrate = migrateLegacyActionsIds as jest.MockedFunction<typeof migrateLegacyActionsIds>;
+const packageInstall = ensureLatestRulesPackageInstalled as jest.MockedFunction<
+  typeof ensureLatestRulesPackageInstalled
+>;
+const actions = validateRuleActions as jest.MockedFunction<typeof validateRuleActions>;
+const responseActions = validateRuleImportResponseActions as jest.MockedFunction<
+  typeof validateRuleImportResponseActions
+>;
+const emptyConnectors = {
+  successCount: 0,
+  success: true,
+  warnings: [],
+  errors: [],
+};
+const emptyExceptions = {
+  errors: [],
+  successCount: 0,
+  success: true,
+};
+
+describe('Import rules route', () => {
+  const rule = getImportRulesSchemaMock();
+  let config: ReturnType<typeof configMock.createDefault>;
+  let server: ReturnType<typeof serverMock.create>;
+  let clients: ReturnType<typeof requestContextMock.createTools>['clients'];
+  let context: ReturnType<typeof requestContextMock.createTools>['context'];
+
+  const inject = (request = getImportRulesRequest(buildHapiStream(''))) =>
+    server.inject(request, requestContextMock.convertContext(context));
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    server = serverMock.create();
+    ({ clients, context } = requestContextMock.createTools());
+    config = configMock.createDefault();
+
+    context.securitySolution.getEndpointService.mockReturnValue({} as never);
+
+    stream.mockResolvedValue([{ exceptions: [], rules: [rule], actionConnectors: [] }]);
+    exceptions.mockResolvedValue(emptyExceptions);
+    connectors.mockResolvedValue(emptyConnectors);
+    dedupe.mockReturnValue([[], [rule]]);
+    migrate.mockResolvedValue([rule]);
+    packageInstall.mockResolvedValue(undefined);
+    actions.mockResolvedValue({ validatedActionRules: [rule], missingActionErrors: [] });
+    responseActions.mockResolvedValue({ valid: [rule], errors: [] });
+    clients.detectionRulesClient.importRules.mockResolvedValue({
+      successes: [
+        {
+          rule_id: rule.rule_id,
+          outcome: 'created',
+          telemetry: { id: 'id-1', type: 'query', rule_source: { type: 'internal' } },
+        },
+      ],
+      errors: [],
+    });
+
+    importRulesRoute(server.router, config, clients.logger);
+  });
+
+  it('returns 400 when the file is not ndjson', async () => {
+    const response = await inject(getImportRulesRequest(buildHapiStream('', 'wrong.html')));
+
+    expect(response.status).toEqual(400);
+    expect(response.body).toEqual({ message: 'Invalid file extension .html', status_code: 400 });
+    expect(clients.detectionRulesClient.importRules).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 when the file field is missing', async () => {
+    const response = await inject(getImportRulesRequest());
+
+    expect(response.status).toEqual(400);
+    expect(response.body).toEqual({ message: 'file is required', status_code: 400 });
+    expect(clients.detectionRulesClient.importRules).not.toHaveBeenCalled();
+  });
+
+  it('returns 500 when a collaborator throws', async () => {
+    stream.mockRejectedValue(new Error('parse failed'));
+
+    const response = await inject();
+
+    expect(response.status).toEqual(500);
+    expect(response.body).toEqual({ message: 'parse failed', status_code: 500 });
+  });
+
+  it('installs the prebuilt package and forwards import options', async () => {
+    const response = await inject(getImportRulesRequestOverwriteTrue(buildHapiStream('')));
+
+    expect(response.status).toEqual(200);
+    expect(createPrebuiltRuleAssetsClient).toHaveBeenCalled();
+    expect(packageInstall).toHaveBeenCalledWith(
+      'assets-client',
+      context.securitySolution,
+      clients.logger
+    );
+    expect(clients.detectionRulesClient.importRules).toHaveBeenCalledWith({
+      rules: [rule],
+      changeTracking: {
+        action: SecurityRuleChangeTrackingAction.ruleImport,
+        metadata: { bulkCount: 1 },
+      },
+      overwriteRules: true,
+      allowMissingConnectorSecrets: false,
+      batchSize: RULE_IMPORT_BATCH_SIZE,
+    });
+    expect(response.body).toEqual({
+      success: true,
+      success_count: 1,
+      rules_summary: { created: 1, updated: 0, skipped: 0, failed: 0 },
+      rules_count: 1,
+      errors: [],
+      exceptions_errors: [],
+      exceptions_success: true,
+      exceptions_success_count: 0,
+      action_connectors_success: true,
+      action_connectors_success_count: 0,
+      action_connectors_errors: [],
+      action_connectors_warnings: [],
+    });
+  });
+
+  it('sets allowMissingConnectorSecrets when connectors were in the file', async () => {
+    stream.mockResolvedValue([
+      { exceptions: [], rules: [rule], actionConnectors: [{ id: 'connector-1' } as never] },
+    ]);
+
+    await inject();
+
+    expect(clients.detectionRulesClient.importRules).toHaveBeenCalledWith(
+      expect.objectContaining({ allowMissingConnectorSecrets: true })
+    );
+  });
+
+  it('concatenates parse, duplicate, import, and action errors', async () => {
+    migrate.mockResolvedValue([new Error('bad json'), rule]);
+    dedupe.mockReturnValue([
+      [{ rule_id: 'rule-1', error: { status_code: 400, message: 'duplicate' } }],
+      [rule],
+    ]);
+    actions.mockResolvedValue({
+      validatedActionRules: [rule],
+      missingActionErrors: [
+        { rule_id: 'rule-1', error: { status_code: 400, message: 'missing action' } },
+      ],
+    });
+    responseActions.mockResolvedValue({
+      valid: [rule],
+      errors: [{ rule_id: 'rule-1', error: { status_code: 400, message: 'bad response action' } }],
+    });
+    clients.detectionRulesClient.importRules.mockResolvedValue({
+      successes: [],
+      errors: [
+        createRuleImportErrorObject({ ruleId: 'rule-1', message: 'import failed' }),
+        createRuleImportErrorObject({
+          ruleId: 'rule-2',
+          message: 'already exists',
+          type: 'conflict',
+        }),
+      ],
+    });
+
+    const response = await inject();
+
+    expect(response.status).toEqual(200);
+    expect(response.body.success).toEqual(false);
+    expect(response.body.success_count).toEqual(0);
+    expect(response.body.rules_count).toEqual(1);
+    expect(response.body.rules_summary).toEqual({
+      created: 0,
+      updated: 0,
+      skipped: 0,
+      failed: 1,
+    });
+    expect(response.body.errors).toEqual([
+      { error: { status_code: 400, message: 'bad json' } },
+      { rule_id: 'rule-1', error: { status_code: 400, message: 'duplicate' } },
+      { rule_id: 'rule-1', error: { status_code: 400, message: 'import failed' } },
+      { rule_id: 'rule-2', error: { status_code: 409, message: 'already exists' } },
+      { rule_id: 'rule-1', error: { status_code: 400, message: 'missing action' } },
+      { rule_id: 'rule-1', error: { status_code: 400, message: 'bad response action' } },
+    ]);
+  });
+
+  it('chunks at RULE_IMPORT_BATCH_SIZE and keeps leftover batchSize at 200', async () => {
+    const total = RULE_IMPORT_BATCH_SIZE + 1;
+    const rules = Array.from({ length: total }, (_, i) =>
+      getImportRulesSchemaMock({ rule_id: `rule-${i}` })
+    );
+    stream.mockResolvedValue([{ exceptions: [], rules, actionConnectors: [] }]);
+    dedupe.mockReturnValue([[], rules]);
+    migrate.mockResolvedValue(rules);
+    actions.mockResolvedValue({ validatedActionRules: rules, missingActionErrors: [] });
+    responseActions.mockResolvedValue({ valid: rules, errors: [] });
+    clients.detectionRulesClient.importRules
+      .mockResolvedValueOnce({
+        successes: [
+          {
+            rule_id: 'rule-0',
+            outcome: 'created',
+            telemetry: { id: 'id-0', type: 'query', rule_source: { type: 'internal' } },
+          },
+        ],
+        errors: [createRuleImportErrorObject({ ruleId: 'rule-1', message: 'first batch' })],
+      })
+      .mockResolvedValueOnce({
+        successes: [
+          {
+            rule_id: `rule-${RULE_IMPORT_BATCH_SIZE}`,
+            outcome: 'created',
+            telemetry: { id: 'id-last', type: 'query', rule_source: { type: 'internal' } },
+          },
+        ],
+        errors: [
+          createRuleImportErrorObject({
+            ruleId: 'rule-2',
+            message: 'second batch',
+            type: 'conflict',
+          }),
+        ],
+      });
+
+    const response = await inject();
+
+    expect(response.status).toEqual(200);
+    expect(response.body.success).toEqual(false);
+    expect(response.body.success_count).toEqual(2);
+    expect(response.body.errors).toEqual([
+      { rule_id: 'rule-1', error: { status_code: 400, message: 'first batch' } },
+      { rule_id: 'rule-2', error: { status_code: 409, message: 'second batch' } },
+    ]);
+    expect(clients.detectionRulesClient.importRules).toHaveBeenCalledTimes(2);
+    expect(clients.detectionRulesClient.importRules.mock.calls[0][0].rules).toHaveLength(
+      RULE_IMPORT_BATCH_SIZE
+    );
+    expect(clients.detectionRulesClient.importRules.mock.calls[1][0].rules).toHaveLength(1);
+    expect(clients.detectionRulesClient.importRules.mock.calls[0][0].batchSize).toBe(
+      RULE_IMPORT_BATCH_SIZE
+    );
+    expect(clients.detectionRulesClient.importRules.mock.calls[1][0].batchSize).toBe(
+      RULE_IMPORT_BATCH_SIZE
+    );
+    expect(clients.detectionRulesClient.importRules.mock.calls[0][0].changeTracking).toEqual({
+      action: SecurityRuleChangeTrackingAction.ruleImport,
+      metadata: { bulkCount: total },
+    });
+    expect(clients.detectionRulesClient.importRules.mock.calls[1][0].changeTracking).toEqual({
+      action: SecurityRuleChangeTrackingAction.ruleImport,
+      metadata: { bulkCount: total },
+    });
+  });
+
+  it('maps mixed import successes and errors to success_count plus 400/409', async () => {
+    stream.mockResolvedValue([
+      {
+        exceptions: [],
+        rules: ['rule-a', 'rule-b', 'rule-c', 'rule-d'].map((ruleId) => ({
+          ...rule,
+          rule_id: ruleId,
+        })),
+        actionConnectors: [],
+      },
+    ]);
+    clients.detectionRulesClient.importRules.mockResolvedValue({
+      successes: [
+        {
+          rule_id: 'rule-b',
+          outcome: 'updated',
+          telemetry: { id: 'id-rule-b', type: 'query', rule_source: { type: 'internal' } },
+        },
+        {
+          rule_id: 'rule-d',
+          outcome: 'skipped',
+          telemetry: { id: 'id-rule-d', type: 'query', rule_source: { type: 'internal' } },
+        },
+      ],
+      errors: [
+        createRuleImportErrorObject({ ruleId: 'rule-a', message: 'boom' }),
+        createRuleImportErrorObject({
+          ruleId: 'rule-c',
+          message: 'conflict',
+          type: 'conflict',
+        }),
+      ],
+    });
+
+    const response = await inject();
+
+    expect(response.status).toEqual(200);
+    expect(response.body.success).toEqual(false);
+    expect(response.body.success_count).toEqual(2);
+    expect(response.body.rules_count).toEqual(4);
+    expect(response.body.rules_summary).toEqual({
+      created: 0,
+      updated: 1,
+      skipped: 1,
+      failed: 2,
+    });
+    expect(response.body.errors).toEqual([
+      { rule_id: 'rule-a', error: { status_code: 400, message: 'boom' } },
+      { rule_id: 'rule-c', error: { status_code: 409, message: 'conflict' } },
+    ]);
+  });
+});

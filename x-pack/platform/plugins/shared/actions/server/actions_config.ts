@@ -1,0 +1,442 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import { readFileSync } from 'fs';
+import { isIPv6 } from 'node:net';
+import { rootCertificates } from 'node:tls';
+
+import { i18n } from '@kbn/i18n';
+import { tryCatch, map, mapNullable, getOrElse } from 'fp-ts/Option';
+import { curry } from 'lodash';
+import { pipe } from 'fp-ts/pipeable';
+
+import {
+  getSSLSettingsFromConfig,
+  type CustomHostSettings,
+  type ProxySettings,
+  type SSLSettings,
+} from '@kbn/actions-utils';
+import type { ActionsConfig } from './config';
+import { AllowedHosts, EnabledActionTypes, DEFAULT_QUEUED_MAX } from './config';
+import { getCanonicalCustomHostUrl } from './lib/custom_host_settings';
+import { ActionTypeDisabledError } from './lib';
+import { parseDuration } from './lib/parse_date';
+import type { AwsSesConfig, ResponseSettings } from './types';
+import type { ValidateEmailAddressesOptions } from '../common';
+import {
+  validateEmailAddresses,
+  invalidEmailsAsMessage,
+  DEFAULT_EMAIL_BODY_LENGTH,
+  MAX_EMAIL_BODY_LENGTH,
+} from '../common';
+export { AllowedHosts, EnabledActionTypes } from './config';
+
+enum AllowListingField {
+  URL = 'url',
+  hostname = 'hostname',
+}
+
+export interface InboundEventAdmissionConfig {
+  enabled: boolean;
+  maxInFlight: number;
+  maxInFlightPerConnector: number;
+}
+
+export interface InboundEventRateLimitBudgetConfig {
+  limit: number;
+  windowMs: number;
+}
+
+export interface InboundEventRateLimitConfig {
+  enabled: boolean;
+  maxKeys: number;
+  remoteAddress: InboundEventRateLimitBudgetConfig;
+  connector: InboundEventRateLimitBudgetConfig;
+}
+
+export const DEFAULT_MAX_ATTEMPTS = 3;
+
+interface FileBasedSSLConfig {
+  verificationMode?: SSLSettings['verificationMode'];
+  certificate?: string;
+  key?: string;
+  certificateAuthorities?: string | readonly string[];
+}
+
+interface ResolveFileBasedSSLSettingsOptions {
+  ssl: FileBasedSSLConfig | undefined;
+  serviceName: string;
+  includeSystemCertificateAuthorities?: boolean;
+  allowPartialTrustChain?: boolean;
+}
+
+const resolveFileBasedSSLSettings = ({
+  ssl,
+  serviceName,
+  includeSystemCertificateAuthorities = false,
+  allowPartialTrustChain,
+}: ResolveFileBasedSSLSettingsOptions): SSLSettings => {
+  const readSSLFile = (filePath: string, configKey: string): Buffer => {
+    try {
+      return readFileSync(filePath);
+    } catch (err) {
+      throw new Error(
+        `${serviceName} SSL configuration error: failed to read ${configKey} file: ${err.message}`
+      );
+    }
+  };
+  const certificateAuthorityPaths = ssl?.certificateAuthorities
+    ? Array.isArray(ssl.certificateAuthorities)
+      ? ssl.certificateAuthorities
+      : [ssl.certificateAuthorities]
+    : [];
+  const certificateAuthorities = certificateAuthorityPaths.map((filePath) =>
+    readSSLFile(filePath, 'certificateAuthorities')
+  );
+  const settings: SSLSettings = {
+    ...getSSLSettingsFromConfig(ssl?.verificationMode),
+    cert: ssl?.certificate ? readSSLFile(ssl.certificate, 'certificate') : undefined,
+    key: ssl?.key ? readSSLFile(ssl.key, 'key') : undefined,
+    ca:
+      certificateAuthorities.length > 0
+        ? Buffer.concat([
+            ...(includeSystemCertificateAuthorities
+              ? [Buffer.from(`${rootCertificates.join('\n')}\n`)]
+              : []),
+            ...certificateAuthorities,
+          ])
+        : undefined,
+  };
+
+  if (allowPartialTrustChain !== undefined) {
+    settings.allowPartialTrustChain = allowPartialTrustChain;
+  }
+
+  return settings;
+};
+
+const createCachedSSLSettings = (resolve: () => SSLSettings): (() => SSLSettings) => {
+  let cache: SSLSettings | undefined;
+  return () => {
+    cache ??= resolve();
+    return cache;
+  };
+};
+
+export interface ActionsConfigurationUtilities {
+  isHostnameAllowed: (hostname: string) => boolean;
+  isUriAllowed: (uri: string) => boolean;
+  isActionTypeEnabled: (actionType: string) => boolean;
+  ensureHostnameAllowed: (hostname: string) => void;
+  ensureUriAllowed: (uri: string) => void;
+  ensureActionTypeEnabled: (actionType: string) => void;
+  getSSLSettings: () => SSLSettings;
+  getEARSSSLSettings: () => SSLSettings;
+  getRelaySSLSettings: () => SSLSettings;
+  getProxySettings: () => undefined | ProxySettings;
+  getResponseSettings: () => ResponseSettings;
+  getCustomHostSettings: (targetUrl: string) => CustomHostSettings | undefined;
+  getMicrosoftGraphApiUrl: () => string;
+  getMicrosoftGraphApiScope: () => string;
+  getMicrosoftExchangeUrl: () => string;
+  getMaxAttempts: ({
+    actionTypeMaxAttempts,
+    actionTypeId,
+  }: {
+    actionTypeMaxAttempts?: number;
+    actionTypeId: string;
+  }) => number;
+  validateEmailAddresses(
+    addresses: string[],
+    options?: ValidateEmailAddressesOptions
+  ): string | undefined;
+  enableFooterInEmail: () => boolean;
+  getMaxQueued: () => number;
+  getWebhookSettings(): {
+    ssl: {
+      pfx: {
+        enabled: boolean;
+      };
+    };
+  };
+  getAwsSesConfig: () => AwsSesConfig;
+  getEnabledEmailServices: () => string[];
+  getMaxEmailBodyLength: () => number;
+  getEarsUrl: () => string | undefined;
+  isEarsEnabled: () => boolean;
+  isEarsExperimentalEnabled: () => boolean;
+  isInboundEventsEnabled: () => boolean;
+  getInboundEventsMaxBodyBytes: () => number;
+  getInboundEventsMaxEmitted: () => number;
+  getInboundEventsAdmission: () => InboundEventAdmissionConfig;
+  getInboundEventsRateLimit: () => InboundEventRateLimitConfig;
+  isConnectorSigningKeysEnabled: () => boolean;
+}
+
+function allowListErrorMessage(field: AllowListingField, value: string) {
+  return i18n.translate('xpack.actions.urlAllowedHostsConfigurationError', {
+    defaultMessage:
+      'target {field} "{value}" is not added to the Kibana config xpack.actions.allowedHosts',
+    values: {
+      value,
+      field,
+    },
+  });
+}
+
+function disabledActionTypeErrorMessage(actionType: string) {
+  return i18n.translate('xpack.actions.disabledActionTypeError', {
+    defaultMessage:
+      'action type "{actionType}" is not enabled in the Kibana config xpack.actions.enabledActionTypes',
+    values: {
+      actionType,
+    },
+  });
+}
+
+// URL wraps IPv6 hostnames in brackets and compresses them (`2001:db8:0::1` -> `2001:db8::1`),
+// so both allowedHosts entries and checked hostnames are reduced to that same unbracketed form
+function normalizeHostname(hostname: string): string {
+  const unbracketed =
+    hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
+  if (!isIPv6(unbracketed)) return unbracketed;
+
+  try {
+    return new URL(`http://[${unbracketed}]`).hostname.slice(1, -1);
+  } catch (err) {
+    return unbracketed;
+  }
+}
+
+function isAllowed({ allowedHosts }: ActionsConfig, hostname: string | null): boolean {
+  const allowed = new Set(allowedHosts.map(normalizeHostname));
+  if (allowed.has(AllowedHosts.Any)) return true;
+  if (hostname && allowed.has(normalizeHostname(hostname))) return true;
+  return false;
+}
+
+function parseUri(uri: string): URL {
+  // network path references (`//host/path`) have no scheme, which URL requires
+  return new URL(uri.startsWith('//') ? `http:${uri}` : uri);
+}
+
+function isHostnameAllowedInUri(config: ActionsConfig, uri: string): boolean {
+  return pipe(
+    tryCatch(() => parseUri(uri)),
+    map((parsedUrl) => parsedUrl.hostname),
+    mapNullable((hostname) => isAllowed(config, hostname)),
+    getOrElse<boolean>(() => false)
+  );
+}
+
+function isActionTypeEnabledInConfig(
+  { enabledActionTypes }: ActionsConfig,
+  actionType: string
+): boolean {
+  const enabled = new Set(enabledActionTypes);
+  if (enabled.has(EnabledActionTypes.Any)) return true;
+  if (enabled.has(actionType)) return true;
+  return false;
+}
+
+function getProxySettingsFromConfig(config: ActionsConfig): undefined | ProxySettings {
+  if (!config.proxyUrl) {
+    return undefined;
+  }
+
+  return {
+    proxyUrl: config.proxyUrl,
+    proxyBypassHosts: arrayAsSet(config.proxyBypassHosts),
+    proxyOnlyHosts: arrayAsSet(config.proxyOnlyHosts),
+    proxyHeaders: config.proxyHeaders,
+    proxySSLSettings: getSSLSettingsFromConfig(config.ssl?.proxyVerificationMode),
+  };
+}
+
+function getMicrosoftGraphApiUrlFromConfig(config: ActionsConfig): string {
+  return config.microsoftGraphApiUrl;
+}
+
+function getMicrosoftGraphApiScopeFromConfig(config: ActionsConfig): string {
+  return config.microsoftGraphApiScope;
+}
+
+function getMicrosoftExchangeUrlFromConfig(config: ActionsConfig): string {
+  return config.microsoftExchangeUrl;
+}
+
+function arrayAsSet<T>(arr: T[] | undefined): Set<T> | undefined {
+  if (!arr) return;
+  return new Set(arr);
+}
+
+function getResponseSettingsFromConfig(config: ActionsConfig): ResponseSettings {
+  return {
+    maxContentLength: config.maxResponseContentLength.getValueInBytes(),
+    timeout: config.responseTimeout.asMilliseconds(),
+  };
+}
+
+function getCustomHostSettings(
+  config: ActionsConfig,
+  targetUrl: string
+): CustomHostSettings | undefined {
+  const customHostSettings = config.customHostSettings;
+  if (!customHostSettings) {
+    return;
+  }
+
+  let parsedUrl: URL | undefined;
+  try {
+    parsedUrl = new URL(targetUrl);
+  } catch (err) {
+    // presumably this bad URL is reported elsewhere
+    return;
+  }
+
+  const canonicalUrl = getCanonicalCustomHostUrl(parsedUrl);
+  return customHostSettings.find((settings) => settings.url === canonicalUrl);
+}
+
+function validateEmails(
+  config: ActionsConfig,
+  addresses: string[],
+  options: ValidateEmailAddressesOptions
+): string | undefined {
+  const validated = validateEmailAddresses(
+    config.email?.domain_allowlist ?? null,
+    addresses,
+    options,
+    config.email?.recipient_allowlist ?? null
+  );
+  return invalidEmailsAsMessage(validated);
+}
+
+export function getActionsConfigurationUtilities(
+  config: ActionsConfig
+): ActionsConfigurationUtilities {
+  const isHostnameAllowed = curry(isAllowed)(config);
+  const isUriAllowed = curry(isHostnameAllowedInUri)(config);
+  const isActionTypeEnabled = curry(isActionTypeEnabledInConfig)(config);
+  const validatedEmailCurried = curry(validateEmails)(config);
+  const getEARSSSLSettings = createCachedSSLSettings(() =>
+    resolveFileBasedSSLSettings({
+      ssl: config.auth.ears?.ssl,
+      serviceName: 'EARS',
+    })
+  );
+  const getRelaySSLSettings = createCachedSSLSettings(() =>
+    resolveFileBasedSSLSettings({
+      ssl: config.relay?.ssl,
+      serviceName: 'Relay',
+      includeSystemCertificateAuthorities: true,
+      allowPartialTrustChain: config.relay?.ssl ? true : undefined,
+    })
+  );
+  return {
+    isHostnameAllowed,
+    isUriAllowed,
+    isActionTypeEnabled,
+    getProxySettings: () => getProxySettingsFromConfig(config),
+    getResponseSettings: () => getResponseSettingsFromConfig(config),
+    getSSLSettings: () => getSSLSettingsFromConfig(config.ssl?.verificationMode),
+    getEARSSSLSettings,
+    getRelaySSLSettings,
+    ensureUriAllowed(uri: string) {
+      if (!isUriAllowed(uri)) {
+        throw new Error(allowListErrorMessage(AllowListingField.URL, uri));
+      }
+    },
+    ensureHostnameAllowed(hostname: string) {
+      if (!isHostnameAllowed(hostname)) {
+        throw new Error(allowListErrorMessage(AllowListingField.hostname, hostname));
+      }
+    },
+    ensureActionTypeEnabled(actionType: string) {
+      if (!isActionTypeEnabled(actionType)) {
+        throw new ActionTypeDisabledError(disabledActionTypeErrorMessage(actionType), 'config');
+      }
+    },
+    getCustomHostSettings: (targetUrl: string) => getCustomHostSettings(config, targetUrl),
+    getMicrosoftGraphApiUrl: () => getMicrosoftGraphApiUrlFromConfig(config),
+    getMicrosoftGraphApiScope: () => getMicrosoftGraphApiScopeFromConfig(config),
+    getMicrosoftExchangeUrl: () => getMicrosoftExchangeUrlFromConfig(config),
+    validateEmailAddresses: (addresses: string[], options: ValidateEmailAddressesOptions) =>
+      validatedEmailCurried(addresses, options),
+    getMaxAttempts: ({ actionTypeMaxAttempts, actionTypeId }) => {
+      const connectorTypeConfig = config.run?.connectorTypeOverrides?.find(
+        (connectorType) => actionTypeId === connectorType.id
+      );
+
+      return (
+        connectorTypeConfig?.maxAttempts ||
+        config.run?.maxAttempts ||
+        actionTypeMaxAttempts ||
+        DEFAULT_MAX_ATTEMPTS
+      );
+    },
+    enableFooterInEmail: () => config.enableFooterInEmail,
+    getMaxQueued: () => config.queued?.max || DEFAULT_QUEUED_MAX,
+    getWebhookSettings: () => {
+      return {
+        ssl: {
+          pfx: {
+            enabled: config.webhook?.ssl.pfx.enabled ?? true,
+          },
+        },
+      };
+    },
+    getAwsSesConfig: () => {
+      if (config.email?.services?.ses?.host && config.email?.services?.ses?.port) {
+        return {
+          host: config.email?.services?.ses?.host,
+          port: config.email?.services?.ses?.port,
+          secure: true,
+        };
+      }
+
+      return null;
+    },
+    getEnabledEmailServices() {
+      const emailServices = config.email?.services?.enabled;
+      if (emailServices) {
+        return Array.from(new Set(Array.from(emailServices)));
+      }
+
+      return ['*'];
+    },
+    getMaxEmailBodyLength() {
+      const configuredLength = config.email?.maximum_body_length ?? DEFAULT_EMAIL_BODY_LENGTH;
+      const nonNegativeLength = Math.max(0, configuredLength);
+      return Math.min(nonNegativeLength, MAX_EMAIL_BODY_LENGTH);
+    },
+    getEarsUrl: () => config.auth.ears?.url,
+    isEarsEnabled: () => (config.auth.ears?.enabled ?? true) && !!config.auth.ears?.url,
+    isEarsExperimentalEnabled: () => config.auth.ears?.enableExperimental ?? false,
+    isInboundEventsEnabled: () => config.inboundEvents.enabled,
+    getInboundEventsMaxBodyBytes: () => config.inboundEvents.maxBodyBytes.getValueInBytes(),
+    getInboundEventsMaxEmitted: () => config.inboundEvents.maxEmitted,
+    getInboundEventsAdmission: (): InboundEventAdmissionConfig => ({
+      enabled: config.inboundEvents.admission.enabled,
+      maxInFlight: config.inboundEvents.admission.maxInFlight,
+      maxInFlightPerConnector: config.inboundEvents.admission.maxInFlightPerConnector,
+    }),
+    getInboundEventsRateLimit: (): InboundEventRateLimitConfig => ({
+      enabled: config.inboundEvents.rateLimit.enabled,
+      maxKeys: config.inboundEvents.rateLimit.maxKeys,
+      remoteAddress: {
+        limit: config.inboundEvents.rateLimit.remoteAddress.limit,
+        windowMs: parseDuration(config.inboundEvents.rateLimit.remoteAddress.window),
+      },
+      connector: {
+        limit: config.inboundEvents.rateLimit.connector.limit,
+        windowMs: parseDuration(config.inboundEvents.rateLimit.connector.window),
+      },
+    }),
+    isConnectorSigningKeysEnabled: () => config.connectorSigningKeys.enabled,
+  };
+}

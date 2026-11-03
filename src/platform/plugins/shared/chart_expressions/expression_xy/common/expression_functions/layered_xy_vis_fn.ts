@@ -1,0 +1,84 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+import { XY_VIS_RENDERER } from '../constants';
+import type { LayeredXyVisFn } from '../types';
+import { type XYRender } from '../types';
+import { logDatatables, logDatatable } from '../utils';
+import {
+  validateMarkSizeRatioLimits,
+  validateAddTimeMarker,
+  validateMinTimeBarInterval,
+  hasBarLayer,
+  errors,
+  validateAxes,
+} from './validate';
+import { appendLayerIds, getDataLayers } from '../helpers';
+import {
+  applyAxisFormatPolicies,
+  applyYAxisExtentPolicies,
+  resolveAxisFormatPolicies,
+} from '../axis_format_policy';
+
+export const layeredXyVisFn: LayeredXyVisFn['fn'] = async (data, args, handlers) => {
+  const layers = appendLayerIds(args.layers ?? [], 'layers');
+  const axisFormatPolicies = resolveAxisFormatPolicies(layers, args.yAxisConfigs);
+
+  if (args.singleTable) {
+    logDatatable(data, layers, handlers, args.splitColumnAccessor, args.splitRowAccessor);
+  } else {
+    logDatatables(
+      layers,
+      handlers,
+      args.splitColumnAccessor,
+      args.splitRowAccessor,
+      args.annotations
+    );
+  }
+
+  const chartLayers = applyAxisFormatPolicies(layers, axisFormatPolicies);
+  const yAxisConfigs = applyYAxisExtentPolicies(args.yAxisConfigs, axisFormatPolicies);
+  const dataLayers = getDataLayers(chartLayers);
+  const hasBar = hasBarLayer(dataLayers);
+  validateAddTimeMarker(dataLayers, args.addTimeMarker);
+  validateMarkSizeRatioLimits(args.markSizeRatio);
+  validateMinTimeBarInterval(dataLayers, hasBar, args.minTimeBarInterval);
+  const hasMarkSizeAccessors =
+    dataLayers.filter((dataLayer) => dataLayer.markSizeAccessor !== undefined).length > 0;
+
+  if (!hasMarkSizeAccessors && args.markSizeRatio !== undefined) {
+    throw new Error(errors.markSizeRatioWithoutAccessor());
+  }
+
+  validateAxes(dataLayers, yAxisConfigs);
+
+  return {
+    type: 'render',
+    as: XY_VIS_RENDERER,
+    value: {
+      args: {
+        ...args,
+        layers: chartLayers,
+        yAxisConfigs,
+        axisFormatPolicies,
+        minBarHeight: args.minBarHeight ?? 1,
+        markSizeRatio: hasMarkSizeAccessors && !args.markSizeRatio ? 10 : args.markSizeRatio,
+        ariaLabel:
+          args.ariaLabel ??
+          (handlers.variables?.embeddableTitle as string) ??
+          handlers.getExecutionContext?.()?.description,
+      },
+      canNavigateToLens: Boolean(handlers.variables.canNavigateToLens),
+      syncColors: handlers?.isSyncColorsEnabled?.() ?? false,
+      syncTooltips: handlers?.isSyncTooltipsEnabled?.() ?? false,
+      syncCursor: handlers?.isSyncCursorEnabled?.() ?? true,
+      overrides: handlers.variables?.overrides as XYRender['value']['overrides'],
+    },
+  };
+};

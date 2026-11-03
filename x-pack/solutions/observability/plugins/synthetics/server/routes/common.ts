@@ -1,0 +1,413 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import { z } from '@kbn/zod';
+import { isEmpty } from 'lodash';
+import { escapeQuotes } from '@kbn/es-query';
+import { DEFAULT_SPACE_ID } from '@kbn/core-spaces-common';
+import { useLogicalAndFields } from '../../common/constants';
+import type { RouteContext } from './types';
+import {
+  MonitorSortFieldSchema,
+  OverviewStatusSortFieldSchema,
+} from '../../common/runtime_types/schemas/sort_field';
+import {
+  MONITOR_STATUS_ENUM,
+  OVERVIEW_STATUS_MAX_PER_PAGE,
+} from '../../common/constants/monitor_management';
+import { getAllLocations } from '../synthetics_service/get_all_locations';
+import type { PrivateLocation, ServiceLocation } from '../../common/runtime_types';
+import { syntheticsMonitorAttributes } from '../../common/types/saved_objects';
+import {
+  jsonArrayFromString,
+  MAX_DATE_RANGE_LENGTH,
+  MAX_ROUTE_STRING_LENGTH,
+  queryBoolean,
+  queryNumber,
+  queryNumberFrom,
+} from './zod_query';
+
+const MAX_MONITOR_QUERY_IDS_IN_BODY = 10000;
+const MAX_MONITOR_QUERY_ID_LENGTH = 256;
+const MAX_FILTER_ITEM_LENGTH = MAX_ROUTE_STRING_LENGTH;
+const MAX_FILTER_ARRAY_SIZE = 1000;
+const MAX_SEARCH_AFTER_SIZE = 50;
+
+const stringOrArray = z
+  .union([
+    z.string().max(MAX_FILTER_ITEM_LENGTH),
+    z.array(z.string().max(MAX_FILTER_ITEM_LENGTH)).max(MAX_FILTER_ARRAY_SIZE),
+  ])
+  .optional()
+  .describe('A string or an array of strings.');
+
+const stringOrArrayFilter = (description: string) =>
+  stringOrArray.describe(`${description} Accepts a string or an array of strings.`);
+
+const CommonQuerySchema = {
+  query: z.string().max(MAX_ROUTE_STRING_LENGTH).optional().describe('A free-text query string.'),
+  filter: z
+    .string()
+    .max(MAX_ROUTE_STRING_LENGTH)
+    .optional()
+    .describe('Additional KQL filtering criteria.'),
+  tags: stringOrArrayFilter('Tags to filter monitors.'),
+  monitorTypes: stringOrArrayFilter('The monitor types to filter by, such as `http`.'),
+  locations: stringOrArrayFilter('The location IDs to filter by.'),
+  projects: stringOrArrayFilter('The projects to filter by.'),
+  schedules: stringOrArrayFilter('The schedules to filter by.'),
+  // Remote cluster aliases. Only honoured by the overview status route, where
+  // it scopes pings to documents whose `_index` is prefixed by one of the
+  // selected aliases (CCS pattern `<alias>:<index>`). Saved-object-backed
+  // routes ignore it because remote monitors have no local saved object.
+  remoteNames: stringOrArray,
+  status: stringOrArrayFilter('The monitor statuses to filter by.'),
+  monitorQueryIds: stringOrArrayFilter('The monitor query IDs to filter by.'),
+  configIds: stringOrArrayFilter('The monitor config IDs to filter by.'),
+  showFromAllSpaces: queryBoolean
+    .optional()
+    .describe('If `true`, return monitors from all spaces the user can access.'),
+  useLogicalAndFor: z
+    .union([
+      z.string().max(MAX_FILTER_ITEM_LENGTH),
+      z.array(z.enum(useLogicalAndFields)).max(MAX_FILTER_ARRAY_SIZE),
+    ])
+    .optional()
+    .describe('Apply logical AND for `tags` and/or `locations`. Accepts a string or an array.'),
+  // Date-range window for the overview list (see runtime type docs). The
+  // overview page always sends these; their presence scopes each monitor's
+  // status to the window instead of the default "current status" look-back.
+  // Bounded length: these only ever carry a short datemath expression
+  // (`now-15m`) or an ISO-8601 timestamp, so cap the input to avoid unbounded
+  // strings reaching `datemath.parse` (CodeQL: unbounded string DoS).
+  dateRangeStart: z
+    .string()
+    .max(MAX_DATE_RANGE_LENGTH)
+    .optional()
+    .describe('The start of the status window, as datemath (`now-15m`) or an ISO-8601 timestamp.'),
+  dateRangeEnd: z
+    .string()
+    .max(MAX_DATE_RANGE_LENGTH)
+    .optional()
+    .describe('The end of the status window, as datemath (`now`) or an ISO-8601 timestamp.'),
+};
+
+export const QuerySchema = z.strictObject({
+  ...CommonQuerySchema,
+  page: queryNumber.optional().describe('The page number for paginated results.'),
+  perPage: queryNumber.optional().describe('The number of items to return per page.'),
+  sortField: MonitorSortFieldSchema.describe('The field to sort the results by.'),
+  sortOrder: z.enum(['desc', 'asc']).optional().describe('The sort order.'),
+  searchAfter: jsonArrayFromString(
+    z.string().max(MAX_FILTER_ITEM_LENGTH),
+    MAX_SEARCH_AFTER_SIZE,
+    MAX_FILTER_ITEM_LENGTH
+  )
+    .optional()
+    .describe('A JSON array of sort values from the previous page, for cursor-based paging.'),
+  internal: queryBoolean.optional().default(false).describe('For internal use only.'),
+});
+
+export type MonitorsQuery = z.infer<typeof QuerySchema>;
+
+export const OverviewStatusSchema = z.strictObject({
+  ...CommonQuerySchema,
+  scopeStatusByLocation: queryBoolean.optional(),
+  groupByMonitor: queryBoolean.optional(),
+  // When explicitly `false`, read-only Heartbeat / Elastic Agent managed
+  // monitors (no saved object, `origin: 'heartbeat'`) are excluded from the
+  // overview. Defaults to showing them; remote (CCS) monitors are unaffected.
+  includeHeartbeatMonitors: queryBoolean.optional(),
+  page: queryNumberFrom(1).optional(),
+  perPage: queryNumberFrom(1, OVERVIEW_STATUS_MAX_PER_PAGE).optional(),
+  sortField: OverviewStatusSortFieldSchema,
+  sortOrder: z.enum(['asc', 'desc']).optional(),
+  statusFilter: z
+    .enum([
+      MONITOR_STATUS_ENUM.UP,
+      MONITOR_STATUS_ENUM.DOWN,
+      MONITOR_STATUS_ENUM.PENDING,
+      MONITOR_STATUS_ENUM.STALE,
+      MONITOR_STATUS_ENUM.DISABLED,
+    ])
+    .optional(),
+});
+
+export type OverviewStatusQuery = z.infer<typeof OverviewStatusSchema>;
+
+export const OverviewStatusStaleBodySchema = z.strictObject({
+  monitorQueryIds: z
+    .array(z.string().max(MAX_MONITOR_QUERY_ID_LENGTH))
+    .min(1)
+    .max(MAX_MONITOR_QUERY_IDS_IN_BODY),
+});
+
+export type OverviewStatusStaleBody = z.infer<typeof OverviewStatusStaleBodySchema>;
+
+export const MONITOR_SEARCH_FIELDS = [
+  'name',
+  'tags.text',
+  'locations.id.text',
+  'locations.label',
+  'urls',
+  'hosts',
+  'project_id.text',
+];
+
+/**
+ * Ping-document equivalents of `MONITOR_SEARCH_FIELDS`, used to scope the
+ * overview status aggregation by the search box query.
+ *
+ * These MUST stay aligned with the saved-object search fields above: the
+ * overview lists monitors via the saved-object search but derives each
+ * monitor's status from ping data matched by these fields. A field that lists a
+ * monitor (e.g. by location or host) but is not matched here would strip that
+ * monitor's status data, misclassifying it — e.g. a `stale` monitor would read
+ * as `pending`.
+ */
+export const MONITOR_STATUS_PING_SEARCH_FIELDS = [
+  'monitor.name',
+  'monitor.name.text',
+  'tags',
+  'observer.name',
+  'observer.geo.name',
+  'urls',
+  'hosts',
+  'url.full',
+  'url.domain',
+  'monitor.project.id',
+];
+
+interface Filters {
+  filter?: string;
+  tags?: string | string[];
+  monitorTypes?: string | string[];
+  locations?: string | string[];
+  projects?: string | string[];
+  schedules?: string | string[];
+  monitorQueryIds?: string | string[];
+  configIds?: string | string[];
+}
+
+export const getMonitorFilters = async (
+  context: RouteContext,
+  attr: string = syntheticsMonitorAttributes
+) => {
+  const {
+    tags,
+    monitorTypes,
+    filter = '',
+    projects,
+    schedules,
+    monitorQueryIds,
+    configIds,
+    locations: queryLocations,
+    useLogicalAndFor,
+  } = context.request.query;
+  const locations = await parseLocationFilter(context, queryLocations);
+
+  return parseArrayFilters(
+    {
+      filter,
+      tags,
+      monitorTypes,
+      projects,
+      schedules,
+      monitorQueryIds,
+      configIds,
+      locations,
+    },
+    useLogicalAndFor,
+    attr
+  );
+};
+
+export const parseArrayFilters = (
+  {
+    tags,
+    filter,
+    configIds,
+    projects,
+    monitorTypes,
+    schedules,
+    monitorQueryIds,
+    locations,
+  }: Filters,
+  useLogicalAndFor: MonitorsQuery['useLogicalAndFor'] = [],
+  attributes: string = syntheticsMonitorAttributes
+) => {
+  const filtersStr = [
+    filter,
+    getSavedObjectKqlFilter({
+      field: 'tags',
+      values: tags,
+      operator: useLogicalAndFor.includes('tags') ? 'AND' : 'OR',
+      attributes,
+    }),
+    getSavedObjectKqlFilter({ field: 'project_id', values: projects, attributes }),
+    getSavedObjectKqlFilter({ field: 'type', values: monitorTypes, attributes }),
+    getSavedObjectKqlFilter({
+      field: 'locations.id',
+      values: locations,
+      operator: useLogicalAndFor.includes('locations') ? 'AND' : 'OR',
+      attributes,
+    }),
+    getSavedObjectKqlFilter({ field: 'schedule.number', values: schedules, attributes }),
+    getSavedObjectKqlFilter({ field: 'id', values: monitorQueryIds, attributes }),
+    getSavedObjectKqlFilter({ field: 'config_id', values: configIds, attributes }),
+  ]
+    .filter((f) => !!f)
+    .join(' AND ');
+
+  return { filtersStr, locationIds: locations };
+};
+
+export const getSavedObjectKqlFilter = ({
+  field,
+  values,
+  operator = 'OR',
+  searchAtRoot = false,
+  attributes = syntheticsMonitorAttributes,
+}: {
+  field: string;
+  values?: string | string[];
+  operator?: string;
+  searchAtRoot?: boolean;
+  attributes?: string;
+}) => {
+  if (values === 'All' || (Array.isArray(values) && values?.includes('All'))) {
+    return undefined;
+  }
+
+  if (isEmpty(values) || !values) {
+    return '';
+  }
+  let fieldKey = '';
+  if (searchAtRoot) {
+    fieldKey = `${field}`;
+  } else {
+    fieldKey = `${attributes}.${field}`;
+  }
+
+  if (Array.isArray(values)) {
+    return `${fieldKey}:(${values
+      .map((value) => `"${escapeQuotes(value)}"`)
+      .join(` ${operator} `)})`;
+  }
+
+  return `${fieldKey}:"${escapeQuotes(values)}"`;
+};
+
+export const parseLocationFilter = async (
+  {
+    syntheticsMonitorClient,
+    savedObjectsClient,
+    server,
+  }: Pick<RouteContext, 'syntheticsMonitorClient' | 'savedObjectsClient' | 'server'>,
+  locations?: string | string[]
+) => {
+  if (!locations || locations?.length === 0) {
+    return;
+  }
+
+  const { allLocations } = await getAllLocations({
+    syntheticsMonitorClient,
+    savedObjectsClient,
+    server,
+    excludeAgentPolicies: true,
+  });
+
+  if (Array.isArray(locations)) {
+    return locations
+      .map((loc) => findLocationItem(loc, allLocations)?.id ?? '')
+      .filter((val) => !!val);
+  }
+
+  return [findLocationItem(locations, allLocations)?.id ?? ''];
+};
+
+export const findLocationItem = (
+  query: string,
+  locations: Array<ServiceLocation | PrivateLocation>
+) => {
+  return locations.find(({ id, label }) => query === id || label === query);
+};
+
+/**
+ * Returns whether the query is likely to return a subset of monitor objects.
+ * Useful where `absoluteTotal` needs to be determined with a separate call
+ * @param monitorQuery { MonitorsQuery }
+ */
+export const isMonitorsQueryFiltered = (monitorQuery: MonitorsQuery) => {
+  const {
+    query,
+    tags,
+    monitorTypes,
+    locations,
+    status,
+    filter,
+    projects,
+    schedules,
+    remoteNames,
+    monitorQueryIds,
+    configIds,
+  } = monitorQuery;
+
+  return (
+    !!query ||
+    !!filter ||
+    !!locations?.length ||
+    !!monitorTypes?.length ||
+    !!tags?.length ||
+    !!status?.length ||
+    !!projects?.length ||
+    !!schedules?.length ||
+    !!remoteNames?.length ||
+    !!monitorQueryIds?.length ||
+    !!configIds?.length
+  );
+};
+
+export function parseMappingKey(key: string | undefined) {
+  switch (key) {
+    case 'schedule':
+    case 'schedule.keyword':
+      return 'schedule.number';
+    case 'project_id.keyword':
+      return 'project_id';
+    case 'tags.keyword':
+      return 'tags';
+    case 'name':
+    case 'type':
+      return `${key}.keyword`;
+    default:
+      return key;
+  }
+}
+
+export const validateRouteSpaceName = async (routeContext: RouteContext) => {
+  const { spaceId, server, request, response } = routeContext;
+  if (spaceId === DEFAULT_SPACE_ID) {
+    // default space is always valid
+    return { spaceId: DEFAULT_SPACE_ID };
+  }
+
+  try {
+    await server.spaces?.spacesService.getActiveSpace(request);
+  } catch (error) {
+    if (error.output?.statusCode === 404) {
+      return {
+        spaceId,
+        invalidResponse: response.notFound({
+          body: { message: `Kibana space '${spaceId}' does not exist` },
+        }),
+      };
+    }
+  }
+
+  return { invalidResponse: undefined };
+};

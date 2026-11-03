@@ -1,0 +1,153 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import { partition } from 'lodash';
+import type { BulkGetUnifiedAttachmentsResponse } from '../../../common/types/api';
+import {
+  BulkGetUnifiedAttachmentsRequestSchema,
+  BulkGetUnifiedAttachmentsResponseSchema,
+} from '../../../common/types/api';
+import type { AttachmentAttributes, AttachmentAttributesV2 } from '../../../common/types/domain';
+import { flattenAttachmentSavedObjects } from '../../common/utils';
+import { createCaseError, generateCaseErrorResponse } from '../../common/error';
+import type { CasesClientArgs } from '../types';
+import { Operations } from '../../authorization';
+import type { BulkGetArgs } from './types';
+import type { BulkOptionalAttributes, OptionalAttributes } from '../../services/attachments/types';
+import type { CasesClient } from '../client';
+import type { AttachmentSavedObject, SOWithErrors } from '../../common/types';
+import { partitionByCaseAssociation } from '../../common/partitioning';
+import { getCaseReferenceId } from '../../common/references';
+import { decodeOrThrowZod, decodeWithExcessOrThrowZod } from '../../common/runtime_types';
+
+type AttachmentSavedObjectWithErrors = Array<SOWithErrors<AttachmentAttributes>>;
+
+/**
+ * Retrieves multiple attachments by id.
+ */
+export async function bulkGet(
+  { savedObjectIds, caseID }: BulkGetArgs,
+  clientArgs: CasesClientArgs,
+  casesClient: CasesClient
+): Promise<BulkGetUnifiedAttachmentsResponse> {
+  const {
+    services: { attachmentService },
+    logger,
+    authorization,
+  } = clientArgs;
+
+  try {
+    const request = decodeWithExcessOrThrowZod(BulkGetUnifiedAttachmentsRequestSchema)({
+      ids: savedObjectIds,
+    });
+
+    // perform an authorization check for the case
+    await casesClient.cases.resolve({ id: caseID });
+
+    const attachments = await attachmentService.getter.bulkGet(request.ids);
+
+    const { validAttachments, attachmentsWithErrors, invalidAssociationAttachments } =
+      partitionAttachments(caseID, attachments);
+
+    const { authorized: authorizedAttachments, unauthorized: unauthorizedAttachments } =
+      await authorization.getAndEnsureAuthorizedEntities({
+        savedObjects: validAttachments,
+        operation: Operations.bulkGetAttachments,
+      });
+
+    const errors = constructErrors({
+      associationErrors: invalidAssociationAttachments,
+      unauthorizedAttachments,
+      soBulkGetErrors: attachmentsWithErrors,
+      caseId: caseID,
+    });
+
+    const res = {
+      attachments: flattenAttachmentSavedObjects(authorizedAttachments),
+      errors,
+    };
+    return decodeOrThrowZod(BulkGetUnifiedAttachmentsResponseSchema)(res);
+  } catch (error) {
+    throw createCaseError({
+      message: `Failed to bulk get attachments for case id: ${caseID}: ${error}`,
+      error,
+      logger,
+    });
+  }
+}
+
+interface PartitionedAttachments {
+  validAttachments: AttachmentSavedObject[];
+  attachmentsWithErrors: AttachmentSavedObjectWithErrors;
+  invalidAssociationAttachments: Array<Pick<AttachmentSavedObject, 'id'>>;
+}
+
+const partitionAttachments = (
+  caseId: string,
+  attachments: BulkOptionalAttributes<AttachmentAttributesV2>
+): PartitionedAttachments => {
+  const [attachmentsWithoutErrors, errors] = partitionBySOError(attachments.saved_objects);
+  const [caseAttachments, invalidAssociationAttachments] = partitionByCaseAssociation(
+    caseId,
+    attachmentsWithoutErrors
+  );
+  // A decode error from another case would leak its type; report it as not attached.
+  const [otherCaseErrors, caseErrors] = partition(errors, ({ references }) => {
+    const caseRefId = getCaseReferenceId(references ?? []);
+    return caseRefId != null && caseRefId !== caseId;
+  });
+
+  return {
+    validAttachments: caseAttachments,
+    attachmentsWithErrors: caseErrors,
+    invalidAssociationAttachments: [...invalidAssociationAttachments, ...otherCaseErrors],
+  };
+};
+
+const partitionBySOError = (attachments: Array<OptionalAttributes<AttachmentAttributesV2>>) =>
+  partition(
+    attachments,
+    (attachment) => attachment.error == null && attachment.attributes != null
+  ) as [AttachmentSavedObject[], AttachmentSavedObjectWithErrors];
+
+const constructErrors = ({
+  caseId,
+  soBulkGetErrors,
+  associationErrors,
+  unauthorizedAttachments,
+}: {
+  caseId: string;
+  soBulkGetErrors: AttachmentSavedObjectWithErrors;
+  associationErrors: Array<Pick<AttachmentSavedObject, 'id'>>;
+  unauthorizedAttachments: AttachmentSavedObject[];
+}): BulkGetUnifiedAttachmentsResponse['errors'] => {
+  const errors: BulkGetUnifiedAttachmentsResponse['errors'] = [];
+
+  for (const soError of soBulkGetErrors) {
+    errors.push({ ...generateCaseErrorResponse(soError.error), savedObjectId: soError.id });
+  }
+
+  for (const attachment of associationErrors) {
+    errors.push({
+      error: 'Bad Request',
+      message: `Attachment is not attached to case id=${caseId}`,
+      status: 400,
+      savedObjectId: attachment.id,
+    });
+  }
+
+  for (const unauthorizedAttachment of unauthorizedAttachments) {
+    errors.push({
+      error: 'Forbidden',
+      message: `Unauthorized to access attachment with owner: "${unauthorizedAttachment.attributes.owner}"`,
+      status: 403,
+      savedObjectId: unauthorizedAttachment.id,
+    });
+  }
+
+  return errors;
+};

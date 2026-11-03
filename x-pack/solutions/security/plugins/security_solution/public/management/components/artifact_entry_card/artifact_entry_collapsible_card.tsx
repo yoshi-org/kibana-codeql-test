@@ -1,0 +1,79 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import React, { memo } from 'react';
+import { EuiHorizontalRule, useGeneratedHtmlId } from '@elastic/eui';
+import type { AnyArtifact } from './types';
+import type { CommonArtifactEntryCardProps } from './artifact_entry_card';
+import { CardContainerPanel } from './components/card_container_panel';
+import { useNormalizedArtifact } from './hooks/use_normalized_artifact';
+import { useTestIdGenerator } from '../../hooks/use_test_id_generator';
+import { CardSectionPanel } from './components/card_section_panel';
+import type { CriteriaConditionsProps } from './components/criteria_conditions';
+import { CriteriaConditions } from './components/criteria_conditions';
+import { CardCompressedHeader } from './components/card_compressed_header';
+
+export interface ArtifactEntryCollapsibleCardProps extends CommonArtifactEntryCardProps {
+  onExpandCollapse: () => void;
+  expanded?: boolean;
+  /** When true, shows a read-only Enabled column for artifacts that support the `disabled` tag. */
+  showEnabledColumn?: boolean;
+}
+
+export const ArtifactEntryCollapsibleCard = memo<ArtifactEntryCollapsibleCardProps>(
+  ({
+    item,
+    onExpandCollapse,
+    policies,
+    actions,
+    expanded = false,
+    'data-test-subj': dataTestSubj,
+    Decorator,
+    CriteriaComponent = CriteriaConditions,
+    showEnabledColumn = false,
+    ...commonProps
+  }) => {
+    const artifact = useNormalizedArtifact(item);
+    const getTestId = useTestIdGenerator(dataTestSubj);
+    const expandedSectionId = useGeneratedHtmlId({
+      prefix: 'artifactEntryCollapsibleCardDetails',
+    });
+
+    return (
+      <CardContainerPanel {...commonProps} item={item as AnyArtifact} data-test-subj={dataTestSubj}>
+        <CardSectionPanel className="artifact-entry-collapsible-card">
+          <CardCompressedHeader
+            artifact={artifact}
+            actions={actions}
+            policies={policies}
+            expanded={expanded}
+            showEnabledColumn={showEnabledColumn}
+            onExpandCollapse={onExpandCollapse}
+            expandedSectionId={expandedSectionId}
+            data-test-subj={getTestId('header')}
+          />
+        </CardSectionPanel>
+        {expanded && (
+          <>
+            <EuiHorizontalRule margin="xs" />
+
+            <CardSectionPanel id={expandedSectionId}>
+              {Decorator && <Decorator item={item} data-test-subj={getTestId('decorator')} />}
+
+              <CriteriaComponent
+                os={artifact.os as CriteriaConditionsProps['os']}
+                entries={artifact.entries}
+                data-test-subj={getTestId('criteriaConditions')}
+              />
+            </CardSectionPanel>
+          </>
+        )}
+      </CardContainerPanel>
+    );
+  }
+);
+ArtifactEntryCollapsibleCard.displayName = 'ArtifactEntryCollapsibleCard';

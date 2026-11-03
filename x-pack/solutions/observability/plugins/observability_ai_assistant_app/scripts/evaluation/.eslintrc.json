@@ -1,0 +1,14 @@
+{
+  "overrides": [
+    {
+      "files": [
+        "**/*.spec.ts"
+      ],
+      "rules": {
+        "spaced-comment": [
+          "off"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,792 @@
+# @kbn/connector-specs
+
+A TypeScript-based specification framework for defining Kibana connectors using a **single-file approach**. This package enables developers to define complete connector specifications that are automatically discovered and registered to the actions registry.
+
+## Overview
+
+The `@kbn/connector-specs` package provides a simplified, declarative way to define connectors for Kibana's Stack Connectors system. Instead of manually registering connectors across multiple files, you define a connector spec in `src/specs/<connector>/<connector>.ts`, and it will be automatically picked up and registered once exported from `src/all_specs.ts`.
+
+### Key Features
+
+- **Single-File Connector Definitions**: Define complete connector specs in one TypeScript file
+- **Automatic Registration**: Connectors are automatically discovered and registered to the actions registry
+- **Type-Safe**: Built on Zod schemas for validation and type safety
+- **UI Derivation**: UI forms are automatically generated from schemas using metadata extensions
+- **Standard Auth Patterns**: Reusable authentication schemas (Basic, Bearer, Headers)
+- **Policy-Based Configuration**: Built-in support for rate limiting, retry policies, pagination, and more
+
+## Quick Start (Recommended): Build a Connector with AI
+
+This package includes Agent Skills that automate the full connector development lifecycle.
+The `/build-connector` skill orchestrates creating a connector spec, workflows, tests, documentation, activation in Kibana, and end-to-end testing via Agent Builder.
+
+### Prerequisites
+
+Agent Skills must be loaded. If you do not see them already available, it's usually sufficient to prompt:
+
+```
+> Load all **/SKILL.md skills
+```
+
+or:
+
+```
+> Look for connector and agent builder SKILL.md files, and load those skills
+```
+
+
+### Usage
+
+In your AI Assistant of choice, run:
+
+```
+/build-connector <service-name>
+```
+
+For example: `/build-connector Figma`
+
+This will walk through 12 tasks: generating code, reviewing it, activating the connector in a running Kibana, creating a test agent, chatting with it, iterating on quality, and delivering a final result.
+
+### Other available skills
+
+| Skill | Description |
+|-------|-------------|
+| `/create-connector <name>` | Generate just the connector spec, workflows, tests, and docs (no activation or testing) |
+| `/activate-connector <type>` | Create a connector instance in a running Kibana via the Actions API |
+| `/review-connector` | Review connector spec changes against a quality checklist |
+
+## Alternate: Generate a New Connector Spec
+
+Use the generator to create the folder structure and wire everything up:
+
+```bash
+node scripts/generate connector my_connector --id ".myConnector" --owner "@elastic/<team-name>"
+```
+
+This will:
+- Create `src/specs/my_connector/my_connector.ts` (spec scaffold)
+- Create `src/specs/my_connector/icon/index.tsx` (placeholder icon component)
+- Update `src/all_specs.ts`
+- Update `src/connector_icons_map.ts`
+- Append a CODEOWNERS rule for the new folder
+
+### Connector ID constraints
+
+- Must start with `.`
+- Allowed characters: `A-Z`, `a-z`, `0-9`, `.`, `_`, `-`
+- Max length: **64**
+
+## The “1.5 Files” Approach (Manual)
+
+This package still follows a **1.5 files approach** for defining connectors:
+
+1. **1 folder**: Create a connector folder (e.g., `src/specs/my_connector/`) containing `my_connector.ts`
+2. **0.5 file**: Add a single export line to `src/all_specs.ts`:
+   ```typescript
+   export * from './specs/my_connector/my_connector';
+   ```
+
+That's it! Once exported from `all_specs.ts`, the connector spec is automatically discovered and registered to the actions registry during plugin initialization.
+
+### How It Works
+
+The registration happens automatically in both server and public plugin setup:
+
+- **Server-side**: Connector specs are iterated and registered via `actions.registerSubActionConnectorType()`
+- **Public-side**: Connector specs are registered to the UI registry
+
+The `createConnectorTypeFromSpec()` function converts the `SingleFileConnectorDefinition` into the format expected by the actions registry.
+
+## Quick Start
+
+### Creating a New Connector
+
+1. **Create the spec file** in `src/specs/<connector>/<connector>.ts`:
+
+```typescript
+// src/specs/my_connector/my_connector.ts
+import { z } from '@kbn/zod/v4';
+import type { ConnectorSpec } from '../../connector_spec';
+
+export const MyConnector: ConnectorSpec = {
+  metadata: {
+    id: '.my_connector',
+    displayName: 'My Connector',
+    description: 'A custom connector example',
+    minimumLicense: 'gold',
+    // See "Intermediate release state" below: a new connector type ships with
+    // ['agentBuilder'] and gains its remaining feature IDs in a follow-up PR.
+    supportedFeatureIds: ['agentBuilder'],
+  },
+
+  auth: {
+    types: ['bearer'],
+    headers: {
+      'Content-Type': 'application/json',
+    }
+  },
+
+  schema: z.object({
+    url: z.string().url().describe('API URL'),
+  }),
+
+  actions: {
+    execute: {
+      isTool: true,
+      input: z.object({
+        message: z.string().describe('Message to send'),
+      }),
+      handler: async (ctx, input) => {
+        const response = await ctx.client.post(`${ctx.config.url}/api/endpoint`, {
+          data: input,
+        });
+        return response.data;
+      },
+    },
+  },
+
+  test: {
+    handler: async (ctx) => {
+      await ctx.client.get(`${ctx.config.url}/health`);
+      return {};
+    },
+    enabled: true,
+  },
+};
+```
+
+2. **Export from `all_specs.ts`**:
+
+```typescript
+// src/all_specs.ts
+export * from './specs/my_connector/my_connector';
+```
+
+3. **Done!** The connector will automatically appear in the Kibana UI.
+
+## Architecture
+
+### Core Components
+
+#### `connector_spec.ts`
+The main specification file that defines:
+- `SingleFileConnectorDefinition` - The main interface for connector definitions
+- Standard authentication schemas (Basic, Bearer, Headers)
+- Policy interfaces (RateLimit, Pagination, Retry, Error, Streaming)
+- Action definitions and context types
+- Helper utilities
+
+#### `connector_spec_ui.ts`
+UI metadata extension system that enables:
+- Automatic UI form generation from Zod schemas
+- Field-level UI hints (sensitive fields, widgets, sections, ordering)
+- Conditional field visibility
+- Dynamic option loading from actions
+- Pre-configured schema helpers (`UISchemas.secret()`, `UISchemas.textarea()`, etc.)
+
+#### `specs/`
+Directory containing actual connector implementations
+
+#### `specs/<connector>/icon/`
+Directory containing per-connector icon components (and optional assets)
+
+### Design Principles
+
+1. **Single Schema**: Config and secrets are defined together in one schema, with secrets marked using `meta.sensitive`
+2. **Zod as Source of Truth**: Validation and UI are both derived from Zod schemas
+3. **Standard Auth Patterns**: Reusable authentication schemas reduce boilerplate
+4. **UI Derivation**: Forms are automatically generated from schemas with optional metadata hints
+5. **Type Safety**: Full TypeScript support with proper typing throughout
+
+## Connector Definition Structure
+
+A `SingleFileConnectorDefinition` consists of:
+
+### Metadata
+
+```typescript
+metadata: {
+  id: '.connector_id',              // Unique connector identifier
+  displayName: 'Connector Name',     // User-facing name
+  description: 'Description',        // Connector description
+  icon?: string,                     // EUI icon name (e.g., 'addDataApp', 'globe') - only for built-in EUI icons
+  docsUrl?: string,                  // Link to documentation
+  minimumLicense: 'basic' | 'gold' | 'platinum' | 'enterprise',
+  supportedFeatureIds: ['workflows', 'alerting', 'cases', ...],
+}
+```
+
+#### Intermediate release state
+
+A new connector type must reach Production-NonCanary before it can declare user-facing
+features. Serverless rollouts and rollbacks leave nodes on different Kibana versions for a
+while, and a user action referencing a connector type that a node does not have breaks on
+that node. So adding a connector takes two PRs:
+
+1. Ship the connector with `supportedFeatureIds: ['agentBuilder']`.
+2. Once the connector is registered in every Production-NonCanary version, add `'workflows'`
+   and any other user-facing feature IDs in a follow-up PR.
+
+Mention the required follow-up PR in the first PR's description so it is not forgotten.
+
+### Auth Type
+
+Specify which standard auth schemas (if any) are supported by this connector. If none
+are specified, defaults to no authentication. Can also specify a custom schema for the authType
+which will be used in place of the default
+
+```typescript
+auth: {
+  types: [
+    // use basic auth type with the default schema
+    'basic',
+    // use api_key_header auth type with a custom header field
+    {
+      type: 'api_key_header',
+      defaults: {
+        headerField: 'custom-api-key-field'
+      }
+    }
+  ],
+  // optionally add headers that will be added to all requests
+  headers: {
+    'Content-Type': 'application/json',
+  }
+}
+```
+
+### Schema
+
+A single Zod schema containing all connector config fields and any secrets fields outside of the standard auth schemas
+
+```typescript
+schema: z.object({
+  // Config fields
+  url: z.string().url().describe('API URL'),
+  
+  // Secret fields (marked with meta.sensitive)
+  apiKey: UISchemas.secret().describe('API Key'),
+})
+```
+
+### Actions
+
+Actions define what the connector can do:
+
+```typescript
+actions: {
+  actionName: {
+    isTool?: boolean,              // Whether this action is a tool (for AI workflows)
+    input: z.ZodSchema,            // Input validation schema
+    output?: z.ZodSchema,          // Output validation schema (optional)
+    handler: async (ctx, input) => {
+      // Action implementation
+      return result;
+    },
+    description?: string,
+    actionGroup?: string,
+    supportsStreaming?: boolean,
+  },
+}
+```
+
+### Test
+
+Optional connection test shown in the connector Test tab when `enabled: true`:
+
+```typescript
+test: {
+  handler: async (ctx) => {
+    await ctx.client.get(`${ctx.config.url}/health`);
+    return {};
+  },
+  description?: string,
+  enabled?: boolean, // requires throw-on-failure handler contract below
+}
+```
+
+Test handler contract: **throw on failure**; do not return an `{ ok }` flag. A resolved
+return value (including `{}` or optional data) is treated as success. Set `enabled: true` only
+after migrating the handler to this contract.
+
+### Policies (Optional)
+
+Configure connector behavior:
+
+```typescript
+policies: {
+  rateLimit?: RateLimitPolicy,
+  pagination?: PaginationPolicy,
+  retry?: RetryPolicy,
+  error?: ErrorPolicy,
+  streaming?: StreamingPolicy,
+}
+```
+
+## Authentication Patterns
+
+### Header-Based Authentication
+
+```typescript
+import { HeaderAuthSchema } from '../connector_spec';
+
+schema: z.discriminatedUnion('method', [
+  z.object({
+    method: z.literal('headers'),
+    headers: z.object({
+      'X-API-Key': UISchemas.secret().describe('API Key'),
+    }),
+  }),
+])
+```
+
+### Bearer Token Authentication
+
+```typescript
+import { BearerAuthSchema } from '../connector_spec';
+
+schema: z.object({
+  url: z.string().url(),
+  ...BearerAuthSchema.shape,
+})
+```
+
+### Basic Authentication
+
+```typescript
+import { BasicAuthSchema } from '../connector_spec';
+
+schema: z.object({
+  url: z.string().url(),
+  ...BasicAuthSchema.shape,
+})
+```
+
+## UI Metadata
+
+Use the `withUIMeta` helper or `UISchemas` to add UI hints:
+
+```typescript
+import { withUIMeta, UISchemas } from '../connector_spec_ui';
+
+// Sensitive field (password/token)
+apiKey: UISchemas.secret('sk-...').describe('API Key')
+
+// Multi-line text
+message: UISchemas.textarea({ rows: 5 }).describe('Message')
+
+// JSON editor
+config: UISchemas.json().describe('Configuration')
+
+// With custom metadata
+field: withUIMeta(z.string(), {
+  sensitive: true,
+  section: 'Authentication',
+  order: 1,
+  placeholder: 'Enter value...',
+  helpText: 'Additional help text',
+}).describe('Field Label')
+```
+
+## Advanced Features
+
+### Dynamic Options
+
+Load dropdown options from another action:
+
+```typescript
+channel: z.string().meta({
+  optionsFrom: {
+    action: 'getChannels',
+    map: (result) => result.channels.map(c => ({ 
+      value: c.id, 
+      label: c.name 
+    })),
+    cacheDuration: 300,
+  },
+}).describe('Channel')
+```
+
+### Conditional Fields
+
+Show/hide fields based on other field values:
+
+```typescript
+customHost: z.string().meta({
+  when: {
+    field: 'serviceType',
+    is: 'custom',
+    then: 'show',
+  },
+}).describe('Custom Host')
+```
+
+### Streaming Support
+
+Enable streaming responses:
+
+```typescript
+policies: {
+  streaming: {
+    enabled: true,
+    mechanism: 'sse',  // or 'chunked', 'websocket'
+    parser: 'ndjson',  // or 'json', 'text', 'custom'
+  },
+}
+```
+
+### Rate Limiting
+
+Configure rate limit handling:
+
+```typescript
+policies: {
+  rateLimit: {
+    strategy: 'header',
+    remainingHeader: 'X-RateLimit-Remaining',
+    resetHeader: 'X-RateLimit-Reset',
+  },
+}
+```
+
+## Icons
+
+Icons can be provided in two ways: **built-in EUI icons** (for simple cases) or **lazy-loaded React components** (for custom icons).
+
+### Method 1: Built-in EUI Icons
+
+For connectors that don't need custom branding, you can use any built-in EUI icon by setting the icon name in metadata:
+
+```typescript
+metadata: {
+  id: '.my_connector',
+  displayName: 'My Connector',
+  icon: 'addDataApp',  // Any EUI icon name (e.g., 'globe', 'link', 'cloud', etc.)
+}
+```
+
+**Pros**: Simple, no additional files needed, no bundle size impact  
+**Cons**: Limited to EUI's built-in icon set
+
+**Note**: The `icon` field in metadata should **only** be used for EUI icon names. For custom icons, use the lazy-loaded approach below.
+
+### Method 2: Lazy-Loaded Custom Icons (For Custom Branding)
+
+For custom icons (logos, branded images, etc.), use lazy-loaded React components. This approach keeps custom icon assets out of the main bundle and loads them on-demand. To use lazy icons:
+
+1. **Create an icon component** in `src/specs/{connector_folder}/icon/`:
+
+**Option A: Using EuiIcon with an image file**
+
+```typescript
+// src/specs/my_connector/icon/index.tsx
+import React from 'react';
+import { EuiIcon } from '@elastic/eui';
+import type { ConnectorIconProps } from '../../../types';
+import myIcon from './my_connector.png'; // or .jpg, .svg
+
+export default (props: ConnectorIconProps) => {
+  return <EuiIcon type={myIcon} {...props} />;
+};
+```
+
+**Option B: Using a custom SVG component**
+
+```typescript
+// src/icons/my_connector.tsx
+import React from 'react';
+import type { ConnectorIconProps } from '../types';
+
+export default (props: ConnectorIconProps) => {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="#00A6C1" {...props}>
+      <path d="M88.5,20.3c0-3.5-3.8-6.7-7.8-6.7H46V30h42.5L88.5,20.3z" />
+    </svg>
+  );
+};
+```
+
+2. **Register the icon** in `src/connector_icons_map.ts`:
+
+```typescript
+// src/connector_icons_map.ts
+import { lazy } from 'react';
+import type { ConnectorIconProps } from './types';
+
+export const ConnectorIconsMap: Map<
+  string,
+  React.LazyExoticComponent<React.ComponentType<ConnectorIconProps>>
+> = new Map([
+  // ... existing icons ...
+  [
+    '.my_connector',
+    lazy(() => import(/* webpackChunkName: "connectorIconMyConnector" */ './specs/my_connector/icon')),
+  ],
+]);
+```
+
+3. **Omit the icon from metadata** (or leave it undefined):
+
+```typescript
+// src/specs/my_connector.ts
+export const MyConnector: SingleFileConnectorDefinition = {
+  metadata: {
+    id: '.my_connector',  // Must match the key in ConnectorIconsMap
+    displayName: 'My Connector',
+    // icon is optional - will be resolved from ConnectorIconsMap
+  },
+  // ... rest of the definition
+};
+```
+
+**Pros**: Better performance, code splitting, icons loaded on-demand, supports custom branding  
+**Cons**: Requires additional files and registration
+
+### Icon Resolution Priority
+
+The system resolves icons in the following order:
+
+1. If `metadata.icon` is set (EUI icon name), it's used directly
+2. If `metadata.icon` is not set, the system looks up the connector ID in `ConnectorIconsMap`
+3. If no icon is found, defaults to the `'globe'` icon
+
+## TypeScript Support
+
+The package provides full TypeScript support:
+
+```typescript
+import type { 
+  ConnectorSpec,
+  ActionDefinition,
+  ConnectorMetadata,
+} from '@kbn/connector-specs';
+```
+
+## Contract Tests
+
+`createContractContext` (in `src/test`) runs actions offline against the vendor's OpenAPI spec, using [`@kbn/connector-emulate`](../kbn-connector-emulate/README.md). The handler gets a real axios client, authenticated by the connector's own auth type, whose requests are validated and answered by the mock:
+
+```typescript
+import { createContractContext } from '../../test/create_contract_context';
+
+const { runAction, mock } = await createContractContext({
+  connector: FirecrawlConnector,
+  specs: [firecrawlOpenApiSpec],
+});
+
+await runAction('scrape', { url: 'https://example.com' });
+expect(mock.calls.flatMap(({ requestViolations }) => requestViolations)).toEqual([]);
+```
+
+Inputs are parsed with the action's schema first. Auth secrets the test leaves out get the auth type's defaults, or placeholders its schema accepts; `serviceAccountJson` gets a service account key with a throwaway RSA key, so GCP auth types can sign their JWTs. OAuth auth types get a fixed access token.
+
+`AuthContext` and `ActionContext` have an optional `fetchTestOnly`, set only by contract contexts (never in Kibana, where the global `fetch` is used). It exists so auth helpers that exchange tokens themselves, such as GCP's, can reach the mock, which answers token URLs. Do not use it for vendor calls: those must go through `client`, which applies Kibana's proxy and SSL settings. While a contract context configures its auth type or runs an action, the global `fetch` throws, so a request that bypasses the mock fails instead of reaching the network.
+
+## Vendor API artifacts
+
+Each connector can have a `vendor_api/` folder next to its spec, recording the vendor API it depends on ([#295685](https://github.com/elastic/kibana/issues/295685)). `recordActions` (in `src/test/vendor_api`) produces most of it: it runs every action against the contract mock, with inputs generated from the action's schema, and records the vendor operations each one calls. The inputs are:
+
+- one without optional properties, and one with them;
+- one at the schema's upper bounds: longest strings (`max` up to 65,536 characters, or 1024 characters when unbounded), largest numbers, fullest arrays and the last enum value;
+- one per enum value, so every value the schema allows is sent once.
+
+The vendor spec rejecting any of them fails recording, so the action's schema has to be at least as strict as the vendor's: a limit the vendor doesn't have is fine, a looser one isn't.
+
+```sh
+# Before writing the connector: list what a vendor spec offers, which adds it to manifest.json
+node scripts/connector_vendor_api --inspect --connector datadog --source v1=https://… --grep monitor
+# Then describe the operations to call
+node scripts/connector_vendor_api --inspect --connector datadog --operation 'GET /api/v1/monitor'
+# First recording: against the inspected sources, or name each vendor spec; YAML or JSON, external $refs are bundled
+node scripts/connector_vendor_api --connector datadog [--source v1=https://… --source v2=https://…]
+# After changing the connector: record offline against the committed snapshots
+node scripts/connector_vendor_api --connector datadog
+# Pick up vendor changes: fetch every source in manifest.json again
+node scripts/connector_vendor_api --connector datadog --refresh
+# CI: write nothing, fail if anything would change
+node scripts/connector_vendor_api --connector datadog --check
+# Specs of tens of megabytes, such as Microsoft Graph's, need a larger heap to fetch
+NODE_OPTIONS=--max-old-space-size=8192 node scripts/connector_vendor_api --connector microsoft-teams --refresh
+```
+
+Fetched documents are kept by URL in `data/connector_vendor_api` (not committed), and the manifest's `fetchedAt` says when. A spec inspected before writing a connector is then the one it is recorded against, even when the vendor publishes it from a moving branch. `--refresh` fetches every source again.
+
+`--inspect` needs no connector code, so it can run before any exists. It loads specs the way recording does (converted to OpenAPI 3, `$ref`s bundled, and with `--connector`, the connector's manifest sources and overlay). With `--connector`, `--source` specs the manifest doesn't have yet are added to it, so the source is declared once; a source it has can only be moved by recording with `--source`. A connector that isn't written yet keeps them in `specs/<id>/vendor_api`, with underscores for the id's hyphens, so write its spec in that folder. It then either lists operations (`METHOD path operationId summary`, up to 200 per source; narrow with `--grep`) or, for each `--operation` (`METHOD /path` or an `operationId`), prints as YAML what an action needs to call it: servers, security schemes and required scopes, every parameter with its location and effective `style`/`explode`, the request body and success response schemas with `$ref`s inlined `--depth` levels deep (default 4), and the `pagination` descriptor recording would propose. Examples and `x-` extensions are left out and descriptions shortened, so even a large spec gives a short answer.
+
+Vendors that publish their API reference as Markdown pages with an [`llms.txt`](https://llmstxt.org) index, instead of a spec, are recorded from those pages. `--format` names the template the pages follow (`databricks-markdown` or `brave-markdown`, see the `@kbn/connector-emulate` README), and the source's URL is the index. `--pages` limits the pages fetched to URL prefixes, absolute or relative to the index, such as the folders of the API groups the connector calls; without it, every page the index links to on its own origin is fetched. Both are kept in `manifest.json`, so `--refresh` needs neither:
+
+```sh
+node scripts/connector_vendor_api --connector brave-search --source search=https://api-dashboard.search.brave.com/llms.txt --format search=brave-markdown --pages search=api-reference/web/search/
+node scripts/connector_vendor_api --connector databricks --source docs=https://docs.databricks.com/api/llms.txt --format docs=databricks-markdown --pages docs=jobs/v2/ --pages docs=clusters/v2/ --pages docs=warehouses/v1/ --pages docs=alerts/v1/
+```
+
+The pages are converted to OpenAPI with `convertMarkdownReference`, and recorded, projected and snapshotted like any other source. A prefix that selects no page fails the run, as the vendor may have moved the group. `--inspect` takes `--format` and `--pages` too, and adds them to the manifest with the source.
+
+The folder holds:
+
+- `manifest.json`: the sources and the operations each action calls.
+- `snapshots/<source>.openapi.json`: each vendor spec, converted to OpenAPI 3 if needed (from Swagger 2.0, from a Google API Discovery document such as `https://gmail.googleapis.com/$discovery/rest?version=v1`, or from an AWS Smithy model of a `restJson1` or `restXml` service, such as the files in [`aws/api-models-aws`](https://github.com/aws/api-models-aws), pinned to a commit) and cut down to the recorded operations (under `paths`, or AutoRest's `x-ms-paths` for specs such as Azure Blob Storage's) and what they reference. Descriptions, examples and `x-` extensions other than `x-speakeasy-pagination`, `x-ms-pageable` and `x-ms-skip-url-encoding` (which marks a path parameter that spans segments, such as Azure's `{scope}`), and the routing that converted Smithy models carry (`x-path-parameter` for S3's virtual-hosted buckets, `x-optional-fixed-query` for its `x-id`) are dropped so that wording changes don't produce diffs. Snapshots are the vendor's spec as published: the overlay is not applied to them, but they keep the components its updates reference.
+- `overlay.yaml` (optional): an [OpenAPI Overlay](https://spec.openapis.org/overlay/latest.html) correcting the vendor specs, applied whenever they are loaded, including while recording. An action that no longer matches anything is reported, as the vendor may have fixed the spec.
+- `fixtures.json` (optional): see below.
+
+Actions run with a connector config sampled from the connector's `schema`, required properties only, so optional settings such as custom base URLs keep their defaults. They run under each auth type in `auth.types`, with placeholder secrets, and the manifest lists the operations reached under any of them, so an action that only some auth types allow (such as Gmail's write actions, which Elastic-managed OAuth refuses) is still recorded.
+
+Connectors that can't have a vendor spec, such as ones that talk to a database driver instead of an HTTP API, are listed in `vendor_api_exemptions.json` at the package root, by `metadata.id` with a reason. Existing connectors without a `vendor_api` folder are simply not recorded yet; [#295688](https://github.com/elastic/kibana/issues/295688) backfills them.
+
+Recording checks each action's `scope`. A `read` action may only send `GET`, `HEAD` or `OPTIONS`, or call the operations its fixture lists in `queries`, so other tools (such as live verification) can rely on `scope: 'read'` meaning the action changes no vendor state.
+
+The script fails when:
+
+- a request breaks the spec;
+- a `read` action sends any other request;
+- a `queries` entry is never needed;
+- a response override breaks the spec;
+- a request matches no operation and isn't listed in `unmatched`;
+- an operation looks like it returns a collection, but has no `pagination` and none could be proposed;
+- an action throws before sending a request under every auth type, so nothing it calls would be recorded.
+
+Other handler errors, auth types that can't be used against the contract mock, and proposed `pagination` descriptors are reported as warnings. An action's errors under an auth type it refuses are left out when another auth type works.
+
+### Contract test
+
+`src/connector_spec_vendor_api_contract.test.ts` runs in the package's Jest config, offline. It fails when:
+
+- a connector has both a `vendor_api/manifest.json` and an exemption, or an exemption names no connector;
+- coverage shrinks since the merge base (`GITHUB_PR_MERGE_BASE` in CI, otherwise the merge base with `upstream/main` or `origin/main`): a connector that had a `vendor_api/manifest.json` there no longer has one, or a new connector has neither a `vendor_api/manifest.json` nor an exemption. Without a merge base, this check is skipped;
+- re-recording a connector against its committed snapshots finds a problem from the list above, or would change `manifest.json` or a snapshot. This catches actions added or changed without rerunning the script.
+
+### `manifest.json`
+
+```json
+{
+  "sources": {
+    "v1": {
+      "format": "openapi",
+      "url": "https://example.com/openapi.json",
+      "apiVersion": "1.0",
+      "fetchedAt": "2026-10-07T00:00:00Z"
+    }
+  },
+  "operations": {
+    "search": [
+      {
+        "source": "v1",
+        "method": "get",
+        "path": "/search",
+        "pagination": {
+          "style": "cursor",
+          "request": { "cursorParam": "cursor", "sizeParam": "limit" },
+          "response": { "itemsPath": "results", "nextPath": "next_cursor" }
+        }
+      }
+    ]
+  },
+  "unmatched": {
+    "mute": [{ "method": "post", "path": "/v1/monitor/{id}/mute", "reason": "Missing from the spec; see #123" }]
+  }
+}
+```
+
+- `sources`: one entry per vendor spec. `format` is what the vendor publishes (`openapi`, `swagger`, `discovery` or `smithy`, or the template of a Markdown reference, whose `url` is its `llms.txt` index and `pages` the URL prefixes fetched). `apiVersion` is the spec's `info.version`; Markdown references have none. `fetchedAt` only changes when the snapshot changes. An optional `note`, written by hand and kept on updates, explains an unusual source, such as a vendor test fixture.
+- `operations`: per action, the operations its runs matched, by source, lowercase method and path template, sorted.
+- `pagination`: how an operation pages, as the contract mock takes it (see the `@kbn/connector-emulate` README), or `"none"` for one that returns everything at once. Operations look like they return a collection when they take a cursor, offset or page parameter, a page size next to an array in the response, or return a bare array. For those without one, the script proposes a descriptor from `x-speakeasy-pagination`, `x-ms-pageable` or parameter and field names, and warns so it gets reviewed; when it can't, it fails until one is declared. Declared descriptors are kept on every run.
+- `unmatched`: per action, requests that match no operation in any source, with the reason that's expected. A `{name}` path segment matches any value, as the generated inputs vary. A request that matches nothing and isn't listed fails the script.
+
+Keys are sorted at every depth (`serializeManifest`), so regenerating without vendor changes produces no diff. `vendorApiManifestSchema` is the schema.
+
+### `fixtures.json` (optional)
+
+```json
+{
+  "getCard": {
+    "input": { "cardId": "5f0c1e2d3b4a596877665544" },
+    "responses": [{ "method": "GET", "path": "/cards/{id}", "status": 200, "body": { "id": "5f0c1e2d3b4a596877665544" } }]
+  },
+  "searchCards": {
+    "queries": [{ "source": "v1", "method": "POST", "path": "/cards/search" }]
+  }
+}
+```
+
+Per action:
+
+- `input`: merged into each generated input, for values the schema can't describe, such as cross-field rules or IDs with a vendor format. A list of inputs generates the inputs once per entry, for rules no single value satisfies in every input, such as two mutually exclusive options.
+- `config`: merged into the connector config for the action's runs. Recording samples only the required config fields, so use this to set an optional field the action needs, such as a second server URL.
+- `queries`: for a `read` action, operations that use another method but only query, such as a search sent as `POST`. Each entry states that the operation changes no vendor state, so reviewers should check it. A `source` restricts an entry to one spec. Requests that match no operation (those in `"unmatched"`, such as calls to a vendor's MCP server) are matched by their path, where a `{name}` segment matches any segment.
+- `responses`: served by the mock for the action's runs instead of sampled responses, so handlers that branch on a response take the intended path. A `source` restricts an override to one spec. Overrides that break the spec, or name an operation it lacks, are reported.
+
+`vendorApiFixturesSchema` is the schema.
+
+### Drift detection
+
+`--drift` compares a connector's committed artifacts with the vendor's latest specs, without writing them:
+
+```bash
+# One connector, or every connector with a manifest when --connector is left out
+node scripts/connector_vendor_api --drift --connector firecrawl --report target/drift.json
+```
+
+For each connector it:
+
+- fetches every source in `manifest.json` (a source that doesn't load is reported as unreachable);
+- records the actions against the committed snapshots and against the latest specs, with the overlay applied, as a refresh would, but in a temporary copy of the folder;
+- compares each regenerated snapshot with the committed one and classifies the changes with [`oasdiff`](https://github.com/oasdiff/oasdiff) `changelog`. The binary is `OASDIFF_BIN`, else `oasdiff` on the `PATH`, as for `@kbn/api-contracts`; Kibana's CI agents have it. A response that widens (a new enum value, a longer string) is breaking, since a connector reading the field may not handle it; deprecations are their own kind;
+- reports overlay actions that no longer match the latest specs.
+
+Each connector in the JSON report gets a `verdict`: `healthy`, `vendor-drift` (the actions pass against the snapshots but not the latest specs), `kibana-regression` (they fail against the snapshots already) or `unknown` (a spec didn't load). Its `outcome` says what to do: `none`, `refresh` (only non-breaking changes, or the actions now call other operations, and everything passes; a run with `--refresh` updates the artifacts) or `issue` (anything breaking, deprecated, unreachable, unclassified without `oasdiff`, failing, or a stale overlay action). A new `info.version` alone changes nothing, since some vendors bump it on every deploy.
+
+### Running a connector in Kibana against its contract mock
+
+`node scripts/connector_emulate` serves a connector's contract mock as an HTTP forward proxy (see the server mode section of `@kbn/connector-emulate`'s README), so a running Kibana can execute the connector without vendor credentials:
+
+```bash
+# Answers from the committed snapshots, with the overlay applied
+node scripts/connector_emulate --connector firecrawl
+# Answers from each source's current vendor spec instead
+node scripts/connector_emulate --connector firecrawl --spec latest --port 5691
+```
+
+The mock answers with the manifest's pagination, but not with the per-action `responses` in `fixtures.json`, because a proxied request doesn't say which action sent it. It logs every request with its status, and the violations of failed ones. On startup it prints the Kibana settings to use: `xpack.actions.proxyUrl` pointing at the proxy, and `xpack.actions.customHostSettings` entries that trust its CA for the vendor hosts in the specs, including per-operation servers and OAuth token URLs. Vendor hosts that come from connector config, such as a tenant's subdomain, need the CA trusted for every host instead, by starting Kibana with `NODE_EXTRA_CA_CERTS=data/connector_emulate/ca.crt`. The CA is created there on first use and reused afterwards, so Kibana keeps trusting it when the mock restarts.
+
+## Related Documentation
+
+- [Connector Spec](./src/connector_spec.ts) - Full API reference
+- [UI Metadata System](./src/connector_spec_ui.ts) - UI derivation documentation
+- [Client types](./src/lib/clients/README.md) - Authoring and review checklist for pooled `ctx.getClient` client types
+
+## Contributing
+
+When adding a new **pooled client type** (`ctx.getClient`), follow [src/lib/clients/README.md](./src/lib/clients/README.md) — keep the client self-contained under `lib/<client>/`, apply `networkSettings` in `build`, register it on `clientTypes`, and leave `create_connector_from_spec.ts` alone unless you need an Actions-only override. Registration is a deliberate production enablement.
+
+When adding a new connector:
+
+1. Create the connector folder in `src/specs/<connector>/` with `<connector>.ts`
+2. Export it from `src/all_specs.ts`
+3. (Optional) Add an icon:
+   - For simple cases: Use a built-in EUI icon by setting `metadata.icon` to an EUI icon name (e.g., `'globe'`, `'addDataApp'`)
+   - For custom branding: Create a lazy icon component in `src/specs/<connector>/icon/` and register it in `src/connector_icons_map.ts`
+4. Follow the existing patterns for consistency
+5. Include proper TypeScript types
+6. Add appropriate UI metadata for better UX
+7. Consider adding a test file (`src/specs/{connector}.test.ts`) to validate your action handlers. See existing connector tests for examples.
+8. End-user documentation for connectors lives in `docs/reference/connectors-kibana/{connector-name}-action-type.md`. See existing connector docs for the expected structure. Don't forget to update the TOC and relevant `_snippets/` files!
+
+### Adding a Lazy Icon
+
+When creating a new connector with a lazy icon:
+
+1. Create the icon component file(s):
+   - For simple SVGs: `src/specs/{connector_folder}/icon/index.tsx`
+   - For icons with assets: `src/specs/{connector_folder}/icon/index.tsx` and asset files
+2. Register in `src/connector_icons_map.ts`:
+   ```typescript
+   [
+     '.your_connector_id',
+     lazy(() => import(/* webpackChunkName: "connectorIconYourConnector" */ './specs/your_connector_folder/icon')),
+   ],
+   ```
+3. Ensure `metadata.id` in your spec matches the key in the map (including the leading dot)
+
+## License
+
+Elastic License 2.0 OR AGPL-3.0-only OR SSPL-1.0

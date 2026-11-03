@@ -1,0 +1,32 @@
+{
+  "extends": "@kbn/tsconfig-base/tsconfig.json",
+  "compilerOptions": {
+    "outDir": "target/types",
+    "stripInternal": true,
+    "types": ["jest", "node"]
+  },
+  "include": ["**/*.ts", "**/*.js"],
+  "exclude": ["types/**/*", "**/__fixtures__/**/*", "target/**/*"],
+  "kbn_references": [
+    "@kbn/kbn-client",
+    "@kbn/std",
+    "@kbn/test-es-server",
+    "@kbn/tooling-log",
+    "@kbn/dev-cli-runner",
+    "@kbn/dev-cli-errors",
+    "@kbn/ci-stats-reporter",
+    "@kbn/repo-info",
+    "@kbn/es",
+    "@kbn/dev-proc-runner",
+    "@kbn/test-kibana-server",
+    "@kbn/jest-serializers",
+    "@kbn/stdio-dev-helpers",
+    "@kbn/test-docker-servers",
+    "@kbn/swc-register",
+    "@kbn/test-saml-auth",
+    "@kbn/code-owners",
+    "@kbn/scout-reporting",
+    "@kbn/scout-info",
+    "@kbn/apm-utils"
+  ]
+}

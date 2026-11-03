@@ -1,0 +1,10 @@
+{
+  "type": "shared-common",
+  "id": "@kbn/data-forge",
+  "owner": [
+    "@elastic/nightshift-sre-agent-team", 
+    "@elastic/obs-signals-logs-team"
+  ],
+  "group": "platform",
+  "visibility": "shared"
+}

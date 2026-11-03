@@ -1,0 +1,191 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import React from 'react';
+import ReactDOM from 'react-dom';
+import { Redirect } from 'react-router-dom';
+import { i18n } from '@kbn/i18n';
+import type { RouteComponentProps, RouteProps } from 'react-router-dom';
+import type { AppMountParameters, ChromeBreadcrumb, CoreStart } from '@kbn/core/public';
+import { APP_WRAPPER_CLASS } from '@kbn/core/public';
+
+import { KibanaRenderContextProvider } from '@kbn/react-kibana-context-render';
+
+import { RedirectAppLinks } from '@kbn/shared-ux-link-redirect-app';
+
+import { useBreadcrumbs } from '@kbn/observability-shared-plugin/public';
+import { DASHBOARD_LABEL, RumHome } from '../components/app/rum_dashboard/rum_home';
+import type { ApmPluginSetupDeps, ApmPluginStartDeps } from '../plugin';
+
+import { createStaticDataView } from '../services/rest/data_view';
+import { createCallApmApi } from '../services/rest/create_call_apm_api';
+import { UxProviders } from './ux_providers';
+
+export type BreadcrumbTitle<T = {}> =
+  | string
+  // @ts-expect-error upgrade typescript v4.9.5
+  | ((props: RouteComponentProps<T>) => string)
+  | null;
+
+export interface RouteDefinition<T = any> extends RouteProps {
+  breadcrumb: BreadcrumbTitle<T>;
+}
+
+export const uxRoutes: RouteDefinition[] = [
+  {
+    exact: true,
+    path: '/',
+    render: () => <Redirect to="/ux" />,
+    breadcrumb: DASHBOARD_LABEL,
+  },
+];
+
+// No hrefs: the dashboard is the only route, and Chrome Next turns the last linked crumb into the
+// header back button, so a link here would render a back button pointing at the current page.
+export const UX_BREADCRUMBS: ChromeBreadcrumb[] = [
+  {
+    text: i18n.translate('xpack.ux.breadcrumbs.root', {
+      defaultMessage: 'User Experience',
+    }),
+  },
+  {
+    text: i18n.translate('xpack.ux.breadcrumbs.dashboard', {
+      defaultMessage: 'Dashboard',
+    }),
+  },
+];
+
+function UxApp() {
+  useBreadcrumbs(UX_BREADCRUMBS);
+
+  return (
+    <div className={APP_WRAPPER_CLASS} data-test-subj="csmMainContainer">
+      <RumHome />
+    </div>
+  );
+}
+
+export function UXAppRoot({
+  appMountParameters,
+  core,
+  deps,
+  corePlugins: {
+    embeddable,
+    inspector,
+    maps,
+    observability,
+    observabilityShared,
+    observabilityAIAssistant,
+    exploratoryView,
+    data,
+    dataViews,
+    lens,
+  },
+  isDev,
+  spaceId,
+}: {
+  appMountParameters: AppMountParameters;
+  core: CoreStart;
+  deps: ApmPluginSetupDeps;
+  corePlugins: ApmPluginStartDeps;
+  isDev: boolean;
+  spaceId: string;
+}) {
+  const { history } = appMountParameters;
+  const plugins = { ...deps, maps };
+
+  createCallApmApi(core);
+
+  return (
+    <KibanaRenderContextProvider {...core}>
+      <div className={APP_WRAPPER_CLASS}>
+        <RedirectAppLinks
+          coreStart={{
+            application: core.application,
+          }}
+        >
+          <UxProviders
+            core={core}
+            services={{
+              ...core,
+              ...plugins,
+              inspector,
+              observability,
+              observabilityShared,
+              observabilityAIAssistant,
+              embeddable,
+              exploratoryView,
+              data,
+              dataViews,
+              lens,
+            }}
+            pluginContext={{
+              appMountParameters,
+              exploratoryView,
+              observabilityShared,
+              spaceId,
+              isDev,
+            }}
+            history={history}
+          >
+            <UxApp />
+          </UxProviders>
+        </RedirectAppLinks>
+      </div>
+    </KibanaRenderContextProvider>
+  );
+}
+
+/**
+ * This module is rendered asynchronously in the Kibana platform.
+ */
+
+export const renderApp = ({
+  core,
+  deps,
+  appMountParameters,
+  corePlugins,
+  isDev,
+  spaceId,
+}: {
+  core: CoreStart;
+  deps: ApmPluginSetupDeps;
+  appMountParameters: AppMountParameters;
+  corePlugins: ApmPluginStartDeps;
+  isDev: boolean;
+  spaceId: string;
+}) => {
+  const { element } = appMountParameters;
+
+  createCallApmApi(core);
+
+  // Creating the static data view requires write access to saved objects, so
+  // only attempt it for users who can save. Read-only users (e.g. `viewer`)
+  // fall back to the ad-hoc data view and would otherwise hit a 403 here.
+  if (core.application.capabilities.savedObjectsManagement.edit) {
+    createStaticDataView().catch((e) => {
+      // eslint-disable-next-line no-console
+      console.log('Error creating static data view', e);
+    });
+  }
+
+  ReactDOM.render(
+    <UXAppRoot
+      appMountParameters={appMountParameters}
+      core={core}
+      deps={deps}
+      corePlugins={corePlugins}
+      isDev={isDev}
+      spaceId={spaceId}
+    />,
+    element
+  );
+  return () => {
+    corePlugins.data.search.session.clear();
+    ReactDOM.unmountComponentAtNode(element);
+  };
+};

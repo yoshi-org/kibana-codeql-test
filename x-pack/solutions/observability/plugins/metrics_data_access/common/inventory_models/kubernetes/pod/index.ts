@@ -1,0 +1,59 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import { i18n } from '@kbn/i18n';
+import type { estypes } from '@elastic/elasticsearch';
+import { metrics } from './metrics';
+import { createInventoryModel } from '../../shared/create_inventory_model';
+import type { DataSchemaFormat } from '../../types';
+import {
+  DATASTREAM_DATASET,
+  EVENT_MODULE,
+  K8S_POD_NAME,
+  K8S_POD_UID,
+  KUBELET_STATS_RECEIVER_OTEL,
+} from '../../../constants';
+
+export const pod = createInventoryModel('pod', {
+  displayName: i18n.translate('xpack.metricsData.inventoryModel.pod.displayName', {
+    defaultMessage: 'Kubernetes Pods',
+  }),
+  singularDisplayName: i18n.translate('xpack.metricsData.inventoryModels.pod.singularDisplayName', {
+    defaultMessage: 'Kubernetes Pod',
+  }),
+  requiredIntegration: {
+    beats: 'kubernetes',
+    otel: KUBELET_STATS_RECEIVER_OTEL,
+  },
+  crosslinkSupport: {
+    details: true,
+    logs: true,
+    apm: true,
+    uptime: true,
+  },
+  fields: {
+    id: 'kubernetes.pod.uid',
+    name: 'kubernetes.pod.name',
+    ip: 'kubernetes.pod.ip',
+  },
+  // Whole SemConv identity: uid and name. These documents have no ip field.
+  schemaFields: {
+    semconv: { id: K8S_POD_UID, name: K8S_POD_NAME },
+  },
+  metrics,
+  nodeFilter: ({
+    schema,
+  }: { schema?: DataSchemaFormat } = {}): estypes.QueryDslQueryContainer[] => {
+    if (!schema) {
+      return [];
+    }
+
+    return schema === 'ecs'
+      ? [{ term: { [EVENT_MODULE]: 'kubernetes' } }]
+      : [{ term: { [DATASTREAM_DATASET]: KUBELET_STATS_RECEIVER_OTEL } }];
+  },
+});

@@ -1,0 +1,148 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+import type {
+  AuthenticatedUser,
+  ElasticsearchClient,
+  IScopedClusterClient,
+  Logger,
+} from '@kbn/core/server';
+import { type FieldMap, type InstallParams } from '@kbn/index-adapter';
+import type {} from './rule_migrations_data_client';
+import { RuleMigrationsDataClient } from './rule_migrations_data_client';
+import type {
+  RuleMigrationAdapterId,
+  RuleMigrationAdapters,
+  RuleMigrationIndexNameProviders,
+} from '../types';
+import type { SiemMigrationsClientDependencies } from '../../common/types';
+import {
+  getIntegrationsFieldMap,
+  getPrebuiltRulesFieldMap,
+  migrationsFieldMaps,
+  ruleMigrationResourcesFieldMap,
+  ruleMigrationsFieldMap,
+} from './field_maps';
+import { RuleMigrationIndexMigrator } from '../index_migrators';
+import { resolveElserInferenceId } from './utils/resolve_elser_inference_id';
+import { SiemMigrationsBaseDataService } from '../../common/siem_migrations_base_service';
+
+interface CreateClientParams {
+  spaceId: string;
+  currentUser: AuthenticatedUser;
+  esScopedClient: IScopedClusterClient;
+  dependencies: SiemMigrationsClientDependencies;
+}
+interface CreateRuleAdapterParams {
+  adapterId: RuleMigrationAdapterId;
+  fieldMap: FieldMap;
+}
+
+export interface SetupParams extends Omit<InstallParams, 'logger'> {
+  esClient: ElasticsearchClient;
+}
+
+export class RuleMigrationsDataService extends SiemMigrationsBaseDataService {
+  protected readonly baseIndexName = '.kibana-siem-rule-migrations';
+
+  /** Adapters are created during `setup`, once the ELSER inference endpoint has been resolved. */
+  private adapters?: RuleMigrationAdapters;
+
+  constructor(
+    private logger: Logger,
+    protected kibanaVersion: string,
+    private readonly elserInferenceId?: string
+  ) {
+    super(kibanaVersion);
+  }
+
+  private ensureAdapters(): RuleMigrationAdapters {
+    if (!this.adapters) {
+      throw new Error('Service not initialized, please call setup first');
+    }
+    return this.adapters;
+  }
+
+  private createAdapters(elserInferenceId: string): RuleMigrationAdapters {
+    return {
+      migrations: this.createRuleIndexPatternAdapter({
+        adapterId: 'migrations',
+        fieldMap: migrationsFieldMaps,
+      }),
+      rules: this.createRuleIndexPatternAdapter({
+        adapterId: 'rules',
+        fieldMap: ruleMigrationsFieldMap,
+      }),
+      resources: this.createRuleIndexPatternAdapter({
+        adapterId: 'resources',
+        fieldMap: ruleMigrationResourcesFieldMap,
+      }),
+      integrations: this.createRuleIndexAdapter({
+        adapterId: 'integrations',
+        fieldMap: getIntegrationsFieldMap({ elserInferenceId }),
+      }),
+      prebuiltrules: this.createRuleIndexAdapter({
+        adapterId: 'prebuiltrules',
+        fieldMap: getPrebuiltRulesFieldMap({ elserInferenceId }),
+      }),
+    };
+  }
+
+  private createRuleIndexPatternAdapter({ adapterId, fieldMap }: CreateRuleAdapterParams) {
+    const name = this.getAdapterIndexName(adapterId);
+    return this.createIndexPatternAdapter({ name, fieldMap });
+  }
+
+  private createRuleIndexAdapter({ adapterId, fieldMap }: CreateRuleAdapterParams) {
+    const name = this.getAdapterIndexName(adapterId);
+    return this.createIndexAdapter({ name, fieldMap });
+  }
+
+  private async runIndexMigrations(esClient: SetupParams['esClient']) {
+    const adapters = this.ensureAdapters();
+    const indexMigrator = new RuleMigrationIndexMigrator(adapters, esClient, this.logger);
+    await indexMigrator.run();
+  }
+
+  private async install(params: SetupParams): Promise<void> {
+    const adapters = this.ensureAdapters();
+    const installParams = { ...params, logger: this.logger };
+    await Promise.all([
+      adapters.rules.install(installParams),
+      adapters.resources.install(installParams),
+      adapters.integrations.install(installParams),
+      adapters.prebuiltrules.install(installParams),
+      adapters.migrations.install(installParams),
+    ]);
+  }
+
+  public async setup(params: SetupParams): Promise<void> {
+    const elserInferenceId = await resolveElserInferenceId(params.esClient, this.elserInferenceId);
+    this.adapters = this.createAdapters(elserInferenceId);
+    await this.install(params);
+    await this.runIndexMigrations(params.esClient);
+  }
+
+  public createClient({ spaceId, currentUser, esScopedClient, dependencies }: CreateClientParams) {
+    const adapters = this.ensureAdapters();
+    const indexNameProviders: RuleMigrationIndexNameProviders = {
+      rules: this.createIndexNameProvider(adapters.rules, spaceId),
+      resources: this.createIndexNameProvider(adapters.resources, spaceId),
+      integrations: async () => this.getAdapterIndexName('integrations'),
+      prebuiltrules: async () => this.getAdapterIndexName('prebuiltrules'),
+      migrations: this.createIndexNameProvider(adapters.migrations, spaceId),
+    };
+
+    return new RuleMigrationsDataClient(
+      indexNameProviders,
+      currentUser,
+      esScopedClient,
+      this.logger,
+      spaceId,
+      dependencies
+    );
+  }
+}

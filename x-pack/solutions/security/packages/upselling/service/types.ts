@@ -1,0 +1,46 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import type { AppHeaderProps } from '@kbn/app-header';
+import type { SecurityPageName } from '@kbn/security-solution-navigation';
+
+export interface UpsellingPageProps {
+  /** Header the host page renders above the upsell; defaults to the core `AppHeader`. */
+  appHeader?: React.ComponentType<AppHeaderProps>;
+}
+export type UpsellingPageComponent = React.ComponentType<UpsellingPageProps>;
+
+export type PageUpsellings = Partial<Record<SecurityPageName, UpsellingPageComponent>>;
+export type MessageUpsellings = Partial<Record<UpsellingMessageId, string>>;
+export type SectionUpsellings = Partial<Record<UpsellingSectionId, React.ComponentType>>;
+
+export type UpsellingSectionId =
+  | 'entity_analytics_panel'
+  | 'endpointPolicyProtections'
+  | 'osquery_automated_response_actions'
+  | 'endpoint_protection_updates'
+  | 'endpoint_device_control'
+  | 'endpoint_agent_tamper_protection'
+  | 'endpoint_custom_notification'
+  | 'cloud_security_posture_integration_installation'
+  | 'cloud_defend_integration_installation'
+  | 'ruleDetailsEndpointExceptions'
+  | 'automatic_import'
+  | 'siem_migrations_start'
+  | 'graph_visualization';
+
+export type UpsellingMessageId =
+  | 'investigation_guide'
+  | 'investigation_guide_interactions'
+  | 'alert_assignments'
+  | 'alert_suppression_rule_form'
+  | 'alert_suppression_rule_details'
+  | 'note_management_user_filter'
+  | 'prebuilt_rule_customization'
+  | 'prebuilt_rule_customization_description'
+  | 'endpoint_custom_yara_signatures'
+  | 'endpoint_registry_credential_hardening';

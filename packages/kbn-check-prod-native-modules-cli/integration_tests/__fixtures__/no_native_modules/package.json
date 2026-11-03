@@ -1,0 +1,8 @@
+{
+  "name": "no-native-modules-project",
+  "version": "1.0.0",
+  "dependencies": {
+    "@elastic/package-a": "^1.0.0",
+    "@elastic/package-b": "^2.0.0"
+  }
+}

@@ -1,0 +1,193 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+import { RuleTester } from 'eslint';
+import { rules } from '../..';
+import dedent from 'dedent';
+
+const fmt = (str: TemplateStringsArray) => dedent(str) + '\n';
+
+const tsTester = [
+  '@typescript-eslint/parser',
+  new RuleTester({
+    parser: require.resolve('@typescript-eslint/parser'),
+    parserOptions: {
+      sourceType: 'module',
+      ecmaVersion: 2018,
+      ecmaFeatures: {
+        jsx: true,
+      },
+    },
+  }),
+] as const;
+
+const babelTester = [
+  '@babel/eslint-parser',
+  new RuleTester({
+    parser: require.resolve('@babel/eslint-parser'),
+    parserOptions: {
+      sourceType: 'module',
+      ecmaVersion: 2018,
+      requireConfigFile: false,
+      babelOptions: {
+        presets: ['@kbn/babel-preset/node_preset'],
+      },
+    },
+  }),
+] as const;
+
+for (const [name, tester] of [tsTester, babelTester]) {
+  describe(name, () => {
+    tester.run('@kbn/imports/no_unused_imports', rules.no_unused_imports, {
+      valid: [
+        {
+          filename: 'foo.ts',
+          code: fmt`
+            import { foo, bar as Bar } from 'new'
+            use(foo, Bar)
+          `,
+        },
+        {
+          filename: 'foo.ts',
+          code: fmt`
+            import Old from 'old'
+            use(Old)
+          `,
+        },
+      ],
+
+      invalid: [
+        {
+          filename: 'foo.ts',
+          code: fmt`
+            import { foo, bar as Bar } from 'old'
+          `,
+          errors: [
+            {
+              line: 1,
+              message: 'All imports from "old" are unused and should be removed',
+            },
+          ],
+          output: '',
+        },
+        {
+          filename: 'foo.ts',
+          code: fmt`
+            import type { foo, bar as Bar } from 'old'
+          `,
+          errors: [
+            {
+              line: 1,
+              message: 'All imports from "old" are unused and should be removed',
+            },
+          ],
+          output: '',
+        },
+        {
+          filename: 'foo.ts',
+          code: fmt`
+            import type { foo, bar as Bar } from 'old'
+            use(foo)
+          `,
+          errors: [
+            {
+              line: 1,
+              message: 'Bar is unused and should be removed',
+            },
+          ],
+          output: fmt`
+            import type { foo,  } from 'old'
+            use(foo)
+          `,
+        },
+        {
+          filename: 'foo.ts',
+          code: fmt`
+            import type { foo, bar as Bar } from 'old'
+            use(Bar)
+          `,
+          errors: [
+            {
+              line: 1,
+              message: 'foo is unused and should be removed',
+            },
+          ],
+          output: fmt`
+            import type {  bar as Bar } from 'old'
+            use(Bar)
+          `,
+        },
+        {
+          filename: 'foo.ts',
+          code: fmt`
+            // @ts-expect-error
+            // @ts-ignore
+            // foo message
+            // eslint-disable-next-line no-console
+            import type { foo, bar as Bar } from 'old'
+          `,
+          errors: [
+            {
+              line: 5,
+              message: 'All imports from "old" are unused and should be removed',
+            },
+          ],
+          output: fmt`
+            // foo message
+          `,
+        },
+      ],
+    });
+  });
+}
+
+const [tsParserName, tsRuleTester] = tsTester;
+
+// Oxlint doesn't run `react/jsx-uses-react` next to this rule, so the rule marks the JSX pragma
+// and `Fragment` as used itself. These cases use the tester configured with `ecmaFeatures.jsx`.
+describe(`${tsParserName} JSX`, () => {
+  tsRuleTester.run('@kbn/imports/no_unused_imports', rules.no_unused_imports, {
+    valid: [
+      {
+        filename: 'foo.tsx',
+        code: fmt`
+          /** @jsx jsx */
+          import { jsx } from '@emotion/react'
+          export const a = <div />
+        `,
+      },
+      {
+        filename: 'foo.tsx',
+        code: fmt`
+          import { Fragment } from 'react'
+          export const a = <></>
+        `,
+      },
+    ],
+
+    invalid: [
+      {
+        filename: 'foo.tsx',
+        code: fmt`
+          import { unused } from 'x'
+          export const a = <div />
+        `,
+        errors: [
+          {
+            line: 1,
+            message: 'All imports from "x" are unused and should be removed',
+          },
+        ],
+        output: fmt`
+          export const a = <div />
+        `,
+      },
+    ],
+  });
+});

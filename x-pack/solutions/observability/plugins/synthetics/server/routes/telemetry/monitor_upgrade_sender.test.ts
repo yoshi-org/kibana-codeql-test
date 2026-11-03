@@ -1,0 +1,290 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
+ */
+
+import type { Logger } from '@kbn/core/server';
+import { loggingSystemMock } from '@kbn/core/server/mocks';
+import type { SavedObject } from '@kbn/core/server';
+import type { SyntheticsMonitor } from '../../../common/runtime_types/monitor_management';
+import {
+  ConfigKey,
+  MonitorTypeEnum,
+  ScheduleUnit,
+  SourceType,
+} from '../../../common/runtime_types/monitor_management';
+import { DEFAULT_FIELDS } from '../../../common/constants/monitor_defaults';
+
+import type { AnalyticsServiceSetup } from '@kbn/core/server';
+import { coreMock } from '@kbn/core/server/mocks';
+import { SyntheticsTelemetry } from '../../telemetry/synthetics_telemetry';
+
+import {
+  MONITOR_UPDATE_EVENT_TYPE,
+  MONITOR_CURRENT_EVENT_TYPE,
+  MONITOR_ERROR_EVENT_TYPE,
+} from '../../telemetry/constants';
+import { createHash } from 'crypto';
+import {
+  formatTelemetryEvent,
+  formatTelemetryUpdateEvent,
+  formatTelemetryDeleteEvent,
+  sendTelemetryEvents,
+  sendErrorTelemetryEvents,
+} from './monitor_upgrade_sender';
+
+const stackVersion = '8.2.0';
+const id = '123456';
+const errors = [
+  {
+    locationId: 'us_central',
+    error: {
+      reason: 'my reason',
+      status: 400,
+    },
+  },
+];
+const testConfig: SavedObject<SyntheticsMonitor> = {
+  updated_at: '2011-10-05T14:48:00.000Z',
+  id,
+  attributes: {
+    ...DEFAULT_FIELDS[MonitorTypeEnum.BROWSER],
+    [ConfigKey.MONITOR_TYPE]: MonitorTypeEnum.HTTP,
+    [ConfigKey.LOCATIONS]: [
+      {
+        id: 'us_central',
+        label: 'US Central',
+        url: 'testurl.com',
+        geo: {
+          lat: 0,
+          lon: 0,
+        },
+        isServiceManaged: true,
+      },
+      {
+        id: 'custom',
+        label: 'Custom US Central',
+        url: 'testurl.com',
+        geo: {
+          lat: 0,
+          lon: 0,
+        },
+      },
+    ],
+    [ConfigKey.SCHEDULE]: { number: '3', unit: ScheduleUnit.MINUTES },
+    [ConfigKey.URLS]: 'https://elastic.co',
+    [ConfigKey.NAME]: 'Test',
+    [ConfigKey.REVISION]: 1,
+  } as SyntheticsMonitor,
+} as SavedObject<SyntheticsMonitor>;
+const createTestConfig = (extraConfigs: Record<string, any>, updatedAt?: string) => {
+  return {
+    ...testConfig,
+    updated_at: updatedAt || testConfig.updated_at,
+    attributes: {
+      ...testConfig.attributes,
+      ...extraConfigs,
+    },
+  } as SavedObject<SyntheticsMonitor>;
+};
+
+describe('monitor upgrade telemetry helpers', () => {
+  it('formats telemetry events', () => {
+    const actual = formatTelemetryEvent({
+      monitor: testConfig,
+      stackVersion,
+      isInlineScript: false,
+      errors,
+    });
+    expect(actual).toEqual({
+      stackVersion,
+      configId: createHash('sha256').update(testConfig.id).digest('hex'),
+      locations: ['us_central', 'other'],
+      locationsCount: 2,
+      monitorNameLength: testConfig.attributes[ConfigKey.NAME].length,
+      updatedAt: testConfig.updated_at,
+      type: testConfig.attributes[ConfigKey.MONITOR_TYPE],
+      scriptType: undefined,
+      monitorInterval: 180000,
+      lastUpdatedAt: undefined,
+      deletedAt: undefined,
+      errors,
+      durationSinceLastUpdated: undefined,
+      revision: 1,
+    });
+  });
+
+  it.each([
+    [ConfigKey.MONITOR_SOURCE_TYPE, SourceType.PROJECT, 'project', false, false],
+    [ConfigKey.SOURCE_INLINE, 'test', 'recorder', true, true],
+    [ConfigKey.SOURCE_INLINE, 'test', 'inline', false, true],
+  ])(
+    'handles formatting scriptType for browser monitors',
+    (config, value, scriptType, isRecorder, isInlineScript) => {
+      const actual = formatTelemetryEvent({
+        monitor: createTestConfig({
+          [config]: value,
+          [ConfigKey.METADATA]: {
+            script_source: {
+              is_generated_script: isRecorder,
+            },
+          },
+        }),
+        isInlineScript,
+        stackVersion,
+        errors,
+      });
+      expect(actual).toEqual({
+        stackVersion,
+        configId: createHash('sha256').update(testConfig.id).digest('hex'),
+        locations: ['us_central', 'other'],
+        locationsCount: 2,
+        monitorNameLength: testConfig.attributes[ConfigKey.NAME].length,
+        updatedAt: testConfig.updated_at,
+        type: testConfig.attributes[ConfigKey.MONITOR_TYPE],
+        scriptType,
+        monitorInterval: 180000,
+        lastUpdatedAt: undefined,
+        deletedAt: undefined,
+        errors,
+        durationSinceLastUpdated: undefined,
+        revision: 1,
+      });
+    }
+  );
+
+  it('handles formatting update events', () => {
+    const actual = formatTelemetryUpdateEvent(
+      createTestConfig({}, '2011-10-05T16:48:00.000Z'),
+      testConfig.updated_at,
+      stackVersion,
+      false,
+      errors
+    );
+    expect(actual).toEqual({
+      stackVersion,
+      configId: createHash('sha256').update(testConfig.id).digest('hex'),
+      locations: ['us_central', 'other'],
+      locationsCount: 2,
+      monitorNameLength: testConfig.attributes[ConfigKey.NAME].length,
+      updatedAt: '2011-10-05T16:48:00.000Z',
+      type: testConfig.attributes[ConfigKey.MONITOR_TYPE],
+      scriptType: undefined,
+      monitorInterval: 180000,
+      lastUpdatedAt: testConfig.updated_at,
+      deletedAt: undefined,
+      errors,
+      durationSinceLastUpdated: 7200000,
+      revision: 1,
+    });
+  });
+
+  it('handles formatting delete events', () => {
+    const actual = formatTelemetryDeleteEvent(
+      testConfig,
+      stackVersion,
+      '2011-10-05T16:48:00.000Z',
+      false,
+      errors
+    );
+    expect(actual).toEqual({
+      stackVersion,
+      configId: createHash('sha256').update(testConfig.id).digest('hex'),
+      locations: ['us_central', 'other'],
+      locationsCount: 2,
+      monitorNameLength: testConfig.attributes[ConfigKey.NAME].length,
+      updatedAt: '2011-10-05T16:48:00.000Z',
+      type: testConfig.attributes[ConfigKey.MONITOR_TYPE],
+      scriptType: undefined,
+      monitorInterval: 180000,
+      lastUpdatedAt: testConfig.updated_at,
+      deletedAt: '2011-10-05T16:48:00.000Z',
+      errors,
+      durationSinceLastUpdated: 7200000,
+      revision: 1,
+    });
+  });
+});
+
+describe('sendTelemetryEvents', () => {
+  let analyticsMock: jest.Mocked<AnalyticsServiceSetup>;
+  let telemetry: SyntheticsTelemetry;
+  let loggerMock: jest.Mocked<Logger>;
+
+  beforeEach(() => {
+    analyticsMock = coreMock.createSetup().analytics as jest.Mocked<AnalyticsServiceSetup>;
+    loggerMock = loggingSystemMock.createLogger();
+    telemetry = new SyntheticsTelemetry(analyticsMock, loggerMock);
+  });
+
+  it('should report update and current events', () => {
+    const event = formatTelemetryEvent({
+      monitor: testConfig,
+      stackVersion,
+      isInlineScript: true,
+      errors,
+    });
+    sendTelemetryEvents(loggerMock, telemetry, event);
+
+    expect(analyticsMock.reportEvent).toHaveBeenCalledWith(MONITOR_UPDATE_EVENT_TYPE, {
+      ...event,
+      issuedTo: undefined,
+    });
+    expect(analyticsMock.reportEvent).toHaveBeenCalledWith(MONITOR_CURRENT_EVENT_TYPE, {
+      ...event,
+      issuedTo: undefined,
+    });
+  });
+
+  it('logs instead of throwing when reporting fails', () => {
+    analyticsMock.reportEvent.mockImplementation(() => {
+      throw new Error('boom');
+    });
+    const event = formatTelemetryEvent({
+      monitor: testConfig,
+      stackVersion,
+      isInlineScript: true,
+    });
+
+    expect(() => sendTelemetryEvents(loggerMock, telemetry, event)).not.toThrow();
+    expect(loggerMock.error).toHaveBeenCalled();
+  });
+});
+
+describe('sendErrorTelemetryEvents', () => {
+  const errorEvent = { type: 'syncError', message: 'boom', stackVersion };
+  let analyticsMock: jest.Mocked<AnalyticsServiceSetup>;
+  let telemetry: SyntheticsTelemetry;
+  const loggerMock = loggingSystemMock.createLogger() as jest.Mocked<Logger>;
+
+  beforeEach(() => {
+    analyticsMock = coreMock.createSetup().analytics as jest.Mocked<AnalyticsServiceSetup>;
+    telemetry = new SyntheticsTelemetry(analyticsMock, loggerMock);
+  });
+
+  it('reports an error once and suppresses repeats within the throttle window', () => {
+    sendErrorTelemetryEvents(loggerMock, telemetry, errorEvent);
+    sendErrorTelemetryEvents(loggerMock, telemetry, errorEvent);
+
+    expect(analyticsMock.reportEvent).toHaveBeenCalledTimes(1);
+    expect(analyticsMock.reportEvent).toHaveBeenCalledWith(MONITOR_ERROR_EVENT_TYPE, {
+      ...errorEvent,
+      issuedTo: undefined,
+    });
+  });
+
+  it('drops noisy errors without consuming the throttle', () => {
+    sendErrorTelemetryEvents(loggerMock, telemetry, {
+      ...errorEvent,
+      url: 'http://127.0.0.1:1',
+    });
+    sendErrorTelemetryEvents(loggerMock, telemetry, {
+      ...errorEvent,
+      message: 'Cannot sync monitors with the Synthetics service. License is expired.',
+    });
+
+    expect(analyticsMock.reportEvent).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,22 @@
+/*
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the "Elastic License
+ * 2.0", the "GNU Affero General Public License v3.0 only", and the "Server Side
+ * Public License v 1"; you may not use this file except in compliance with, at
+ * your election, the "Elastic License 2.0", the "GNU Affero General Public
+ * License v3.0 only", or the "Server Side Public License, v 1".
+ */
+
+import type { CoreRequestHandlerContext } from '@kbn/core/server';
+import type { z } from '@kbn/zod';
+import type { warningsSchema } from './warnings_schema';
+
+export type Warnings = z.output<typeof warningsSchema>;
+
+export type Operation = 'create' | 'read' | 'update' | 'search';
+
+/** The request-scoped core services that dashboard writes use; routes pass their core request handler context. */
+export interface DashboardRequestServices {
+  savedObjects: Pick<CoreRequestHandlerContext['savedObjects'], 'client' | 'typeRegistry'>;
+  security: { authc: Pick<CoreRequestHandlerContext['security']['authc'], 'getCurrentUser'> };
+}
